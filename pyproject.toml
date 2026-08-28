@@ -1,0 +1,119 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microcaustics"
+version = "1.0.0"
+description = "Fast static and dynamic gravitational microlensing simulations"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Joshua Fagin", email = "faginjoshua@gmail.com" },
+]
+maintainers = [{ name = "Joshua Fagin", email = "faginjoshua@gmail.com" }]
+keywords = [
+  "gravitational lensing",
+  "microlensing",
+  "astronomy",
+  "pytorch",
+  "gpu",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = [
+  "numpy>=1.24",
+  "torch>=2.4",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.7"]
+science = ["astropy>=5.3", "scipy>=1.10"]
+macro = ["caustics>=1.7; python_version >= '3.11'", "scipy>=1.10"]
+notebooks = [
+  "jupyterlab>=4",
+  "ipywidgets>=8",
+  "matplotlib>=3.7",
+  "nbclient>=0.10",
+  "nbformat>=5.9",
+  "pillow>=10",
+  "scipy>=1.10",
+  "scikit-image>=0.22",
+]
+docs = [
+  "matplotlib>=3.7",
+  "mkdocs>=1.6",
+  "mkdocs-material>=9.5",
+  "mkdocstrings[python]>=0.25",
+]
+test = [
+  "astropy>=5.3",
+  "hypothesis>=6",
+  "matplotlib>=3.7",
+  "pytest>=8",
+  "pytest-cov>=5",
+  "scipy>=1.10",
+]
+validation = [
+  "astropy>=5.3",
+  "lenstronomy>=1.11",
+  "scipy>=1.10",
+]
+dev = [
+  "build>=1.2",
+  "hypothesis>=6",
+  "pytest>=8",
+  "pytest-cov>=5",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+microcaustics = "microcaustics.cli:main"
+
+[project.urls]
+Repository = "https://github.com/JFagin/microcaustics"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+extend-exclude = ["examples/notebooks/*.ipynb"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+markers = [
+  "cuda: requires a CUDA device",
+  "external: compares against optional third-party or external research code",
+  "slow: intentionally excluded from the ordinary fast test loop",
+]
+
+[tool.coverage.run]
+source = ["microcaustics"]
+omit = [
+  "*/triton_*.py",
+  "*/plotting/*",
+]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = true

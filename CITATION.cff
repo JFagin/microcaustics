@@ -1,0 +1,52 @@
+cff-version: 1.2.0
+message: >-
+  If you use microcaustics in published work, please cite the accompanying
+  methods paper listed as the preferred citation below.
+title: microcaustics
+type: software
+version: 1.0.0
+license: MIT
+repository-code: https://github.com/JFagin/microcaustics
+authors:
+  - family-names: Fagin
+    given-names: Joshua
+    email: faginjoshua@gmail.com
+    orcid: https://orcid.org/0000-0001-8723-6136
+keywords:
+  - gravitational microlensing
+  - strong gravitational lensing
+  - inverse polygon mapping
+  - GPU computing
+  - quasar accretion disks
+  - caustics
+preferred-citation:
+  type: article
+  title: >-
+    Microcaustics: a Fast GPU-Accelerated Dynamical Microlensing Simulator
+    for the LSST Era
+  year: 2026
+  authors:
+    - family-names: Fagin
+      given-names: Joshua
+      orcid: https://orcid.org/0000-0001-8723-6136
+    - family-names: Stone
+      given-names: Connor
+      orcid: https://orcid.org/0000-0002-9086-6398
+    - family-names: Chan
+      given-names: James Hung-Hsu
+      orcid: https://orcid.org/0000-0001-8797-725X
+    - family-names: Miskiewicz
+      given-names: Sophia
+      orcid: https://orcid.org/0000-0003-0631-9701
+    - family-names: Best
+      given-names: Henry
+      orcid: https://orcid.org/0009-0009-6932-6379
+    - family-names: O'Dowd
+      given-names: Matthew
+      orcid: https://orcid.org/0009-0000-4476-5003
+    - family-names: Perreault-Levasseur
+      given-names: Laurence
+      orcid: https://orcid.org/0000-0003-3544-3939
+    - family-names: Hezaveh
+      given-names: Yashar
+      orcid: https://orcid.org/0000-0002-8669-5733

@@ -1,0 +1,59 @@
+site_name: microcaustics
+site_description: Fast static and dynamic gravitational microlensing simulations
+site_url: https://jfagin.github.io/microcaustics/
+repo_url: https://github.com/JFagin/microcaustics
+repo_name: JFagin/microcaustics
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: numpy
+            show_root_heading: true
+            show_source: false
+            members_order: source
+            separate_signature: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Physical system interface: high_level_system_design.md
+      - Choosing a method: choosing_methods.md
+      - Coordinates and conventions: conventions.md
+      - Runtime and troubleshooting: portability_and_troubleshooting.md
+      - Timing accelerated code: timing.md
+  - Microlensing:
+      - IPM: ipm.md
+      - Dynamic calculations: dynamic.md
+      - Caustics and labels: caustics.md
+      - Lens populations: lens_populations.md
+      - Automatic tuning: tuning.md
+      - Data products: data_products.md
+  - Sources and systems:
+      - Source models: sources.md
+      - Relativistic sources: relativistic_sources.md
+      - Multi-image systems: multi_image.md
+      - Macro-image rendering: macro_image_rendering.md
+      - caustics interoperability: caustics_interoperability.md
+      - Plotting: plotting.md
+  - Development:
+      - Design: design.md
+      - Extending microcaustics: extending.md
+      - API reference: api.md

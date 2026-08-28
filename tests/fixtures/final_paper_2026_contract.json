@@ -1,0 +1,50 @@
+{
+  "format_version": 1,
+  "description": "Immutable numerical settings used to seed package parity fixtures",
+  "production": {
+    "method": "selective_biquadratic_ipm",
+    "rays": 10000000,
+    "scout_ratio": 2,
+    "true_refinement": 2,
+    "virtual_refinement": 4,
+    "flux_path": "map_to_flux",
+    "source_box_refresh_frames": 10,
+    "source_box_reuse": "two_sided_endpoint_union",
+    "temporal_batch_frames": 40,
+    "caustic_batch_frames": 40,
+    "far_field": {
+      "cells_per_axis": 16,
+      "exact_radius_cells": 1.0,
+      "far_field": "complex_taylor_p4",
+      "center_translation_order": 10
+    }
+  },
+  "practical_temporal_reference": {
+    "method": "selective_biquadratic_ipm",
+    "rays": 100000000,
+    "scout_ratio": 2,
+    "true_refinement": 2,
+    "virtual_refinement": 8,
+    "tiles_per_axis": 3,
+    "far_field": {
+      "cells_per_axis": 32,
+      "exact_radius_cells": 1.5,
+      "far_field": "complex_taylor_p4",
+      "center_translation_order": 10
+    }
+  },
+  "gold_static_map_reference": {
+    "method": "selective_biquadratic_ipm",
+    "rays": 1000000000,
+    "scout_ratio": 2,
+    "true_refinement": 2,
+    "virtual_refinement": 8,
+    "tiles_per_axis": 3,
+    "far_field": {
+      "cells_per_axis": 32,
+      "exact_radius_cells": 1.5,
+      "far_field": "complex_taylor_p4",
+      "center_translation_order": 10
+    }
+  }
+}
