@@ -47,7 +47,7 @@ method = mc.IPMConfig(
     virtual_refinement=2,
     far_field_approx=mc.FarFieldApproxConfig(enabled=False),
 )
-system = mc.MultiImageMicrolensingSystem(
+system = mc.MultiImageSystem(
     images={
         "A": mc.MacroLens(convergence=0.25, shear=0.12),
         "B": mc.MacroLens(convergence=0.25, shear=0.18),

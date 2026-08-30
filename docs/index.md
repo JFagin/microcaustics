@@ -4,11 +4,11 @@
 finite-source light curves, caustics and crossing labels, relativistic source
 models, and resolved multi-image simulations.
 
-The package provides three execution layers from one public interface:
+The package provides three execution layers through one public interface.
 
-- portable eager Torch for CPU, CUDA, and Apple devices.
-- cached compiled Torch kernels where a compatible compiler is available. And
-- fused Triton kernels for the CUDA production path.
+- Portable eager Torch runs on CPU, CUDA, and Apple devices.
+- Cached compiled Torch kernels are used when a compatible compiler is available.
+- Fused Triton kernels provide the CUDA production path.
 
 Start with [Choosing a method](choosing_methods.md), then use the
 [source](sources.md), [dynamic](dynamic.md), and [caustic](caustics.md) guides

@@ -198,15 +198,15 @@ class NotebookExecutionTests(unittest.TestCase):
         from nbclient import NotebookClient
 
         cuda_notebooks = {
-            "01_q2237_production_light_curve_and_gif.ipynb",
-            "15_end_to_end_lensed_quasar.ipynb",
-            "16_accuracy_and_performance.ipynb",
-            "17_streaming_and_exporting_results.ipynb",
+            "getting_started/01_q2237_production_light_curve_and_gif.ipynb",
+            "workflows/02_end_to_end_lensed_quasar.ipynb",
+            "validation/02_accuracy_and_performance.ipynb",
+            "workflows/03_streaming_and_exporting_results.ipynb",
         }
         executed_names: list[str] = []
         cuda_outputs: dict[str, str] = {}
         with tempfile.TemporaryDirectory() as temporary:
-            for path in sorted(NOTEBOOK_ROOT.glob("*.ipynb")):
+            for path in sorted(NOTEBOOK_ROOT.rglob("*.ipynb")):
                 notebook = nbformat.read(path, as_version=4)
                 executed = NotebookClient(
                     notebook,
@@ -214,14 +214,18 @@ class NotebookExecutionTests(unittest.TestCase):
                     kernel_name="python3",
                     resources={"metadata": {"path": temporary}},
                 ).execute()
-                executed_names.append(path.name)
-                if path.name in cuda_notebooks:
-                    cuda_outputs[path.name] = json.dumps(executed)
+                name = path.relative_to(NOTEBOOK_ROOT).as_posix()
+                executed_names.append(name)
+                if name in cuda_notebooks:
+                    cuda_outputs[name] = json.dumps(executed)
         cls._executed_names = tuple(executed_names)
         cls._cuda_notebook_outputs = cuda_outputs
 
     def test_notebooks_execute_headlessly(self) -> None:
-        expected = tuple(path.name for path in sorted(NOTEBOOK_ROOT.glob("*.ipynb")))
+        expected = tuple(
+            path.relative_to(NOTEBOOK_ROOT).as_posix()
+            for path in sorted(NOTEBOOK_ROOT.rglob("*.ipynb"))
+        )
         self.assertTupleEqual(self._executed_names, expected)
 
     @unittest.skipUnless(

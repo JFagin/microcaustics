@@ -93,6 +93,54 @@ class PlottingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mcp.enclosed_flux_contour_levels(np.zeros((4, 4)))
 
+    def test_streaming_source_standardization_and_band_plot(self) -> None:
+        geometry = mc.SourceGeometry(
+            (3, 4),
+            (1.0, 1.0),
+            (4000.0, 8000.0),
+            ("blue", "red"),
+        )
+
+        class VariableSource:
+            def __init__(self):
+                self.geometry = geometry
+
+            def brightness(self, times_days, *, dtype=None, device=None):
+                times = torch.as_tensor(
+                    times_days,
+                    dtype=dtype,
+                    device=device,
+                ).reshape(-1, 1, 1, 1)
+                spatial = torch.arange(
+                    12,
+                    dtype=dtype,
+                    device=device,
+                ).reshape(1, 3, 4, 1)
+                bands = torch.tensor(
+                    [1.0, 2.0],
+                    dtype=dtype,
+                    device=device,
+                ).reshape(1, 1, 1, 2)
+                return (1.0 + times) * (1.0 + spatial) * bands
+
+        source = VariableSource()
+        summary = mcp.standardize_source_over_time(
+            source,
+            [0.0, 1.0, 2.0],
+            batch_size=2,
+        )
+        self.assertEqual(summary.representative_index, 2)
+        self.assertEqual(summary.mean.shape, (3, 4, 2))
+        self.assertTrue(np.all(np.isfinite(summary.representative_standardized)))
+        figure, axes = mcp.plot_standardized_source_bands(
+            summary,
+            mc.PlaneGrid((3, 4), (3.0, 4.0)),
+            geometry.band_names,
+            scale_bar_uas=1.0,
+        )
+        self.assertEqual(len(axes), 2)
+        self.assertEqual(len(figure.axes), 3)
+
     def test_method_diagrams_execute_the_real_tree_and_scout(self) -> None:
         simulation = mc.MicrolensingSimulation.create(
             mc.MacroLens(0.05, 0.02),
@@ -143,6 +191,7 @@ class PlottingTests(unittest.TestCase):
             mc.PlaneGrid((16, 16), (2.0, 2.0)),
             ipm_config,
             mc.PlaneRegion((2.0, 3.0)),
+            rectangle_rotation_deg=31.0,
             scale_bar_uas=0.5,
         )
         self.assertEqual(len(axes), 3)
@@ -176,6 +225,42 @@ class PlottingTests(unittest.TestCase):
                 self.assertEqual(int(diagnostic["source_bins"]), 1024)
                 self.assertFalse(bool(diagnostic["displayed_pixel_grid_enlarged"]))
 
+    def test_live_paper_ipm_renderer_builds_its_own_diagnostics(self) -> None:
+        """The publication layout also accepts a newly evaluated simulation."""
+
+        simulation = mc.MicrolensingSimulation.create(
+            mc.MacroLens(0.05, 0.02),
+            mc.PointMassField(
+                torch.tensor([-0.5, 0.6]),
+                torch.tensor([0.4, -0.3]),
+                torch.tensor([0.08, 0.06]),
+            ),
+            runtime=mc.RuntimeConfig(
+                device="cpu",
+                dtype="float32",
+                backend=mc.Backend.TORCH_EAGER,
+            ),
+        )
+        config = mc.IPMConfig(
+            rays=256,
+            scout_ratio=1,
+            refinement=2,
+            virtual_refinement=4,
+            tiled=True,
+            far_field_approx=mc.FarFieldApproxConfig(enabled=False),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = mcp.render_live_paper_ipm_schematic(
+                simulation,
+                mc.PlaneRegion((4.0, 4.0)),
+                mc.PlaneGrid((16, 16), (2.0, 2.0)),
+                config,
+                temporary,
+                output_prefix="live_ipm",
+            )
+            self.assertTrue(all(path.is_file() for path in paths))
+            self.assertTrue((Path(temporary) / "live_ipm_live_diagnostics.npz").is_file())
+
     def test_caustic_label_distance_and_anchor_plots(self) -> None:
         field = self.caustics()
         _, source_ax = mcp.plot_caustics(field)
@@ -192,6 +277,16 @@ class PlottingTests(unittest.TestCase):
         colorbar_ticks = label_figure.axes[-1].get_yticks()
         np.testing.assert_array_equal(colorbar_ticks, np.arange(20))
         self.assertIsNotNone(mcp.plot_distance_map(distance_map, caustics=field)[1])
+        diagnostic_figure, diagnostic_axes = mcp.plot_caustic_diagnostics(
+            self.map(),
+            mc.LabelMap(torch.zeros(4, 5, dtype=torch.int64), self.map().grid),
+            distance_map,
+            mc.LabelMap(torch.ones(4, 5, dtype=torch.int64), self.map().grid),
+            caustics=field,
+            scale_bar_uas=2.0,
+        )
+        self.assertEqual(len(diagnostic_axes), 4)
+        self.assertEqual(len(diagnostic_figure.axes), 8)
         labels = mc.AnchorGaugeLabels(
             raw_center_label=0,
             center_label=0,

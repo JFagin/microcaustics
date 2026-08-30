@@ -285,3 +285,111 @@ def plot_distance_map(
     if show_axes:
         finish_axis(ax)
     return figure, ax
+
+
+def plot_caustic_diagnostics(
+    magnification_map: MagnificationMap,
+    label_map: LabelMap,
+    distance_map: DistanceMap,
+    winding_map: LabelMap,
+    *,
+    caustics: CausticField | None = None,
+    scale_bar_uas: float | None = None,
+):
+    """Plot registered magnification, parity, distance, and winding maps.
+
+    All four products must use the same source-plane grid. Integer products
+    receive discrete color maps and integer-only colorbar ticks. This helper
+    only renders already calculated public result objects; it performs no
+    lensing calculation and does not retain additional accelerator tensors.
+    """
+
+    require_matplotlib()
+    from matplotlib import colormaps, pyplot as plt
+    from matplotlib.colors import BoundaryNorm
+
+    products = (label_map, distance_map, winding_map)
+    if any(product.grid != magnification_map.grid for product in products):
+        raise ValueError("all diagnostic maps must share one source-plane grid")
+
+    figure, axes = plt.subplots(1, 4, figsize=(15.8, 3.7))
+    bounds = magnification_map.grid.bounds_uas
+    common = dict(origin="lower", extent=bounds, aspect="equal")
+    magnification = np.asarray(magnification_map.numpy(), dtype=np.float64)
+    mag_artist = axes[0].imshow(
+        np.log10(np.clip(magnification, 1.0e-12, None)), cmap="magma", **common
+    )
+
+    parity = np.asarray(as_numpy(label_map.values), dtype=int)
+    parity_ticks = np.arange(int(parity.min()), int(parity.max()) + 1)
+    parity_cmap = colormaps["Blues"].resampled(max(1, parity_ticks.size))
+    parity_norm = BoundaryNorm(
+        np.arange(parity_ticks[0] - 0.5, parity_ticks[-1] + 1.5), parity_cmap.N
+    )
+    parity_artist = axes[1].imshow(
+        parity,
+        cmap=parity_cmap,
+        norm=parity_norm,
+        interpolation="nearest",
+        **common,
+    )
+    distance_artist = axes[2].imshow(
+        as_numpy(distance_map.values_uas), cmap="viridis", **common
+    )
+
+    winding = np.asarray(as_numpy(winding_map.values), dtype=int)
+    winding_ticks = np.arange(int(winding.min()), int(winding.max()) + 1)
+    winding_cmap = colormaps["Reds"].resampled(max(1, winding_ticks.size))
+    winding_norm = BoundaryNorm(
+        np.arange(winding_ticks[0] - 0.5, winding_ticks[-1] + 1.5),
+        winding_cmap.N,
+    )
+    winding_artist = axes[3].imshow(
+        winding,
+        cmap=winding_cmap,
+        norm=winding_norm,
+        interpolation="nearest",
+        **common,
+    )
+
+    if caustics is not None:
+        for axis in axes:
+            _overlay_segments(
+                axis,
+                caustics.caustic_segments_uas,
+                color="white",
+                linewidth=0.35,
+                alpha=0.85,
+            )
+    for axis, title in zip(
+        axes,
+        ("Magnification", "Binary parity", "Distance", "Winding number"),
+        strict=True,
+    ):
+        axis.set_xlim(bounds[:2])
+        axis.set_ylim(bounds[2:])
+        axis.set_title(title)
+        if scale_bar_uas is not None:
+            add_scale_bar(
+                axis,
+                float(scale_bar_uas),
+                label=rf"{float(scale_bar_uas):g} $\mu$as",
+                color="white",
+            )
+        hide_image_axes(axis)
+    panel_colorbar(figure, axes[0], mag_artist, label=r"$\log_{10}\mu$")
+    panel_colorbar(
+        figure, axes[1], parity_artist, label="Parity", ticks=parity_ticks
+    )
+    panel_colorbar(
+        figure, axes[2], distance_artist, label=r"Distance [$\mu$as]"
+    )
+    panel_colorbar(
+        figure,
+        axes[3],
+        winding_artist,
+        label="Winding number",
+        ticks=winding_ticks,
+    )
+    figure.tight_layout()
+    return figure, axes

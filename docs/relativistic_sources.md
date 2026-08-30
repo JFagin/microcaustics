@@ -50,8 +50,7 @@ driver = mc.broken_power_law_driving_signal(
 disk = mc.KerrDiskModel(
     black_hole_mass_solar=10**9.08,
     eddington_ratio=0.34,
-    wavelengths_angstrom=(3671.0, 4827.0, 6223.0),
-    band_names=("u", "g", "r"),
+    bands={"u": 3671.0, "g": 4827.0, "r": 6223.0},
     spin=0.74,
     inclination_deg=10.0,
     position_angle_deg=175.0,
@@ -59,7 +58,8 @@ disk = mc.KerrDiskModel(
     lamp_fraction=0.1,
     corona_height_above_isco_rg=20.0,
     driving_signal=driver,
-    grid=mc.SourceGridConfig(shape=1024, margin=1.05),
+    resolution=1024,
+    source_margin=1.05,
 )
 source = disk.pixelate(distances, runtime=runtime)
 ```
@@ -68,6 +68,37 @@ Omit `driving_signal` for a static relativistic disk. Use
 `disk.with_driving_signal(signal)` to retain every other choice. Resolution,
 enclosed-flux support, outer margin, lamppost sampling, and compile behavior
 remain explicit numerical controls.
+
+The full-GR frequency-shift map is already part of the returned source. No
+microlensing calculation is required:
+
+```python
+g = source.transfer.gfactor       # g = nu_observed / nu_emitted
+hit = source.transfer.hit         # primary rays that reach the disk
+g_map = torch.where(hit, g, torch.nan)
+```
+
+The source-model tutorial plots this map in angular coordinates. The SIM5
+validation tutorial independently regenerates the same package transfer before
+reading the optional external SIM5 result.
+
+The other registered GR and reverberation maps are available from the same
+source without retracing rays:
+
+```python
+radius_rg = source.transfer.radius_rg
+azimuth_rad = source.transfer.emission_azimuth_rad
+observer_delay_days = source.transfer.relative_delay_days
+continuum_lag_days = source.delay_days
+heating_response_temperature4 = source.response_temperature4
+```
+
+`relative_delay_days` is the disk-to-observer propagation term and has its own
+relative zero. `delay_days` adds the lamp-to-disk travel time and is reset to
+zero at the earliest physically responsive disk element. The latter is the
+causal delay used by the continuum transfer functions. The source-model
+tutorial renders the radius, azimuth, observer-delay, and total-continuum-lag
+maps in their common source-plane coordinates.
 
 The lower-level observer-transfer components remain public for inspecting the
 trace, importing an external transfer, or developing a different illumination

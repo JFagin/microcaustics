@@ -552,6 +552,12 @@ class ModulatedSource:
 
         return self.source.geometry
 
+    def support_radius_m(self, distances) -> float | None:
+        """Forward an optional physical support radius from the base source."""
+
+        method = getattr(self.source, "support_radius_m", None)
+        return None if method is None else float(method(distances))
+
     def brightness(
         self,
         times_days: torch.Tensor | Sequence[float] | float,

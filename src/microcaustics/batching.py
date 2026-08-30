@@ -207,7 +207,7 @@ def batched_system_maps(
     :func:`batched_magnification_maps`.
     """
 
-    from .config import production_ipm_config
+    from .config import _production_static_ipm_config
     from .system import MicrolensingRealization
 
     resolved = tuple(
@@ -217,7 +217,7 @@ def batched_system_maps(
     if not resolved:
         raise ValueError("at least one microlensing system is required")
     requested_method = (
-        production_ipm_config(dynamic=False) if method is None else method
+        _production_static_ipm_config() if method is None else method
     )
     methods = tuple(item._method_for_domain(requested_method) for item in resolved)
     if any(candidate != methods[0] for candidate in methods[1:]):

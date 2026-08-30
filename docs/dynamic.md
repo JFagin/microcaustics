@@ -6,7 +6,7 @@ in the same order:
 
 ```python
 schedule = mc.production_dynamic_config()
-ipm = mc.production_ipm_config(dynamic=True)
+ipm = mc.production_ipm_config()
 
 maps = simulation.dynamic_maps(
     lens_region,
@@ -139,7 +139,7 @@ The validated production settings have named constructors so examples do not
 silently drift apart:
 
 ```python
-ipm = mc.production_ipm_config(dynamic=True)
+ipm = mc.production_ipm_config()
 schedule = mc.production_dynamic_config()
 ```
 
@@ -150,7 +150,7 @@ endpoint-union scouting. It uses no source-pixel halo
 (`scout_dilation_cells=1`). The dual-scout option performs the frame-zero `k=1`
 to `k=2` scalar normalization correction and reuses that constant for later
 frames. For one unrelated static map, use
-`production_ipm_config(dynamic=False)`, which selects `k=1` and does not run
+the default static-map operation, which selects `k=1` and does not run
 the dynamic correction. For a
 more conservative validation run, also set `scout_refresh_frames=1` and
 optionally disable the scalar correction. The returned metadata identifies

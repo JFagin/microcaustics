@@ -43,6 +43,11 @@ limits. `anchor_count` and `gauge_count` are independent positive integers.
 increasing them adds redundant paths and decreasing them reduces label work.
 The configured `minimum_safe_gauges` must not exceed `gauge_count`.
 
+High-level `MicrolensingSystem` calls do not require a `CausticConfig`. When it
+is omitted, labels inherit the map method's far-field approximation and the
+dynamic schedule's temporal batch size. Construct this configuration only to
+change label-specific controls or when using the low-level simulation API.
+
 ```python
 caustic_config = mc.CausticConfig(
     far_field_approx=ipm.far_field_approx,

@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
+from ._common import add_scale_bar, hide_image_axes, panel_colorbar
+
 
 def save_fixed_palette_gif(
     frames: Iterable[np.ndarray],
@@ -92,4 +94,100 @@ def save_fixed_palette_gif(
         optimize=False,
         disposal=2,
     )
+    return destination
+
+
+def animate_standardized_source_bands(
+    source,
+    times_days,
+    standardization,
+    grid,
+    path: str | Path,
+    *,
+    batch_size: int = 4,
+    fps: float = 8.0,
+    scale_bar_uas: float = 1.0,
+    cmap: str = "seismic",
+    figsize: tuple[float, float] | None = None,
+    dtype=None,
+    device=None,
+) -> Path:
+    """Animate standardized multiband source images with fixed colors.
+
+    ``standardization`` is returned by
+    :func:`microcaustics.plotting.standardize_source_over_time`. The same
+    temporal mean, support mask, clipping interval, Matplotlib normalization,
+    and GIF palette are applied to every frame. This avoids both scientific
+    renormalization and palette flicker.
+    """
+
+    import matplotlib.pyplot as plt
+    import torch
+
+    times = torch.as_tensor(times_days)
+    if times.ndim != 1 or times.numel() < 1:
+        raise ValueError("times_days must be a non-empty one-dimensional sequence")
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be positive")
+    band_names = tuple(source.geometry.band_names)
+    figure, axes = plt.subplots(
+        1,
+        len(band_names),
+        figsize=figsize or (2.65 * len(band_names), 2.7),
+        squeeze=False,
+    )
+    axes = axes[0]
+    artists = []
+    for axis, band in zip(axes, band_names, strict=True):
+        artist = axis.imshow(
+            np.zeros(grid.shape),
+            origin="lower",
+            extent=grid.bounds_uas,
+            cmap=cmap,
+            vmin=standardization.clip[0],
+            vmax=standardization.clip[1],
+            aspect="equal",
+        )
+        artists.append(artist)
+        axis.set_title(f"{band} band")
+        add_scale_bar(
+            axis,
+            scale_bar_uas,
+            label=rf"{scale_bar_uas:g} $\mu$as",
+            color="black",
+            font_size=10,
+        )
+        hide_image_axes(axis)
+    panel_colorbar(
+        figure,
+        axes[-1],
+        artists[-1],
+        label=r"$(B_\lambda-\overline{B}_\lambda)/\sigma_{\overline{B}_\lambda}$",
+    )
+    time_text = axes[0].text(
+        0.03,
+        0.97,
+        "",
+        transform=axes[0].transAxes,
+        ha="left",
+        va="top",
+        color="black",
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.72, "pad": 1.5},
+    )
+    figure.subplots_adjust(
+        left=0.015, right=0.955, bottom=0.04, top=0.88, wspace=0.13
+    )
+    frames = []
+    for chunk in times.split(int(batch_size)):
+        values = source.brightness(chunk, dtype=dtype, device=device)
+        values = values.detach().cpu().numpy().astype(np.float64, copy=False)
+        for time_day, image in zip(chunk, values, strict=True):
+            standardized = standardization.standardize(image)
+            for band_index, artist in enumerate(artists):
+                artist.set_data(standardized[:, :, band_index])
+            time_text.set_text(f"t = {float(time_day) / 365.0:.1f} yr")
+            figure.canvas.draw()
+            frames.append(np.asarray(figure.canvas.buffer_rgba())[..., :3].copy())
+    destination = save_fixed_palette_gif(frames, path, fps=fps, dither=True)
+    plt.close(figure)
     return destination

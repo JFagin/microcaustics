@@ -64,7 +64,7 @@ class MagnificationMap:
 
 @dataclass(frozen=True)
 class LightCurve:
-    """Lensed and optional unlensed multiband fluxes sampled in time."""
+    """Lensed and optional unlensed multiband flux densities in Jy."""
 
     times_days: torch.Tensor
     flux: torch.Tensor
@@ -876,8 +876,22 @@ class MacroImageLightCurve:
         if not np.isfinite(float(self.arrival_time_delay_days)):
             raise ValueError("arrival_time_delay_days must be finite")
         if self.caustics is not None:
-            LabeledLightCurve(self.light_curve, tuple(self.caustics))
-            object.__setattr__(self, "caustics", tuple(self.caustics))
+            caustics = tuple(self.caustics)
+            if len(caustics) == int(self.light_curve.times_days.numel()):
+                LabeledLightCurve(self.light_curve, caustics)
+            else:
+                MultirateLabeledLightCurve(self.light_curve, caustics)
+            object.__setattr__(self, "caustics", caustics)
+
+    @property
+    def label_times_days(self) -> torch.Tensor | None:
+        """Return sparse map epochs associated with optional labels."""
+
+        if self.caustics is None:
+            return None
+        return torch.tensor(
+            [frame.time_days for frame in self.caustics], dtype=torch.float64
+        )
 
     @property
     def crossing_labels(self) -> torch.Tensor | None:

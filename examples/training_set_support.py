@@ -23,6 +23,134 @@ WAVELENGTHS_ANGSTROM = (3671.0, 4827.0, 6223.0, 7546.0, 8691.0, 9712.0)
 BAND_NAMES = ("u", "g", "r", "i", "z", "y")
 
 
+def plot_training_light_curves(
+    records,
+    output_path: str | Path,
+    *,
+    annotations: list[str] | None = None,
+):
+    """Plot training curves and their three source-center diagnostics.
+
+    This presentation helper keeps the generation notebooks focused on the
+    physical systems and priors. Stored fluxes remain in Jy; conversion to AB
+    magnitudes uses the public package conversion.
+    """
+
+    import matplotlib.pyplot as plt
+
+    from microcaustics import plotting as mcp
+
+    records = list(records)
+    annotations = [""] * len(records) if annotations is None else annotations
+    if len(annotations) != len(records):
+        raise ValueError("annotations must match the number of records")
+    figure = plt.figure(figsize=(14.2, 2.28 * len(records)))
+    layout = figure.add_gridspec(
+        len(records), 4,
+        width_ratios=(5.4, 1.45, 1.15, 1.55), hspace=0.10, wspace=0.32,
+    )
+    for index, (record, annotation) in enumerate(zip(records, annotations, strict=True)):
+        time = record["times_days"]
+        map_time = record["map_times_days"] if "map_times_days" in record.files else time
+        names = record["band_names"].astype(str).tolist()
+        band = names.index("i")
+        total_mag = mc.flux_to_magnitude(torch.as_tensor(record["flux"][:, band])).numpy()
+        micro_mag = mc.flux_to_magnitude(
+            torch.as_tensor(record["flux_microlensing_only"][:, band])
+        ).numpy()
+        diagnostics = (
+            np.log10(np.clip(record["center_magnification"], 1.0e-12, None)),
+            record["crossing_events"].astype(float),
+            record["center_distance_uas"],
+        )
+
+        axis = figure.add_subplot(layout[index, 0])
+        axis.plot(time, micro_mag, color="black", lw=1.35, label="Microlensing only")
+        axis.plot(
+            time, total_mag, color="darkorange", lw=1.15,
+            label="Microlensing + intrinsic variability",
+        )
+        axis.invert_yaxis()
+        axis.set_ylabel(f"LC {index + 1}\nbrightness [mag]")
+        if annotation:
+            axis.text(0.012, 0.08, annotation, transform=axis.transAxes, fontsize=8.5)
+        if index == 0:
+            axis.legend(loc="upper right", frameon=True, fontsize=9)
+        if index < len(records) - 1:
+            axis.tick_params(labelbottom=False)
+        else:
+            axis.set_xlabel("time [days]")
+        mcp.finish_axis(axis)
+
+        labels = (r"$\log_{10}\mu$", "crossing", r"$d_{\rm caustic}$ [$\mu$as]")
+        for column, (values, label) in enumerate(
+            zip(diagnostics, labels, strict=True), start=1
+        ):
+            axis = figure.add_subplot(layout[index, column])
+            if column == 2:
+                axis.step(map_time, values, where="pre", color="black", lw=1.05)
+                axis.set_ylim(-0.05, 1.05)
+                axis.set_yticks((0, 1))
+            else:
+                axis.plot(map_time, values, color="black", lw=1.05)
+            axis.set_xlim(float(time[0]), float(time[-1]))
+            axis.set_ylabel(label, fontsize=9, labelpad=2)
+            if index == 0 and column == 2:
+                axis.set_title("Labels at source center", fontsize=10)
+            if index < len(records) - 1:
+                axis.tick_params(labelbottom=False)
+            else:
+                axis.set_xlabel("time [days]", fontsize=9)
+            mcp.finish_axis(axis)
+    figure.align_ylabels()
+    figure.subplots_adjust(left=0.075, right=0.99, bottom=0.065, top=0.98)
+    figure.savefig(Path(output_path), bbox_inches="tight")
+    return figure
+
+
+def plot_training_map_gallery(
+    frames,
+    output_path: str | Path,
+    *,
+    source_widths_uas=None,
+):
+    """Plot one consistently normalized labeled map per training realization."""
+
+    import matplotlib.pyplot as plt
+
+    from microcaustics import plotting as mcp
+
+    frames = list(frames)
+    widths = [None] * len(frames) if source_widths_uas is None else source_widths_uas
+    logs = [
+        np.log10(np.clip(frame.magnification_map.numpy(), 1.0e-12, None))
+        for frame in frames
+    ]
+    finite = np.concatenate([values[np.isfinite(values)] for values in logs])
+    vmin, vmax = np.percentile(finite, (0.25, 99.75))
+    figure = plt.figure(figsize=(2.96 * len(frames), 3.15))
+    layout = figure.add_gridspec(
+        1, len(frames) + 1,
+        width_ratios=(*([1] * len(frames)), 0.045), wspace=0.06,
+    )
+    axes = [figure.add_subplot(layout[0, index]) for index in range(len(frames))]
+    colorbar_axis = figure.add_subplot(layout[0, -1])
+    for index, (axis, frame, width) in enumerate(zip(axes, frames, widths, strict=True)):
+        scale_bar = 2.0 if width is None or float(width) >= 4.0 else 0.5
+        mcp.plot_magnification_map(
+            frame.magnification_map, ax=axis, caustics=frame.caustics.caustics,
+            log10=True, vmin=float(vmin), vmax=float(vmax), colorbar=False,
+            scale_bar_uas=scale_bar, show_axes=False,
+            title=rf"LC {index + 1}, $t=0$ days",
+        )
+    colorbar = figure.colorbar(axes[-1].images[-1], cax=colorbar_axis)
+    colorbar.set_label(r"$\log_{10}\mu$")
+    colorbar.ax.tick_params(direction="in")
+    figure.subplots_adjust(left=0.015, right=0.985, bottom=0.03, top=0.88)
+    figure.savefig(Path(output_path), bbox_inches="tight")
+    return figure
+
+
 @dataclass(frozen=True)
 class TrainingSystem:
     """One high-level physical system and its training-set provenance."""
@@ -90,7 +218,6 @@ def runtime_for_device(device: str) -> mc.RuntimeConfig:
 
 
 def _thin_disk(
-    source_grid: mc.PlaneGrid,
     distances: mc.LensingDistances,
     *,
     source_redshift: float,
@@ -101,31 +228,26 @@ def _thin_disk(
     position_angle_deg: float,
     times_days: torch.Tensor,
     driver_seed: int,
+    source_resolution: int,
 ) -> mc.PixelatedSource:
     """Construct a multiband disk with a reproducible broken-PSD driver."""
 
-    pixel_uas = source_grid.pixel_scale_uas
-    pixel_m = tuple(
-        float(distances.uas_to_source_length(value, dtype=torch.float64))
-        for value in pixel_uas
-    )
-    geometry = mc.SourceGeometry(
-        source_grid.shape,
-        pixel_m,
-        WAVELENGTHS_ANGSTROM,
-        BAND_NAMES,
-    )
-    disk = mc.ThinDiskSource.from_lensing_distances(
-        geometry,
+    model = mc.ThinDiskModel(
         black_hole_mass_solar=black_hole_mass_solar,
         eddington_ratio=eddington_ratio,
-        distances=distances,
+        bands=dict(zip(BAND_NAMES, WAVELENGTHS_ANGSTROM, strict=True)),
         source_redshift=source_redshift,
         spin=spin,
         inclination_deg=inclination_deg,
         position_angle_deg=position_angle_deg,
         relativity="approximate",
+        support_lamp_fraction=0.1,
+        support_corona_height_above_isco_rg=20.0,
+        resolution=source_resolution,
+        enclosed_flux_fraction=0.999,
+        source_margin=1.05,
     )
+    disk = model.pixelate(distances)
     driver = mc.broken_power_law_driving_signal(
         times_days,
         break_timescale_days=200.0,
@@ -138,36 +260,6 @@ def _thin_disk(
     return mc.ModulatedSource(disk, driver, name="variable_thin_disk")
 
 
-def _disk_field_of_view_uas(
-    distances: mc.LensingDistances,
-    *,
-    black_hole_mass_solar: float,
-    eddington_ratio: float,
-    spin: float,
-    source_redshift: float,
-) -> float:
-    """Enclose 99.9% of the reddest-band disk flux plus a 5% margin."""
-
-    radius_rg = mc.thin_disk_flux_radius_rg(
-        black_hole_mass_solar=black_hole_mass_solar,
-        eddington_ratio=eddington_ratio,
-        spin=spin,
-        observed_wavelength_angstrom=max(WAVELENGTHS_ANGSTROM),
-        source_redshift=source_redshift,
-        lamp_fraction=0.1,
-        corona_height_above_isco_rg=20.0,
-        flux_fraction=0.999,
-        safety_factor=1.05,
-    )
-    gravitational_radius_m = float(mc.gravitational_radius_m(black_hole_mass_solar))
-    return 2.0 * float(
-        distances.source_length_to_uas(
-            radius_rg * gravitational_radius_m,
-            dtype=torch.float64,
-        )
-    )
-
-
 def q2237_b_system(
     *,
     seed: int,
@@ -176,7 +268,6 @@ def q2237_b_system(
     times_days: torch.Tensor,
     source_resolution: int = 1024,
     label_resolution: int = 8192,
-    source_fov_uas: float | None = None,
 ) -> TrainingSystem:
     """Build one Q2237 image-B-like realization from public package objects."""
 
@@ -190,20 +281,7 @@ def q2237_b_system(
     )
     black_hole_mass_solar = 10.0**9.08
     spin = 0.74
-    if source_fov_uas is None:
-        source_fov_uas = _disk_field_of_view_uas(
-            distances,
-            black_hole_mass_solar=black_hole_mass_solar,
-            eddington_ratio=0.34,
-            spin=spin,
-            source_redshift=source_redshift,
-        )
-    source_grid = mc.PlaneGrid(
-        (int(source_resolution), int(source_resolution)),
-        (float(source_fov_uas), float(source_fov_uas)),
-    )
     source = _thin_disk(
-        source_grid,
         distances,
         source_redshift=source_redshift,
         black_hole_mass_solar=black_hole_mass_solar,
@@ -213,6 +291,7 @@ def q2237_b_system(
         position_angle_deg=175.0,
         times_days=times_days,
         driver_seed=driver_seed,
+        source_resolution=source_resolution,
     )
     population = mc.StellarPopulation.salpeter(
         mean_mass_solar=0.3,
@@ -224,8 +303,6 @@ def q2237_b_system(
         source_redshift=source_redshift,
         macro=macro,
         source=source,
-        source_grid=source_grid,
-        source_support_radius_uas=0.5 * float(source_fov_uas),
         stellar_population=population,
         duration_days=float(times_days.max()) if times_days.numel() else 0.0,
         light_loss=0.01,
@@ -243,7 +320,7 @@ def q2237_b_system(
             "seed": int(seed),
             "driver_seed": int(driver_seed),
             "star_count": len(realization.stars),
-            "source_fov_uas": float(source_fov_uas),
+            "source_fov_uas": realization.source_grid.field_of_view_uas[0],
             "lens_fov_uas": realization.lens_region.field_of_view_uas[0],
             "kappa": macro.convergence,
             "gamma": macro.shear,
@@ -291,19 +368,7 @@ def random_system(
         smooth_matter_fraction=smooth_fraction,
     )
     black_hole_mass_solar = 10.0**log_mass
-    source_fov = _disk_field_of_view_uas(
-        distances,
-        black_hole_mass_solar=black_hole_mass_solar,
-        eddington_ratio=eddington_ratio,
-        spin=spin,
-        source_redshift=source_redshift,
-    )
-    source_grid = mc.PlaneGrid(
-        (int(source_resolution), int(source_resolution)),
-        (source_fov, source_fov),
-    )
     source = _thin_disk(
-        source_grid,
         distances,
         source_redshift=source_redshift,
         black_hole_mass_solar=black_hole_mass_solar,
@@ -313,6 +378,7 @@ def random_system(
         position_angle_deg=disk_angle,
         times_days=times_days,
         driver_seed=seed + 200_000,
+        source_resolution=source_resolution,
     )
     population = mc.StellarPopulation.salpeter(
         mean_mass_solar=0.3,
@@ -324,8 +390,6 @@ def random_system(
         source_redshift=source_redshift,
         macro=macro,
         source=source,
-        source_grid=source_grid,
-        source_support_radius_uas=0.5 * source_fov,
         stellar_population=population,
         duration_days=float(times_days.max()) if times_days.numel() else 0.0,
         light_loss=0.01,
@@ -350,7 +414,7 @@ def random_system(
             "spin": spin,
             "inclination_deg": inclination,
             "disk_position_angle_deg": disk_angle,
-            "source_fov_uas": source_fov,
+            "source_fov_uas": realization.source_grid.field_of_view_uas[0],
             "lens_fov_uas": realization.lens_region.field_of_view_uas[0],
             "star_count": len(realization.stars),
         },
@@ -366,7 +430,7 @@ def generate_labeled_example(
 ) -> tuple[mc.MultirateLabeledLightCurve, np.ndarray, float]:
     """Generate sparse dynamic maps/labels and a fine-cadence light curve."""
 
-    method = mc.production_ipm_config(dynamic=True, rays=int(rays))
+    method = mc.production_ipm_config(rays=int(rays))
     schedule = mc.production_dynamic_config()
     caustics = mc.CausticConfig(
         far_field_approx=method.far_field_approx,
@@ -399,8 +463,8 @@ def generate_labeled_example(
     )
     system.simulation.runtime.synchronize()
     elapsed = perf_counter() - start
-    center_series = torch.stack(center_magnifications).cpu().numpy().astype(
-        np.float32, copy=False
+    center_series = (
+        torch.stack(center_magnifications).cpu().numpy().astype(np.float32, copy=False)
     )
     return result, center_series, elapsed
 
@@ -490,7 +554,7 @@ def save_example(
         ),
         "timing_components_seconds": dict(curve.timing.component_seconds),
         "steady_seconds": float(curve.timing.steady_seconds),
-        "method": asdict(mc.production_ipm_config(dynamic=True)),
+        "method": asdict(mc.production_ipm_config()),
         "dynamic_schedule": asdict(mc.production_dynamic_config()),
     }
     # Convert enum-like values and nested tensors only through JSON's explicit

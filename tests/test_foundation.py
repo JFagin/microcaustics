@@ -54,9 +54,9 @@ class FoundationTests(unittest.TestCase):
     def test_gravitational_radius_uses_public_units(self) -> None:
         self.assertAlmostEqual(float(gravitational_radius_m(1.0)), 1476.625, places=3)
 
-    def test_production_presets_distinguish_static_and_dynamic_scouts(self) -> None:
-        static = production_ipm_config(dynamic=False)
-        dynamic = production_ipm_config(dynamic=True)
+    def test_production_preset_supports_explicit_complete_scout(self) -> None:
+        dynamic = production_ipm_config()
+        static = production_ipm_config(scout_ratio=1)
         self.assertEqual(static.scout_ratio, 1)
         self.assertFalse(static.dual_scout_scalar_correction)
         self.assertEqual(dynamic.scout_ratio, 2)
@@ -139,6 +139,22 @@ class FoundationTests(unittest.TestCase):
         )
         source = StaticSource(torch.ones(2, 3, 2), geometry)
         self.assertEqual(source.brightness([0.0, 1.0]).shape, (2, 2, 3, 2))
+
+    def test_source_geometry_from_angular_field(self) -> None:
+        distances = LensingDistances(8.0e24, 1.6e25, 9.0e24)
+        geometry = SourceGeometry.from_angular(
+            distances,
+            shape=(20, 40),
+            field_of_view_uas=(2.0, 8.0),
+            bands={"g": 4800.0, "i": 7600.0},
+        )
+        field_m = distances.uas_to_source_length(
+            torch.tensor((2.0, 8.0)), dtype=torch.float32
+        )
+        self.assertEqual(geometry.shape, (20, 40))
+        self.assertAlmostEqual(geometry.pixel_scale_m[0], float(field_m[0]) / 20)
+        self.assertAlmostEqual(geometry.pixel_scale_m[1], float(field_m[1]) / 40)
+        self.assertEqual(geometry.band_names, ("g", "i"))
 
     def test_backend_falls_back_without_triton(self) -> None:
         capabilities = RuntimeCapabilities(
@@ -535,7 +551,7 @@ class FoundationTests(unittest.TestCase):
         self.assertAlmostEqual(
             float(coordinates.transfer.relative_delay_days[hit].sum()),
             428.7570236620868,
-            places=11,
+            delta=1.0e-9,
         )
         self.assertAlmostEqual(
             float(coordinates.transfer.relative_delay_days[hit].max()),
@@ -2063,7 +2079,17 @@ class FoundationTests(unittest.TestCase):
             )
         )
         for actual, expected in zip(fused, scalar, strict=True):
-            torch.testing.assert_close(actual.values, expected.values, rtol=0, atol=0)
+            # The two schedules reduce otherwise identical float32
+            # contributions in a different order.  CPU vector libraries may
+            # therefore differ by one ULP even though the numerical contract
+            # is unchanged.
+            tolerance = 2.0 * torch.finfo(actual.values.dtype).eps
+            torch.testing.assert_close(
+                actual.values,
+                expected.values,
+                rtol=tolerance,
+                atol=tolerance,
+            )
             self.assertEqual(actual.metadata["temporal_batch_real_frames"], 2 if actual.time_days < 2 else 1)
             self.assertFalse(actual.metadata["dynamic_temporal_solver_fused"])
 

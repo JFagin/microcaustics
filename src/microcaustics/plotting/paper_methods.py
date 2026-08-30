@@ -496,6 +496,290 @@ def render_paper_ipm_schematic(
     return [Path(path) for path in generated]
 
 
+def render_live_paper_ipm_schematic(
+    simulation,
+    lens_region,
+    source_grid,
+    config,
+    output_directory,
+    *,
+    time_days=0.0,
+    output_prefix="paper_tile_exact_ipm_schematic",
+):
+    """Generate the paper IPM schematic from a live simulation.
+
+    This is the data-generating counterpart to
+    :func:`render_paper_ipm_schematic`. It evaluates the configured scout and
+    ray traces one representative retained fine cell, then passes those live
+    diagnostics through the unchanged manuscript renderer. The resulting
+    layout, labels, limits, marker conventions, and typography therefore stay
+    identical to the published schematic without relying on archived arrays.
+    """
+
+    import torch
+
+    from ..solvers.far_field import TaylorFarFieldApproximation
+    from ..solvers.ipm import _source_scout_cells
+
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    far_field = None
+    if config.far_field_approx.enabled:
+        far_field = TaylorFarFieldApproximation(
+            simulation,
+            lens_region,
+            config.far_field_approx,
+            time_days=float(time_days),
+        )
+    selected, fine_ny, fine_nx, _, _ = _source_scout_cells(
+        simulation,
+        far_field,
+        lens_region,
+        source_grid,
+        config,
+        time_days=float(time_days),
+        _return_corners=True,
+    )
+    if selected.numel() == 0:
+        raise RuntimeError("the live paper schematic scout selected no cells")
+
+    xmin, xmax, ymin, ymax = (float(value) for value in lens_region.bounds_uas)
+    fine_dx = (xmax - xmin) / int(fine_nx)
+    fine_dy = (ymax - ymin) / int(fine_ny)
+    rows = torch.div(selected, int(fine_nx), rounding_mode="floor")
+    columns = selected - rows * int(fine_nx)
+    center_x = xmin + (columns.to(simulation.runtime.dtype) + 0.5) * fine_dx
+    center_y = ymin + (rows.to(simulation.runtime.dtype) + 0.5) * fine_dy
+    if far_field is None:
+        mapped_x, mapped_y, _ = simulation.raytrace_direct(
+            center_x, center_y, time_days=float(time_days)
+        )
+    else:
+        mapped_x, mapped_y = far_field.raytrace(center_x, center_y)
+    source_center_x = float(source_grid.center_uas[1])
+    source_center_y = float(source_grid.center_uas[0])
+    center_distance_squared = (
+        (mapped_x - source_center_x).square()
+        + (mapped_y - source_center_y).square()
+    )
+
+    # A source position generally has many microimages. Choosing only the
+    # closest mapped center can therefore select a nearly singular cell even
+    # when several clearer examples reach the same central source region. For
+    # the explanatory schematic, inspect a bounded pool of the closest cells
+    # and prefer a well-conditioned mapped quadrilateral. This changes only
+    # which already-retained cell is displayed; it does not affect scouting or
+    # map construction.
+    candidate_count = min(4096, int(selected.numel()))
+    candidate_indices = torch.topk(
+        center_distance_squared,
+        candidate_count,
+        largest=False,
+    ).indices
+    candidate_rows = rows[candidate_indices]
+    candidate_columns = columns[candidate_indices]
+    candidate_x0 = xmin + candidate_columns.to(simulation.runtime.dtype) * fine_dx
+    candidate_y0 = ymin + candidate_rows.to(simulation.runtime.dtype) * fine_dy
+    candidate_corner_x = torch.stack(
+        (
+            candidate_x0,
+            candidate_x0 + fine_dx,
+            candidate_x0 + fine_dx,
+            candidate_x0,
+        ),
+        dim=1,
+    )
+    candidate_corner_y = torch.stack(
+        (
+            candidate_y0,
+            candidate_y0,
+            candidate_y0 + fine_dy,
+            candidate_y0 + fine_dy,
+        ),
+        dim=1,
+    )
+    flat_corner_x = candidate_corner_x.reshape(-1)
+    flat_corner_y = candidate_corner_y.reshape(-1)
+    if far_field is None:
+        candidate_source_x, candidate_source_y, _ = simulation.raytrace_direct(
+            flat_corner_x,
+            flat_corner_y,
+            time_days=float(time_days),
+        )
+    else:
+        candidate_source_x, candidate_source_y = far_field.raytrace(
+            flat_corner_x,
+            flat_corner_y,
+        )
+    candidate_source_x = candidate_source_x.reshape(candidate_count, 4)
+    candidate_source_y = candidate_source_y.reshape(candidate_count, 4)
+    edge_x = torch.stack(
+        (
+            candidate_source_x[:, 1] - candidate_source_x[:, 0],
+            candidate_source_y[:, 1] - candidate_source_y[:, 0],
+        ),
+        dim=1,
+    )
+    edge_y = torch.stack(
+        (
+            candidate_source_x[:, 3] - candidate_source_x[:, 0],
+            candidate_source_y[:, 3] - candidate_source_y[:, 0],
+        ),
+        dim=1,
+    )
+    affine_edges = torch.stack((edge_x, edge_y), dim=2)
+    singular_values = torch.linalg.svdvals(affine_edges)
+    condition_number = singular_values[:, 0] / singular_values[:, 1].clamp_min(
+        torch.finfo(simulation.runtime.dtype).eps
+    )
+    edge_scale = torch.maximum(
+        torch.linalg.vector_norm(edge_x, dim=1),
+        torch.linalg.vector_norm(edge_y, dim=1),
+    )
+    source_xmin, source_xmax, source_ymin, source_ymax = (
+        float(value) for value in source_grid.bounds_uas
+    )
+    source_scale = min(
+        float(source_grid.field_of_view_uas[0]),
+        float(source_grid.field_of_view_uas[1]),
+    )
+    central_radius = 0.05 * source_scale
+    maximum_edge_scale = 0.15 * source_scale
+    candidate_distance = torch.sqrt(center_distance_squared[candidate_indices])
+    inside_source = (
+        (candidate_source_x >= source_xmin).all(dim=1)
+        & (candidate_source_x <= source_xmax).all(dim=1)
+        & (candidate_source_y >= source_ymin).all(dim=1)
+        & (candidate_source_y <= source_ymax).all(dim=1)
+    )
+    suitable = (
+        inside_source
+        & torch.isfinite(condition_number)
+        & (candidate_distance <= central_radius)
+        & (edge_scale <= maximum_edge_scale)
+    )
+    if bool(torch.any(suitable)):
+        score = (
+            torch.log(condition_number)
+            + 0.15 * candidate_distance / max(central_radius, 1.0e-12)
+            + 0.10 * edge_scale / max(maximum_edge_scale, 1.0e-12)
+        )
+        score = torch.where(
+            suitable,
+            score,
+            torch.full_like(score, float("inf")),
+        )
+        representative = candidate_indices[torch.argmin(score)]
+    else:
+        representative = torch.argmin(center_distance_squared)
+    row = int(rows[representative])
+    column = int(columns[representative])
+    cell_x0 = xmin + column * fine_dx
+    cell_y0 = ymin + row * fine_dy
+
+    refinement = int(config.refinement)
+    lens_x = torch.linspace(
+        cell_x0,
+        cell_x0 + fine_dx,
+        refinement + 1,
+        device=simulation.runtime.device,
+        dtype=simulation.runtime.dtype,
+    )
+    lens_y = torch.linspace(
+        cell_y0,
+        cell_y0 + fine_dy,
+        refinement + 1,
+        device=simulation.runtime.device,
+        dtype=simulation.runtime.dtype,
+    )
+    mesh_y, mesh_x = torch.meshgrid(lens_y, lens_x, indexing="ij")
+    if far_field is None:
+        source_x, source_y, _ = simulation.raytrace_direct(
+            mesh_x, mesh_y, time_days=float(time_days)
+        )
+    else:
+        source_x, source_y = far_field.raytrace(mesh_x, mesh_y)
+    source_nodes = torch.stack((source_x, source_y), dim=-1)
+
+    lens_quad = np.asarray(
+        (
+            (cell_x0, cell_y0),
+            (cell_x0 + fine_dx, cell_y0),
+            (cell_x0 + fine_dx, cell_y0 + fine_dy),
+            (cell_x0, cell_y0 + fine_dy),
+        ),
+        dtype=np.float64,
+    )
+    nodes_np = source_nodes.detach().cpu().numpy()
+    source_quad = np.asarray(
+        (nodes_np[0, 0], nodes_np[0, -1], nodes_np[-1, -1], nodes_np[-1, 0]),
+        dtype=np.float64,
+    )
+
+    ratio = int(config.scout_ratio)
+    fine_mask = np.zeros((int(fine_ny), int(fine_nx)), dtype=np.bool_)
+    fine_mask[
+        rows.detach().cpu().numpy().astype(int),
+        columns.detach().cpu().numpy().astype(int),
+    ] = True
+    coarse_ny = int(fine_ny) // ratio
+    coarse_nx = int(fine_nx) // ratio
+    coarse_mask_yx = fine_mask.reshape(
+        coarse_ny, ratio, coarse_nx, ratio
+    ).any(axis=(1, 3))
+    selection_stage = coarse_mask_yx.T.astype(np.uint8)
+    probe_x = np.linspace(xmin, xmax, coarse_nx + 1)
+    probe_y = np.linspace(ymin, ymax, coarse_ny + 1)
+
+    field = simulation.lens_state(float(time_days))
+    star_x = field.x_uas.detach().cpu().numpy()
+    star_y = field.y_uas.detach().cpu().numpy()
+    if field.mass_solar is None:
+        star_mass = field.einstein_radius_uas.detach().cpu().numpy() ** 2
+    else:
+        star_mass = field.mass_solar.detach().cpu().numpy()
+    stars_path = output_directory / f"{output_prefix}_live_stars.npz"
+    np.savez_compressed(
+        stars_path,
+        star_x=star_x,
+        star_y=star_y,
+        star_mass=star_mass,
+    )
+    source_extent = np.asarray(source_grid.bounds_uas, dtype=np.float64)
+    payload_path = output_directory / f"{output_prefix}_live_diagnostics.npz"
+    np.savez_compressed(
+        payload_path,
+        probe_x_edges_uas=probe_x,
+        probe_y_edges_uas=probe_y,
+        selection_stage=selection_stage,
+        displayed_lens_quad_uas=lens_quad,
+        displayed_mapped_quad_uas=source_quad,
+        displayed_refinement_source_grid_uas=nodes_np,
+        displayed_fine_cell=np.asarray((column, row), dtype=np.int32),
+        fine_grid_nx=np.asarray(int(fine_nx), dtype=np.int32),
+        fine_grid_ny=np.asarray(int(fine_ny), dtype=np.int32),
+        displayed_scout_grid_ratio=np.asarray(ratio, dtype=np.int32),
+        source_extent_uas=source_extent,
+        stellar_aperture_radius_uas=np.asarray(
+            0.5 * min(xmax - xmin, ymax - ymin), dtype=np.float64
+        ),
+        stellar_aperture_center_uas=np.asarray(
+            ((xmin + xmax) / 2.0, (ymin + ymax) / 2.0), dtype=np.float64
+        ),
+        source_npz=np.asarray(str(stars_path.resolve())),
+        displayed_vertex_numbers=np.asarray((1, 2, 3, 4), dtype=np.int32),
+    )
+    return render_paper_ipm_schematic(
+        payload_path,
+        stars_path,
+        output_directory,
+        refinement=refinement,
+        virtual_refinement=int(config.virtual_refinement),
+        source_bins=int(source_grid.shape[1]),
+        output_prefix=output_prefix,
+    )
+
+
 def render_paper_anchor_gauge(
     diagnostic_path,
     output_directory,
@@ -682,6 +966,68 @@ def render_paper_anchor_gauge(
         fig.savefig(output_path, dpi=360, bbox_inches="tight", pad_inches=0.01)
         plt.close(fig)
     return output_path
+
+
+def render_live_paper_anchor_gauge(
+    frame,
+    output_directory,
+    *,
+    output_prefix="q2237b_anchor_gauge_method",
+):
+    """Generate the paper anchor/gauge panel from a live labeled frame.
+
+    The production label map and probes are evaluated before this function is
+    called. This adapter only converts those public result objects into the
+    compact representation consumed by the unchanged manuscript renderer.
+    """
+
+    if frame.label_map is None:
+        raise ValueError("a diagnostic label map is required")
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    labels = frame.labels
+    source_extent = np.asarray(frame.label_map.grid.bounds_uas, dtype=np.float64)
+    width = source_extent[1] - source_extent[0]
+    height = source_extent[3] - source_extent[2]
+    pad = 0.035 * max(width, height)
+    outer_extent = source_extent + np.asarray((-pad, pad, -pad, pad))
+    anchors = labels.anchor_points_uas.detach().cpu().numpy()
+    gauges = labels.gauge_points_uas.detach().cpu().numpy()
+    anchor_labels = labels.anchor_offsets.detach().cpu().numpy().astype(np.uint8) & 1
+    gauge_labels = labels.gauge_labels.detach().cpu().numpy().astype(np.uint8) & 1
+    center = labels.metadata.get("source_center_uas")
+    if center is None:
+        center = tuple(gauges.mean(axis=0)) if gauges.size else (0.0, 0.0)
+    center = np.asarray(center, dtype=np.float64)
+    ray_segments = {0: [], 1: []}
+    for point, label in zip(anchors, anchor_labels, strict=True):
+        ray_segments[int(label)].append((point, center))
+    for label in (0, 1):
+        ray_segments[label] = np.asarray(ray_segments[label], dtype=np.float64).reshape(
+            -1, 2, 2
+        )
+    payload_path = output_directory / f"{output_prefix}_live_diagnostics.npz"
+    np.savez_compressed(
+        payload_path,
+        source_extent=source_extent,
+        outer_extent=outer_extent,
+        # The frozen renderer uses x-major storage and transposes for imshow.
+        binary_map=frame.label_map.values.detach().cpu().numpy().T.astype(np.uint8),
+        caustic_segments=frame.caustics.caustic_segments_uas.detach().cpu().numpy(),
+        anchor_points=anchors,
+        anchor_labels=anchor_labels,
+        gauge_points=gauges,
+        gauge_labels=gauge_labels,
+        center_point=center,
+        center_label=np.asarray(int(labels.center_label) & 1, dtype=np.uint8),
+        ray_segments_class_0=ray_segments[0],
+        ray_segments_class_1=ray_segments[1],
+    )
+    return render_paper_anchor_gauge(
+        payload_path,
+        output_directory,
+        output_prefix=output_prefix,
+    )
 
 
 def render_paper_sim5_validation(

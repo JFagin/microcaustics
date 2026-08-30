@@ -8,6 +8,8 @@ import microcaustics as mc
 
 
 def main() -> None:
+    """Build and evaluate a delayed thermal-reprocessing source."""
+
     dtype = torch.float64
     mass_solar = 1.0e8
     spin = 0.7

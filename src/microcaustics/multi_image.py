@@ -325,6 +325,7 @@ class MultiImageSimulation:
         source: PixelatedSource,
         distances: LensingDistances,
         *,
+        include_labels: bool = False,
         map_observers: Mapping[str, Callable] | None = None,
     ) -> MultiImageLightCurves:
         """Generate fine-cadence resolved curves from sparse dynamic maps.
@@ -333,8 +334,8 @@ class MultiImageSimulation:
         reverberation variability may be evaluated daily while each independent
         microlensing field is generated on a slower cadence. Explicit arrival
         delays on :class:`MacroImageConfig` are applied to source emission only.
-        Caustic products remain tied to map epochs and can be generated through
-        :meth:`dynamic_maps` or the dedicated label interface.
+        When ``include_labels`` is true, caustic products remain tied to the
+        sparse map epochs while source photometry retains its finer cadence.
         """
 
         self._validate_time_mapping(map_times_days)
@@ -355,19 +356,50 @@ class MultiImageSimulation:
                 source,
                 image.arrival_time_delay_days,
             )
-            curve = image.simulation.multirate_light_curve(
-                image.lens_region,
-                image.source_grid,
-                map_times,
-                flux_times,
-                delayed_source,
-                distances,
-                method=image.method,
-                trajectory=image.trajectory,
-                schedule=image.schedule,
-                strict_coverage=image.strict_coverage,
-                map_observer=observers.get(image.name),
-            )
+            if include_labels:
+                if image.lens_grid is None:
+                    raise ValueError(
+                        f"macroimage {image.name!r} requires lens_grid for labels"
+                    )
+                if image.trajectory is not None:
+                    raise ValueError(
+                        "center labels currently require trajectory=None. Encode "
+                        "bulk relative motion in the image point-mass velocities"
+                    )
+                labeled = image.simulation.multirate_light_curve_with_labels(
+                    image.lens_region,
+                    image.source_grid,
+                    image.lens_grid,
+                    map_times,
+                    flux_times,
+                    delayed_source,
+                    distances,
+                    method=image.method,
+                    trajectory=None,
+                    map_schedule=image.schedule,
+                    caustic_config=image.caustic_config,
+                    strict_coverage=image.strict_coverage,
+                    diagnostic_grid=image.diagnostic_grid,
+                    include_distance_map=image.include_distance_map,
+                    map_observer=observers.get(image.name),
+                )
+                curve = labeled.light_curve
+                caustics = labeled.caustics
+            else:
+                curve = image.simulation.multirate_light_curve(
+                    image.lens_region,
+                    image.source_grid,
+                    map_times,
+                    flux_times,
+                    delayed_source,
+                    distances,
+                    method=image.method,
+                    trajectory=image.trajectory,
+                    schedule=image.schedule,
+                    strict_coverage=image.strict_coverage,
+                    map_observer=observers.get(image.name),
+                )
+                caustics = None
             curve = replace(
                 curve,
                 metadata={
@@ -387,6 +419,7 @@ class MultiImageSimulation:
                     image.name,
                     image.arrival_time_delay_days,
                     curve,
+                    caustics,
                 )
             )
             component_seconds[image.name] = curve.timing.delivered_seconds
@@ -400,7 +433,7 @@ class MultiImageSimulation:
                 "shared_source": dict(source.metadata()),
                 "execution_order": "image_major",
                 "maps_retained": False,
-                "labels_included": False,
+                "labels_included": bool(include_labels),
                 "arrival_delays": "explicit_per_image",
             },
             timing=TimingBreakdown(

@@ -16,53 +16,23 @@ from .results import LightCurve, MagnificationMap, TimingBreakdown
 from .sources import ModulatedSource, PixelatedSource
 from .trajectories import LinearTrajectory, SourceTrajectory
 
-
-def zero_point_flux_for_magnitude(reference_flux, reference_magnitude) -> torch.Tensor:
-    """Return the zero-point flux that assigns a reference magnitude.
-
-    This is useful for normalized or otherwise instrument-independent source
-    models. For physical flux densities in Jy, use a zero point of 3631 Jy
-    directly instead.
-    """
-
-    flux = torch.as_tensor(reference_flux)
-    if not flux.is_floating_point():
-        flux = flux.to(torch.get_default_dtype())
-    magnitude = torch.as_tensor(
-        reference_magnitude,
-        device=flux.device,
-        dtype=flux.dtype,
-    )
-    if bool(torch.any(~torch.isfinite(flux))) or bool(torch.any(flux <= 0.0)):
-        raise ValueError("reference_flux must be finite and positive")
-    if bool(torch.any(~torch.isfinite(magnitude))):
-        raise ValueError("reference_magnitude must be finite")
-    return flux * torch.pow(flux.new_tensor(10.0), 0.4 * magnitude)
+AB_ZERO_POINT_JY = 3631.0
 
 
-def flux_to_magnitude(flux, zero_point_flux) -> torch.Tensor:
-    """Convert positive flux to astronomical magnitudes.
+def flux_to_magnitude(flux_jy) -> torch.Tensor:
+    """Convert physical flux density in Jy to AB magnitude.
 
     Inputs broadcast according to ordinary Torch rules. Non-positive or
     non-finite fluxes produce ``nan`` rather than a silently clipped value.
     The function remains differentiable for valid fluxes.
     """
 
-    values = torch.as_tensor(flux)
+    values = torch.as_tensor(flux_jy)
     if not values.is_floating_point():
         values = values.to(torch.get_default_dtype())
-    zero_point = torch.as_tensor(
-        zero_point_flux,
-        device=values.device,
-        dtype=values.dtype,
-    )
-    if bool(torch.any(~torch.isfinite(zero_point))) or bool(
-        torch.any(zero_point <= 0.0)
-    ):
-        raise ValueError("zero_point_flux must be finite and positive")
     valid = torch.isfinite(values) & (values > 0.0)
     safe = torch.where(valid, values, torch.ones_like(values))
-    magnitude = -2.5 * torch.log10(safe / zero_point)
+    magnitude = -2.5 * torch.log10(safe / values.new_tensor(AB_ZERO_POINT_JY))
     return torch.where(valid, magnitude, torch.full_like(magnitude, float("nan")))
 
 
@@ -256,6 +226,60 @@ def light_curve_from_maps(
             steady_seconds=elapsed,
             component_seconds={"source_and_map_convolution": elapsed},
         ),
+    )
+
+
+@torch.no_grad()
+def source_light_curve(
+    source: PixelatedSource,
+    times_days: torch.Tensor | Sequence[float],
+    *,
+    batch_size: int = 16,
+    device: str | torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> LightCurve:
+    """Integrate a time-dependent pixelated source without microlensing.
+
+    This is the direct continuum-reverberation or intrinsic-source light
+    curve. The returned flux density is in Jy when the source brightness uses
+    the package's standard physical surface-brightness convention.
+
+    ``batch_size`` only controls memory. It does not alter the result.
+    ``device`` and ``dtype`` optionally override the time tensor's placement.
+    """
+
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be positive")
+    times = torch.as_tensor(times_days)
+    if times.ndim != 1 or times.numel() < 1:
+        raise ValueError("times_days must be a non-empty one-dimensional sequence")
+    resolved_device = times.device if device is None else torch.device(device)
+    resolved_dtype = (
+        times.dtype if dtype is None and times.is_floating_point() else dtype
+    )
+    if resolved_dtype is None:
+        resolved_dtype = torch.get_default_dtype()
+    times = times.to(device=resolved_device, dtype=resolved_dtype)
+    pixel_area_m2 = float(
+        source.geometry.pixel_scale_m[0] * source.geometry.pixel_scale_m[1]
+    )
+    rows = []
+    for chunk in times.split(int(batch_size)):
+        brightness = source.brightness(
+            chunk, device=resolved_device, dtype=resolved_dtype
+        )
+        rows.append(brightness.sum(dim=(1, 2)) * pixel_area_m2)
+    flux = torch.cat(rows, dim=0)
+    return LightCurve(
+        times_days=times,
+        flux=flux,
+        band_names=source.geometry.band_names,
+        unlensed_flux=flux,
+        metadata={
+            "method": "integrated_source_brightness",
+            "source": dict(source.metadata()),
+        },
+        timing=TimingBreakdown(),
     )
 
 

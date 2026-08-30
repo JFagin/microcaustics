@@ -44,7 +44,7 @@ method = mc.IPMConfig(
     virtual_refinement=2,
     far_field_approx=mc.FarFieldApproxConfig(enabled=False),
 )
-system = mc.MultiImageMicrolensingSystem(
+system = mc.MultiImageSystem(
     images={
         "A": mc.MacroLens(convergence=0.2, shear=0.12),
         "B": mc.MacroLens(convergence=0.2, shear=0.18),
@@ -70,7 +70,6 @@ cadence = mc.SurveyCadence(
 observations = mc.observe_multi_image_light_curves(
     curves,
     cadence,
-    zero_point_flux=1.0e23,
     seed=4,
 )
 print("truth", curves.flux_tensor().shape)

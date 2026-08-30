@@ -28,10 +28,9 @@ For the complete observer-frame velocity construction, include the sky
 position and lens/source peculiar motions:
 
 ```python
-kinematics = mc.SkyProjectedKinematics.sampled_peculiar_velocities(
-    sky_position=mc.SkyPosition(ra_deg=340.126125, dec_deg=3.358611),
-    lens_redshift=0.0395,
-    source_redshift=1.695,
+kinematics = mc.SkyProjectedKinematics.sampled(
+    ra_deg=340.126125,
+    dec_deg=3.358611,
     peculiar_velocity_dispersion_km_s=235,
     stellar_dispersion_km_s=170,
     seed=2001,

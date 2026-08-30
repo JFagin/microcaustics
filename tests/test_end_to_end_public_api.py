@@ -136,8 +136,8 @@ class PublicWorkflowTests(unittest.TestCase):
             for shift in (0.0, 0.08)
         )
         method = mc.production_ipm_config(
-            dynamic=False,
             rays=64,
+            scout_ratio=1,
             cell_chunk_size=17,
             far_field_approx=mc.FarFieldApproxConfig(
                 cells_per_axis=4,

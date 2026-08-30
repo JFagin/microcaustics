@@ -19,6 +19,8 @@ lens = caustics.SIE(
 
 
 def source(intensity: float, name: str):
+    """Return one host galaxy and compact source for a named band."""
+
     host = caustics.Sersic(
         x0=0.04,
         y0=-0.02,
@@ -41,6 +43,8 @@ def source(intensity: float, name: str):
 
 
 def lens_light(intensity: float, name: str):
+    """Return the foreground lens light for a named band."""
+
     return caustics.Sersic(
         x0=0.0,
         y0=0.0,
@@ -65,6 +69,8 @@ renderer = mc.CausticsMacroImageRenderer(
 
 
 def gaussian_psf(fwhm_arcsec: float) -> torch.Tensor:
+    """Sample a normalized Gaussian point-spread-function kernel."""
+
     sampled_pixel_scale = (
         grid.pixel_scale_arcsec[0] / renderer.upsample_factor
     )

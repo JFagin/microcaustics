@@ -136,6 +136,18 @@ class TransferredThinDiskSource:
             color_correction=self.color_correction,
         )
 
+    def support_radius_m(self, distances=None) -> float:
+        """Return the circular disk support represented by the observer grid.
+
+        ``distances`` is accepted for compatibility with physical source
+        models.  The pixel geometry is already stored in metres, so no new
+        cosmological conversion is required.
+        """
+
+        height_m = self.geometry.shape[0] * self.geometry.pixel_scale_m[0]
+        width_m = self.geometry.shape[1] * self.geometry.pixel_scale_m[1]
+        return 0.5 * min(float(height_m), float(width_m))
+
     def brightness(
         self,
         times_days: torch.Tensor | Sequence[float] | float,

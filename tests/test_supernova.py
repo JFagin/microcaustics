@@ -24,6 +24,18 @@ def simple_evolution() -> mc.PowerLawExponentialPhotosphere:
 
 
 class SupernovaSourceTests(unittest.TestCase):
+    def test_band_mapping_replaces_parallel_name_and_wavelength_inputs(self) -> None:
+        source = mc.ExpandingPhotosphereSource(
+            redshift=0.5,
+            bands={"blue": 4_500.0, "red": 7_500.0},
+            maximum_observer_time_days=100.0,
+            evolution=simple_evolution(),
+            resolution=16,
+            luminosity_distance_m=1.0e25,
+        )
+        self.assertEqual(source.band_names, ("blue", "red"))
+        self.assertEqual(source.wavelengths_angstrom, (4_500.0, 7_500.0))
+
     def test_vectorized_brightness_and_exact_zero_before_explosion(self) -> None:
         source = mc.ExpandingPhotosphereSource(
             redshift=0.5,
@@ -90,14 +102,10 @@ class SupernovaSourceTests(unittest.TestCase):
 
         def uniform_profile(x, y, radius, times, wavelengths):
             del times
-            rho2 = (
-                x[None] / radius[:, None, None]
-            ).square() + (
+            rho2 = (x[None] / radius[:, None, None]).square() + (
                 y[None] / radius[:, None, None]
             ).square()
-            return (rho2 <= 1.0)[..., None].expand(
-                -1, -1, -1, len(wavelengths)
-            )
+            return (rho2 <= 1.0)[..., None].expand(-1, -1, -1, len(wavelengths))
 
         def double_spectrum(times, wavelengths):
             return torch.full(

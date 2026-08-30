@@ -36,7 +36,7 @@ class GaussianSource:
     minor-to-major width ratio and ``position_angle_rad`` is counterclockwise
     from the positive x-axis. If ``hole_radius_m`` is positive, the profile is
     multiplied by ``1 - exp(-(r / hole_radius_m)**hole_power)``. Each band is
-    discretely normalized to its requested total flux.
+    discretely normalized to its requested total observed flux density in Jy.
     """
 
     geometry: SourceGeometry
@@ -132,5 +132,7 @@ class GaussianSource:
             "center_m": self.center_m,
             "hole_radius_m": self.hole_radius_m,
             "hole_power": self.hole_power,
+            "brightness_units": "Jy m^-2 projected source plane",
+            "integrated_flux_units": "Jy",
             "is_time_static": True,
         }

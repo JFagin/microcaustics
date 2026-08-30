@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -31,9 +32,62 @@ _C = 299_792_458.0
 _M_SUN = 1.988409870698051e30
 
 
+def _resolve_bands(
+    wavelengths_angstrom,
+    band_names,
+    bands: Mapping[str, float] | None,
+) -> tuple[tuple[float, ...], tuple[str, ...]]:
+    """Normalize either a band mapping or the compatible parallel tuples."""
+
+    wavelengths = tuple(float(value) for value in wavelengths_angstrom)
+    names = tuple(str(value) for value in band_names)
+    if bands is not None:
+        if wavelengths or names:
+            raise ValueError(
+                "supply bands or wavelengths_angstrom/band_names, not both"
+            )
+        names = tuple(str(name) for name in bands)
+        wavelengths = tuple(float(value) for value in bands.values())
+    if not wavelengths or len(wavelengths) != len(names):
+        raise ValueError("bands must contain matching names and wavelengths")
+    if any(not name for name in names) or len(set(names)) != len(names):
+        raise ValueError("band names must be non-empty and unique")
+    if any(not math.isfinite(value) or value <= 0.0 for value in wavelengths):
+        raise ValueError("band wavelengths must be finite and positive")
+    return wavelengths, names
+
+
+def _resolve_sampling(
+    grid: SourceGridConfig,
+    *,
+    resolution: int | tuple[int, int] | None,
+    enclosed_flux_fraction: float | None,
+    source_margin: float | None,
+) -> SourceGridConfig:
+    """Apply convenient scalar sampling overrides to a grid policy."""
+
+    if resolution is None and enclosed_flux_fraction is None and source_margin is None:
+        return grid
+    return replace(
+        grid,
+        **({"shape": resolution} if resolution is not None else {}),
+        **(
+            {"enclosed_flux_fraction": enclosed_flux_fraction}
+            if enclosed_flux_fraction is not None
+            else {}
+        ),
+        **({"margin": source_margin} if source_margin is not None else {}),
+    )
+
+
 @dataclass(frozen=True)
 class SourceGridConfig:
-    """Policy for resolving a physical source into a pixelated angular field."""
+    """Numerical sampling policy for an automatically sized physical source.
+
+    ``shape`` selects the pixel resolution. ``enclosed_flux_fraction`` and
+    ``margin`` define a support criterion rather than an angular field size.
+    The quasar model derives that size from its physical disk parameters.
+    """
 
     shape: int | tuple[int, int] = 1024
     enclosed_flux_fraction: float = 0.999
@@ -94,8 +148,9 @@ class ThinDiskModel:
 
     black_hole_mass_solar: float
     eddington_ratio: float
-    wavelengths_angstrom: tuple[float, ...]
-    band_names: tuple[str, ...]
+    wavelengths_angstrom: tuple[float, ...] = ()
+    band_names: tuple[str, ...] = ()
+    bands: Mapping[str, float] | None = None
     source_redshift: float | None = None
     spin: float = 0.0
     inclination_deg: float = 30.0
@@ -106,9 +161,29 @@ class ThinDiskModel:
     support_corona_height_above_isco_rg: float = 20.0
     relativity: str = "none"
     grid: SourceGridConfig = SourceGridConfig()
+    resolution: int | tuple[int, int] | None = None
+    enclosed_flux_fraction: float | None = None
+    source_margin: float | None = None
     name: str = "thin_disk"
 
     def __post_init__(self) -> None:
+        wavelengths, names = _resolve_bands(
+            self.wavelengths_angstrom,
+            self.band_names,
+            self.bands,
+        )
+        object.__setattr__(self, "wavelengths_angstrom", wavelengths)
+        object.__setattr__(self, "band_names", names)
+        object.__setattr__(
+            self,
+            "grid",
+            _resolve_sampling(
+                self.grid,
+                resolution=self.resolution,
+                enclosed_flux_fraction=self.enclosed_flux_fraction,
+                source_margin=self.source_margin,
+            ),
+        )
         if self.black_hole_mass_solar <= 0.0:
             raise ValueError("black_hole_mass_solar must be positive")
         if self.eddington_ratio <= 0.0:
@@ -126,9 +201,7 @@ class ThinDiskModel:
         if self.support_lamp_fraction < 0.0:
             raise ValueError("support_lamp_fraction must be non-negative")
         if self.support_corona_height_above_isco_rg < 0.0:
-            raise ValueError(
-                "support_corona_height_above_isco_rg must be non-negative"
-            )
+            raise ValueError("support_corona_height_above_isco_rg must be non-negative")
         if self.relativity not in {"none", "approximate"}:
             raise ValueError("relativity must be 'none' or 'approximate'")
 
@@ -162,16 +235,12 @@ class ThinDiskModel:
             temperature_slope_beta=self.temperature_slope_beta,
             color_correction=self.color_correction,
             lamp_fraction=self.support_lamp_fraction,
-            corona_height_above_isco_rg=(
-                self.support_corona_height_above_isco_rg
-            ),
+            corona_height_above_isco_rg=(self.support_corona_height_above_isco_rg),
             flux_fraction=resolved.enclosed_flux_fraction,
             safety_factor=resolved.margin,
             radial_samples=resolved.radial_samples,
         )
-        gravitational_radius_m = (
-            _G * _M_SUN / _C**2 * float(self.black_hole_mass_solar)
-        )
+        gravitational_radius_m = _G * _M_SUN / _C**2 * float(self.black_hole_mass_solar)
         return radius_rg * gravitational_radius_m
 
     def recommended_grid(
@@ -250,8 +319,9 @@ class KerrDiskModel:
 
     black_hole_mass_solar: float
     eddington_ratio: float
-    wavelengths_angstrom: tuple[float, ...]
-    band_names: tuple[str, ...]
+    wavelengths_angstrom: tuple[float, ...] = ()
+    band_names: tuple[str, ...] = ()
+    bands: Mapping[str, float] | None = None
     spin: float = 0.0
     inclination_deg: float = 30.0
     position_angle_deg: float = 0.0
@@ -262,6 +332,9 @@ class KerrDiskModel:
     corona_height_above_isco_rg: float = 20.0
     driving_signal: DrivingSignal | None = None
     grid: SourceGridConfig = SourceGridConfig()
+    resolution: int | tuple[int, int] | None = None
+    enclosed_flux_fraction: float | None = None
+    source_margin: float | None = None
     compile_solver: bool = True
     primary_repair_max_passes: int = 8
     lamppost_nalpha: int = 1024
@@ -269,6 +342,23 @@ class KerrDiskModel:
     name: str = "kerr_thin_disk"
 
     def __post_init__(self) -> None:
+        wavelengths, names = _resolve_bands(
+            self.wavelengths_angstrom,
+            self.band_names,
+            self.bands,
+        )
+        object.__setattr__(self, "wavelengths_angstrom", wavelengths)
+        object.__setattr__(self, "band_names", names)
+        object.__setattr__(
+            self,
+            "grid",
+            _resolve_sampling(
+                self.grid,
+                resolution=self.resolution,
+                enclosed_flux_fraction=self.enclosed_flux_fraction,
+                source_margin=self.source_margin,
+            ),
+        )
         support = ThinDiskModel(
             black_hole_mass_solar=self.black_hole_mass_solar,
             eddington_ratio=self.eddington_ratio,
@@ -281,9 +371,7 @@ class KerrDiskModel:
             color_correction=self.color_correction,
             temperature_slope_beta=self.temperature_slope_beta,
             support_lamp_fraction=self.lamp_fraction,
-            support_corona_height_above_isco_rg=(
-                self.corona_height_above_isco_rg
-            ),
+            support_corona_height_above_isco_rg=(self.corona_height_above_isco_rg),
             grid=self.grid,
         )
         del support
@@ -328,9 +416,7 @@ class KerrDiskModel:
             color_correction=self.color_correction,
             temperature_slope_beta=self.temperature_slope_beta,
             support_lamp_fraction=self.lamp_fraction,
-            support_corona_height_above_isco_rg=(
-                self.corona_height_above_isco_rg
-            ),
+            support_corona_height_above_isco_rg=(self.corona_height_above_isco_rg),
             grid=self.grid,
         )
 
@@ -374,12 +460,12 @@ class KerrDiskModel:
         if not math.isclose(dy_uas, dx_uas, rel_tol=1.0e-10, abs_tol=0.0):
             raise ValueError("KerrDiskModel requires square angular pixels")
         resolved_runtime = (
-            runtime if isinstance(runtime, ResolvedRuntime) else resolve_runtime(runtime)
+            runtime
+            if isinstance(runtime, ResolvedRuntime)
+            else resolve_runtime(runtime)
         )
         redshift = self._redshift(distances)
-        gravitational_radius_m = (
-            _G * _M_SUN / _C**2 * float(self.black_hole_mass_solar)
-        )
+        gravitational_radius_m = _G * _M_SUN / _C**2 * float(self.black_hole_mass_solar)
         fov_m = distances.uas_to_source_length(
             resolved_grid.field_of_view_uas,
             dtype=torch.float64,
@@ -468,12 +554,15 @@ class GaussianModel:
 
     ``sigma_m`` may contain one major-axis width per band. The widest band
     defines the common field. The optional central hole changes the brightness
-    profile but not the conservative outer support calculation.
+    profile but not the conservative outer support calculation. ``total_flux``
+    is the observed integrated spectral flux density in Jy, either shared by
+    all bands or specified once per band.
     """
 
     sigma_m: float | tuple[float, ...]
-    wavelengths_angstrom: tuple[float, ...]
-    band_names: tuple[str, ...]
+    wavelengths_angstrom: tuple[float, ...] = ()
+    band_names: tuple[str, ...] = ()
+    bands: Mapping[str, float] | None = None
     total_flux: float | tuple[float, ...] = 1.0
     axis_ratio: float = 1.0
     position_angle_rad: float = 0.0
@@ -481,6 +570,9 @@ class GaussianModel:
     hole_radius_m: float = 0.0
     hole_power: float = 4.0
     grid: SourceGridConfig = SourceGridConfig()
+    resolution: int | tuple[int, int] | None = None
+    enclosed_flux_fraction: float | None = None
+    source_margin: float | None = None
     name: str = "gaussian"
 
     @classmethod
@@ -489,8 +581,9 @@ class GaussianModel:
         distances: LensingDistances,
         *,
         sigma_uas: float | tuple[float, ...],
-        wavelengths_angstrom: tuple[float, ...],
-        band_names: tuple[str, ...],
+        bands: Mapping[str, float] | None = None,
+        wavelengths_angstrom: tuple[float, ...] = (),
+        band_names: tuple[str, ...] = (),
         center_uas: tuple[float, float] = (0.0, 0.0),
         **kwargs,
     ) -> GaussianModel:
@@ -511,6 +604,7 @@ class GaussianModel:
                 if width_m.ndim == 0
                 else tuple(float(value) for value in width_m.reshape(-1))
             ),
+            bands=bands,
             wavelengths_angstrom=wavelengths_angstrom,
             band_names=band_names,
             center_m=tuple(float(value) for value in center_m.reshape(-1)),
@@ -518,6 +612,23 @@ class GaussianModel:
         )
 
     def __post_init__(self) -> None:
+        wavelengths, names = _resolve_bands(
+            self.wavelengths_angstrom,
+            self.band_names,
+            self.bands,
+        )
+        object.__setattr__(self, "wavelengths_angstrom", wavelengths)
+        object.__setattr__(self, "band_names", names)
+        object.__setattr__(
+            self,
+            "grid",
+            _resolve_sampling(
+                self.grid,
+                resolution=self.resolution,
+                enclosed_flux_fraction=self.enclosed_flux_fraction,
+                source_margin=self.source_margin,
+            ),
+        )
         widths = (
             (float(self.sigma_m),)
             if isinstance(self.sigma_m, (int, float))

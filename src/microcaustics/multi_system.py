@@ -16,15 +16,23 @@ from .config import (
     IPMConfig,
     IRSConfig,
     RuntimeConfig,
+    _production_static_ipm_config,
     production_dynamic_config,
     production_ipm_config,
 )
 from .geometry import PlaneGrid, PlaneRegion
 from .lens import LensingDistances, MacroLens, PointMassField, StellarPopulation
-from .multi_image import MacroImageConfig, MultiImageSimulation
+from .multi_image import MacroImageConfig, MultiImageSimulation, _times_for_image
 from .runtime import ResolvedRuntime
+from .random import derive_seed
 from .sources import PhysicalSourceModel, PixelatedSource, ThermalReprocessingSource
-from .system import IntegrationDomain, MicrolensingSystem
+from .system import (
+    IntegrationDomain,
+    MicrolensingSystem,
+    _cadence_times,
+    _production_dynamic_settings,
+    _with_method_options,
+)
 from .trajectories import SourceTrajectory
 
 if TYPE_CHECKING:
@@ -43,7 +51,7 @@ def _image_seed(value, name: str, index: int) -> int | None:
         return None if selected is None else int(selected)
     if value is None:
         return None
-    return int(value) + index
+    return derive_seed(int(value), f"image:{name}")
 
 
 def _required_image_value(value, name: str, label: str):
@@ -57,7 +65,7 @@ def _required_image_value(value, name: str, label: str):
 
 
 @dataclass(frozen=True)
-class MultiImageMicrolensingSystem:
+class MultiImageSystem:
     """Resolved macroimages that share one physical source.
 
     The concise interface maps each image name directly to a
@@ -68,8 +76,8 @@ class MultiImageMicrolensingSystem:
 
     Arrival delays shift only source emission. Map evolution remains on the
     observer-time axis. A scalar ``seed`` is treated as a reproducible base
-    seed, with successive image seeds incremented in execution order. A seed
-    mapping provides exact per-image values.
+    seed, with stable independent image seeds derived from each image name. A
+    seed mapping provides exact per-image values.
     """
 
     images: Mapping[str, MicrolensingSystem | MacroLens]
@@ -83,9 +91,9 @@ class MultiImageMicrolensingSystem:
     source: PixelatedSource | PhysicalSourceModel | None = None
     distances: LensingDistances | None = None
     source_grid: PlaneGrid | None = None
-    stellar_population: (
-        StellarPopulation | Mapping[str, StellarPopulation] | None
-    ) = None
+    stellar_population: StellarPopulation | Mapping[str, StellarPopulation] | None = (
+        None
+    )
     stars: PointMassField | Mapping[str, PointMassField] | None = None
     integration_domain: (
         IntegrationDomain | str | Mapping[str, IntegrationDomain | str]
@@ -118,11 +126,13 @@ class MultiImageMicrolensingSystem:
         distance_dtype: torch.dtype = torch.float32,
         distance_device: torch.device | str | None = "auto",
         **kwargs,
-    ) -> MultiImageMicrolensingSystem:
+    ) -> MultiImageSystem:
         """Construct all macroimages from one shared redshift geometry."""
 
         if "distances" in kwargs:
-            raise TypeError("from_redshifts derives distances; do not also supply distances")
+            raise TypeError(
+                "from_redshifts derives distances; do not also supply distances"
+            )
         distances = LensingDistances.from_redshifts(
             lens_redshift,
             source_redshift,
@@ -142,14 +152,14 @@ class MultiImageMicrolensingSystem:
         smooth_matter_fraction: float | Mapping[str, float] = 0.0,
         arrival_time_delays_days: Mapping[str, float] | None = None,
         **kwargs,
-    ) -> MultiImageMicrolensingSystem:
+    ) -> MultiImageSystem:
         """Build directly from global macro-model image solutions.
 
         Local convergence, shear, shear direction, and model arrival delays are
         read from each solution. Measured delays may replace the modeled values
         through ``arrival_time_delays_days`` without changing the macro lenses.
         All remaining keywords are the shared or per-image physical fields of
-        :class:`MultiImageMicrolensingSystem`.
+        :class:`MultiImageSystem`.
         """
 
         resolved = tuple(solutions)
@@ -190,10 +200,14 @@ class MultiImageMicrolensingSystem:
             raise TypeError(
                 "images must map names to MacroLens or MicrolensingSystem objects"
             )
-        delays = {name: float(value) for name, value in self.arrival_time_delays_days.items()}
+        delays = {
+            name: float(value) for name, value in self.arrival_time_delays_days.items()
+        }
         unknown = set(delays) - set(images)
         if unknown:
-            raise ValueError(f"arrival delays contain unknown images: {sorted(unknown)}")
+            raise ValueError(
+                f"arrival delays contain unknown images: {sorted(unknown)}"
+            )
         if any(not math.isfinite(value) for value in delays.values()):
             raise ValueError("arrival delays must be finite")
         for value, label in (
@@ -237,6 +251,7 @@ class MultiImageMicrolensingSystem:
                 stars=stars,
                 integration_domain=_image_value(self.integration_domain, name),
                 duration_days=self.duration_days,
+                trajectory=_image_value(self.trajectories, name),
                 light_loss=self.light_loss,
                 safety_scale=self.safety_scale,
                 stellar_motion_sigma_margin=self.stellar_motion_sigma_margin,
@@ -264,18 +279,48 @@ class MultiImageMicrolensingSystem:
         except KeyError as error:
             raise KeyError(f"unknown macroimage {name!r}") from error
 
+    def summary(
+        self,
+        *,
+        times_days: Sequence[float] | Mapping[str, Sequence[float]] | None = None,
+        duration_days: float | None = None,
+        display: bool = True,
+    ) -> dict[str, dict[str, object]]:
+        """Describe all derived image geometries without running a solver."""
+
+        summaries = {
+            name: system.summary(
+                times_days=(
+                    None
+                    if times_days is None
+                    else _times_for_image(times_days, name)
+                ),
+                duration_days=duration_days,
+                display=False,
+            )
+            for name, system in self.images.items()
+        }
+        if display:
+            for name, values in summaries.items():
+                print(f"[{name}]")
+                for key, value in values.items():
+                    print(f"{key}: {value}")
+        return summaries
+
     def with_arrival_time_delays(
         self,
         delays_days: Mapping[str, float],
         *,
         require_all: bool = False,
-    ) -> MultiImageMicrolensingSystem:
+    ) -> MultiImageSystem:
         """Return a copy with measured or model-derived relative delays."""
 
         supplied = {name: float(value) for name, value in delays_days.items()}
         unknown = set(supplied) - set(self.images)
         if unknown:
-            raise ValueError(f"arrival delays contain unknown images: {sorted(unknown)}")
+            raise ValueError(
+                f"arrival delays contain unknown images: {sorted(unknown)}"
+            )
         if require_all and set(supplied) != set(self.images):
             omitted = sorted(set(self.images) - set(supplied))
             raise ValueError(f"arrival delays omit macroimages: {omitted}")
@@ -287,20 +332,37 @@ class MultiImageMicrolensingSystem:
             },
         )
 
-    @cached_property
-    def simulation(self) -> MultiImageSimulation:
-        """Return the cached low-level multi-image simulation."""
+    def _build_simulation(
+        self,
+        times_days: Sequence[float] | Mapping[str, Sequence[float]] | None = None,
+        solver_options: Mapping[str, object] | None = None,
+    ) -> tuple[MultiImageSimulation, tuple]:
+        """Build the numerical images with geometry covering requested times."""
 
         configs = []
+        realizations = []
         for name, system in self.images.items():
-            realization = system.realize()
+            realization = (
+                system.realize()
+                if times_days is None
+                else system._realize_for_times(_times_for_image(times_days, name))
+            )
+            realizations.append(realization)
             method = _image_value(self.methods, name)
             if method is None:
-                method = production_ipm_config(dynamic=True)
+                method = production_ipm_config()
+            if solver_options:
+                method = _with_method_options(
+                    {"method": method, **dict(solver_options)}, dynamic=True
+                )["method"]
             method = realization._method_for_domain(method)
             schedule = _image_value(self.schedules, name)
-            if schedule is None:
-                schedule = production_dynamic_config()
+            caustic_config = _image_value(self.caustic_configs, name)
+            schedule, caustic_config = _production_dynamic_settings(
+                method,
+                schedule,
+                caustic_config,
+            )
             configs.append(
                 MacroImageConfig(
                     name=name,
@@ -308,19 +370,33 @@ class MultiImageMicrolensingSystem:
                     lens_region=realization.lens_region,
                     source_grid=realization.source_grid,
                     method=method,
-                    arrival_time_delay_days=self.arrival_time_delays_days.get(name, 0.0),
+                    arrival_time_delay_days=self.arrival_time_delays_days.get(
+                        name, 0.0
+                    ),
                     trajectory=_image_value(self.trajectories, name),
                     schedule=schedule,
                     lens_grid=realization.lens_grid,
-                    caustic_config=_image_value(self.caustic_configs, name),
+                    caustic_config=caustic_config,
                 )
             )
-        return MultiImageSimulation(tuple(configs))
+        return MultiImageSimulation(tuple(configs)), tuple(realizations)
 
-    def _shared_source(self, source: PixelatedSource | None) -> PixelatedSource:
+    @cached_property
+    def simulation(self) -> MultiImageSimulation:
+        """Return the cached low-level multi-image simulation."""
+
+        return self._build_simulation()[0]
+
+    def _shared_source(
+        self,
+        source: PixelatedSource | None,
+        realizations=None,
+    ) -> PixelatedSource:
         if source is not None:
             return source
-        resolved = tuple(system.realize().source for system in self.images.values())
+        if realizations is None:
+            realizations = tuple(system.realize() for system in self.images.values())
+        resolved = tuple(realization.source for realization in realizations)
         if any(item is None for item in resolved):
             raise ValueError("multi-image light curves require a shared source")
         first = resolved[0]
@@ -333,17 +409,20 @@ class MultiImageMicrolensingSystem:
         """Return common distances after verifying all image systems."""
 
         first = next(iter(self.images.values())).distances
-        if any(
-            system.distances != first
-            for system in tuple(self.images.values())[1:]
-        ):
+        if any(system.distances != first for system in tuple(self.images.values())[1:]):
             raise ValueError("all macroimages must share lensing distances")
         return first
 
-    def dynamic_maps(self, times_days: Sequence[float] | Mapping[str, Sequence[float]]):
+    def dynamic_maps(
+        self,
+        times_days: Sequence[float] | Mapping[str, Sequence[float]],
+        **solver_options,
+    ):
         """Stream dynamic maps for every macroimage."""
 
-        return self.simulation.dynamic_maps(times_days)
+        return self._build_simulation(times_days, solver_options)[0].dynamic_maps(
+            times_days
+        )
 
     def magnification_maps(
         self,
@@ -352,6 +431,7 @@ class MultiImageMicrolensingSystem:
         methods: (
             IPMConfig | IRSConfig | Mapping[str, IPMConfig | IRSConfig] | None
         ) = None,
+        **solver_options,
     ):
         """Return one independent magnification map for every macroimage.
 
@@ -363,12 +443,9 @@ class MultiImageMicrolensingSystem:
         for name, system in self.images.items():
             method = _image_value(methods, name)
             outputs[name] = system.magnification_map(
-                method=(
-                    production_ipm_config(dynamic=False)
-                    if method is None
-                    else method
-                ),
+                method=method or _production_static_ipm_config(),
                 time_days=float(_required_image_value(time_days, name, "time_days")),
+                **solver_options,
             )
         return outputs
 
@@ -406,17 +483,61 @@ class MultiImageMicrolensingSystem:
 
     def light_curves(
         self,
-        times_days: Sequence[float] | Mapping[str, Sequence[float]],
+        times_days: Sequence[float] | Mapping[str, Sequence[float]] | None = None,
         *,
+        duration_days: float | None = None,
+        map_cadence_days: float | None = None,
+        source_cadence_days: float | None = None,
+        start_day: float = 0.0,
         source: PixelatedSource | None = None,
         include_labels: bool = False,
         map_observers=None,
+        **solver_options,
     ):
-        """Generate delayed light curves for every macroimage."""
+        """Generate delayed curves from explicit times or plain cadences."""
 
-        shared_source = self._shared_source(source)
-        return self.simulation.light_curves(
-            times_days,
+        if times_days is None:
+            map_times = _cadence_times(
+                None,
+                duration_days=duration_days,
+                cadence_days=map_cadence_days,
+                start_day=start_day,
+            )
+        else:
+            if duration_days is not None or map_cadence_days is not None:
+                raise ValueError(
+                    "supply times_days or duration_days/map_cadence_days, not both"
+                )
+            map_times = times_days
+        simulation, realizations = self._build_simulation(
+            map_times, solver_options
+        )
+        shared_source = self._shared_source(source, realizations)
+        use_multirate = source_cadence_days is not None and not (
+            map_cadence_days is not None
+            and math.isclose(float(source_cadence_days), float(map_cadence_days))
+        )
+        if use_multirate:
+            if isinstance(map_times, Mapping):
+                raise ValueError(
+                    "source_cadence_days requires one shared regular map cadence"
+                )
+            flux_times = _cadence_times(
+                None,
+                duration_days=float(map_times[-1]) - float(map_times[0]),
+                cadence_days=source_cadence_days,
+                start_day=float(map_times[0]),
+            )
+            return simulation.multirate_light_curves(
+                map_times,
+                flux_times,
+                shared_source,
+                self._shared_distances(),
+                include_labels=include_labels,
+                map_observers=map_observers,
+            )
+        return simulation.light_curves(
+            map_times,
             shared_source,
             self._shared_distances(),
             include_labels=include_labels,
@@ -429,15 +550,21 @@ class MultiImageMicrolensingSystem:
         flux_times_days: Sequence[float] | Mapping[str, Sequence[float]],
         *,
         source: PixelatedSource | None = None,
+        include_labels: bool = False,
         map_observers=None,
+        **solver_options,
     ):
         """Generate fine-cadence variability from sparse dynamic maps."""
 
-        return self.simulation.multirate_light_curves(
+        simulation, realizations = self._build_simulation(
+            map_times_days, solver_options
+        )
+        return simulation.multirate_light_curves(
             map_times_days,
             flux_times_days,
-            self._shared_source(source),
+            self._shared_source(source, realizations),
             self._shared_distances(),
+            include_labels=include_labels,
             map_observers=map_observers,
         )
 
@@ -449,15 +576,17 @@ class MultiImageMicrolensingSystem:
         source: ThermalReprocessingSource | None = None,
         normalize: bool = True,
         map_observers=None,
+        **solver_options,
     ):
         """Generate microlensed transfer functions for every macroimage."""
 
-        resolved_source = self._shared_source(source)
+        simulation, realizations = self._build_simulation(
+            map_times_days, solver_options
+        )
+        resolved_source = self._shared_source(source, realizations)
         if not isinstance(resolved_source, ThermalReprocessingSource):
-            raise TypeError(
-                "transfer_functions requires a ThermalReprocessingSource"
-            )
-        return self.simulation.transfer_functions(
+            raise TypeError("transfer_functions requires a ThermalReprocessingSource")
+        return simulation.transfer_functions(
             map_times_days,
             resolved_source,
             self._shared_distances(),
@@ -465,3 +594,7 @@ class MultiImageMicrolensingSystem:
             normalize=normalize,
             map_observers=map_observers,
         )
+
+
+# Import compatibility for code written before the shorter public name.
+MultiImageMicrolensingSystem = MultiImageSystem

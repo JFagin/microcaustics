@@ -25,7 +25,7 @@ IRS and IPM return absolute, source-independent magnification maps on the same
 
 - `rays=N` sets the base fine-cell budget.
 - `scout_ratio=k` coarsens tiled source-region discovery only.
-- `refinement=r` adds true lens-equation samples within retained cells. And
+- `refinement=r` adds true lens-equation samples within retained cells.
 - `virtual_refinement=v` interpolates the mapped polygon representation and
   must satisfy `v >= r`.
 
@@ -41,7 +41,7 @@ Disable `FarFieldApproxConfig` for a direct point-mass reference. With it enable
 nearby stars are exact and the far field uses a complex Taylor expansion.
 Validate its grid, exact radius, and Taylor order against the direct
 calculation. Every epoch receives its own complete far-field coefficient table.
-temporal batching changes throughput but not the numerical approximation.
+Temporal batching changes throughput but not the numerical approximation.
 
 For moving tiled-IPM fields, `scout_refresh_frames=1` recomputes the scout at
 every frame. Larger values reuse an endpoint-union cell selection and are an
@@ -58,5 +58,5 @@ and whether endpoint-union reuse was active.
 6. Check finite-source light curves and caustic labels when they are products.
 7. Only then tune temporal batches and spatial chunks.
 
-See `examples/notebooks/16_accuracy_and_performance.ipynb` for an executable
+See `examples/notebooks/validation/02_accuracy_and_performance.ipynb` for an executable
 CUDA-aware version of this workflow.

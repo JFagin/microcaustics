@@ -1,6 +1,6 @@
 # Resolved multi-image simulations
 
-`MultiImageMicrolensingSystem` coordinates several independent macroimage
+`MultiImageSystem` coordinates several independent macroimage
 calculations behind one physical source. Define the shared source, redshifts,
 stellar-population prescription, and numerical settings once. Each named
 `MacroLens` then generates its own seeded star field and dynamic map sequence.
@@ -13,7 +13,7 @@ images = {
     "D": mc.MacroLens(convergence=0.64, shear=0.62, shear_angle_deg=80.21),
 }
 
-system = mc.MultiImageMicrolensingSystem.from_redshifts(
+system = mc.MultiImageSystem.from_redshifts(
     lens_redshift=0.0395,
     source_redshift=1.695,
     H0=70.0,
@@ -27,7 +27,6 @@ system = mc.MultiImageMicrolensingSystem.from_redshifts(
     ),
     arrival_time_delays_days={"A": 0.0, "B": 7.4, "C": 2.1, "D": 11.8},
     integration_domain="scout",
-    duration_days=3650,
     light_loss=0.01,
     safety_scale=1.5,
     seed=1001,
@@ -38,9 +37,10 @@ flux = result.flux_tensor()  # [image, time, band]
 curve_b = result["B"].light_curve
 ```
 
-A scalar seed is a reproducible base seed. The images above use seeds
-1001--1004 in mapping order. Supply `seed={"A": ..., "B": ...}` when exact
-per-image seeds are preferred. `methods`, `schedules`, `trajectories`,
+A scalar seed is a reproducible base seed. Stable independent image seeds are
+derived from each image name, so reordering the mapping does not change a
+realization. Supply `seed={"A": ..., "B": ...}` when exact per-image seeds
+are preferred. `methods`, `schedules`, `trajectories`,
 `caustic_configs`, `integration_domain`, `stellar_population`, and `runtime`
 may each be either one shared value or a mapping keyed by image name.
 
@@ -61,9 +61,10 @@ microlensing patterns and bulk velocities.
 Bands remain arbitrary because the interface accepts any `PixelatedSource`.
 There is no built-in assumption of LSST `ugrizy`.
 
-The lower-level `MultiImageSimulation` and `MacroImageConfig` interfaces remain
-available when an application already owns fully constructed simulations,
-lens grids, or heterogeneous runtimes. They are not required for ordinary
+The lower-level `microcaustics.multi_image.MultiImageSimulation` and
+`MacroImageConfig` interfaces remain available when an application already
+owns fully constructed simulations, lens grids, or heterogeneous runtimes.
+They are intentionally outside the top-level namespace and are not required for ordinary
 multi-image calculations.
 
 ## Time convention
@@ -115,7 +116,7 @@ solutions = mc.solve_caustics_macroimages(
     image_names=("A", "B", "C", "D"),
 )
 
-system = mc.MultiImageMicrolensingSystem.from_macroimage_solutions(
+system = mc.MultiImageSystem.from_macroimage_solutions(
     solutions,
     distances=distances,
     source=source,
@@ -156,7 +157,7 @@ solutions = mc.solve_epl_shear_macroimages(
     # Names correspond to the arrival-time-sorted solutions.
     image_names=("D", "A", "C", "B"),
 )
-system = mc.MultiImageMicrolensingSystem.from_macroimage_solutions(
+system = mc.MultiImageSystem.from_macroimage_solutions(
     solutions,
     distances=distances,
     source=source,
@@ -186,11 +187,13 @@ curves = system.multirate_light_curves(
     map_times_days=range(0, 3651, 25),
     flux_times_days=range(0, 3651),
     source=reprocessing_source,
+    include_labels=True,
 )
 ```
 
 The implementation retains at most two maps and never materializes daily
-interpolated maps. At observer time `t`, image `i` evaluates the source at
+interpolated maps. Caustic labels are returned only at the sparse map epochs,
+available through each image's `label_times_days`. At observer time `t`, image `i` evaluates the source at
 `t - arrival_time_delay_days[i]`, while maps and source trajectories stay at
 observer time `t`.
 
@@ -216,10 +219,12 @@ cadence = mc.sample_random_rubin_wfd_cadence("baseline.db", seed=7)
 observations = mc.observe_multi_image_light_curves(
     curves,
     cadence,
-    zero_point_flux=3631.0,  # Jy, hence AB magnitudes
     seed=11,
 )
 ```
+
+All photometric source models return flux density in Jy, so observations and
+plots use AB magnitudes directly. No fitted reference magnitude is required.
 
 Bands are read from the cadence and source. `ugrizy` is not hard-coded into the
 multi-image simulator. General macro-image rendering is a separate optional

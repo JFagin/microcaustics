@@ -9,6 +9,7 @@ from dataclasses import replace
 import torch
 
 import microcaustics as mc
+from microcaustics.multi_image import MacroImageConfig, MultiImageSimulation
 
 
 def _simulation() -> mc.MicrolensingSimulation:
@@ -23,8 +24,8 @@ def _simulation() -> mc.MicrolensingSimulation:
     )
 
 
-def _image(name: str, delay: float) -> mc.MacroImageConfig:
-    return mc.MacroImageConfig(
+def _image(name: str, delay: float) -> MacroImageConfig:
+    return MacroImageConfig(
         name=name,
         simulation=_simulation(),
         lens_region=mc.PlaneRegion((2.0, 2.0)),
@@ -72,7 +73,7 @@ class MultiImageTests(unittest.TestCase):
         )
 
     def test_known_or_solved_delay_mapping_can_override_configurations(self) -> None:
-        initial = mc.MultiImageSimulation.create(
+        initial = MultiImageSimulation.create(
             [_image("A", 0.0), _image("B", 2.0)]
         )
         updated = initial.with_arrival_time_delays({"B": 7.5})
@@ -129,7 +130,7 @@ class MultiImageTests(unittest.TestCase):
         self.assertAlmostEqual(solutions[0].shear, 0.0)
 
     def test_resolved_light_curves_share_source_and_apply_distinct_delays(self) -> None:
-        system = mc.MultiImageSimulation.create(
+        system = MultiImageSimulation.create(
             [_image("A", 0.0), _image("B", 2.0)]
         )
         callbacks = {"A": [], "B": []}
@@ -165,7 +166,7 @@ class MultiImageTests(unittest.TestCase):
         )
 
     def test_per_image_cadences_are_supported_but_not_stackable(self) -> None:
-        system = mc.MultiImageSimulation.create(
+        system = MultiImageSimulation.create(
             [_image("A", 0.0), _image("B", 1.0)]
         )
         result = system.light_curves(
@@ -181,7 +182,7 @@ class MultiImageTests(unittest.TestCase):
     def test_multirate_curves_keep_explicit_delays_and_generate_sparse_maps(
         self,
     ) -> None:
-        system = mc.MultiImageSimulation.create(
+        system = MultiImageSimulation.create(
             [_image("A", 0.0), _image("B", 2.0)]
         )
         callbacks = {"A": [], "B": []}
@@ -220,7 +221,7 @@ class MultiImageTests(unittest.TestCase):
         )
 
     def test_multirate_curve_requires_flux_times_inside_map_cadence(self) -> None:
-        system = mc.MultiImageSimulation.create([_image("A", 0.0)])
+        system = MultiImageSimulation.create([_image("A", 0.0)])
         with self.assertRaisesRegex(ValueError, "within"):
             system.multirate_light_curves(
                 [0.0, 2.0],
@@ -229,8 +230,33 @@ class MultiImageTests(unittest.TestCase):
                 mc.LensingDistances(1.0e25, 2.0e25, 1.0e25),
             )
 
+    def test_multirate_curves_include_labels_at_map_epochs(self) -> None:
+        image = replace(
+            _image("A", 0.0),
+            lens_grid=mc.PlaneGrid((9, 9), (2.0, 2.0)),
+            caustic_config=mc.CausticConfig(
+                far_field_approx=mc.FarFieldApproxConfig(enabled=False),
+                temporal_batch_size=1,
+                jacobian_chunk_size=64,
+                anchor_count=5,
+                gauge_count=7,
+                minimum_safe_gauges=3,
+            ),
+        )
+        result = MultiImageSimulation((image,)).multirate_light_curves(
+            [0.0, 2.0],
+            [0.0, 1.0, 2.0],
+            _variable_source(),
+            mc.LensingDistances(1.0e25, 2.0e25, 1.0e25),
+            include_labels=True,
+        )
+        self.assertTrue(result.metadata["labels_included"])
+        self.assertEqual(result["A"].light_curve.times_days.numel(), 3)
+        self.assertEqual(result["A"].crossing_labels.shape, (2,))
+        self.assertEqual(len(result["A"].caustics), 2)
+
     def test_dynamic_maps_are_streamed_in_image_major_order(self) -> None:
-        system = mc.MultiImageSimulation((_image("A", 0.0), _image("B", 3.0)))
+        system = MultiImageSimulation((_image("A", 0.0), _image("B", 3.0)))
         frames = list(system.dynamic_maps([0.0, 1.0]))
         self.assertEqual([frame.image_name for frame in frames], ["A", "A", "B", "B"])
         self.assertEqual([frame.time_days for frame in frames], [0.0, 1.0, 0.0, 1.0])
@@ -242,7 +268,7 @@ class MultiImageTests(unittest.TestCase):
         )
 
     def test_configuration_rejects_ambiguous_label_requests(self) -> None:
-        system = mc.MultiImageSimulation((_image("A", 0.0),))
+        system = MultiImageSimulation((_image("A", 0.0),))
         with self.assertRaisesRegex(ValueError, "requires lens_grid"):
             system.light_curves(
                 [0.0],
@@ -266,7 +292,7 @@ class MultiImageTests(unittest.TestCase):
                 minimum_safe_gauges=3,
             ),
         )
-        result = mc.MultiImageSimulation((image,)).light_curves(
+        result = MultiImageSimulation((image,)).light_curves(
             [0.0],
             _variable_source(),
             mc.LensingDistances(1.0e25, 2.0e25, 1.0e25),
@@ -297,7 +323,7 @@ class MultiImageTests(unittest.TestCase):
                 del edges, normalize
                 return magnification.new_tensor([[1.0, 3.0], [3.0, 1.0]]) / 4.0
 
-        system = mc.MultiImageSimulation.create([_image("A", 4.0)])
+        system = MultiImageSimulation.create([_image("A", 4.0)])
         result = system.transfer_functions(
             [0.0, 2.0],
             ResponseSource(),
@@ -317,7 +343,7 @@ class MultiImageTests(unittest.TestCase):
 
     def test_macroimage_names_must_be_unique(self) -> None:
         with self.assertRaisesRegex(ValueError, "unique"):
-            mc.MultiImageSimulation((_image("A", 0.0), _image("A", 1.0)))
+            MultiImageSimulation((_image("A", 0.0), _image("A", 1.0)))
 
 
 if __name__ == "__main__":

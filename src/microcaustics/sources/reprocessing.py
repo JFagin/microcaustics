@@ -125,6 +125,13 @@ class ThermalReprocessingSource:
         object.__setattr__(self, "response_temperature4", response)
         object.__setattr__(self, "delay_days", delay)
 
+    def support_radius_m(self, distances=None) -> float:
+        """Return the circular disk support represented by the observer grid."""
+
+        height_m = self.geometry.shape[0] * self.geometry.pixel_scale_m[0]
+        width_m = self.geometry.shape[1] * self.geometry.pixel_scale_m[1]
+        return 0.5 * min(float(height_m), float(width_m))
+
     @classmethod
     def from_axis_lamppost(
         cls,

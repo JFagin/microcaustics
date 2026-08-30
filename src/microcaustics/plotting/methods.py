@@ -271,6 +271,7 @@ def plot_lens_field_strategies(
     config: IPMConfig,
     rectangle_region: PlaneRegion,
     *,
+    rectangle_rotation_deg: float = 0.0,
     time_days: float = 0.0,
     scale_bar_uas: float | None = None,
     maximum_display_stars: int = 8_000,
@@ -289,7 +290,7 @@ def plot_lens_field_strategies(
     if not config.tiled:
         raise ValueError("config must enable tiled source scouting")
     from matplotlib import pyplot as plt
-    from matplotlib.patches import Circle, Rectangle
+    from matplotlib.patches import Circle, Polygon, Rectangle
 
     from ..solvers.far_field import TaylorFarFieldApproximation
     from ..solvers.ipm import _source_scout_cells
@@ -340,10 +341,30 @@ def plot_lens_field_strategies(
             facecolor="#dbeaf5", edgecolor="#1f77b4", linewidth=1.2,
         )
     )
+    rectangle_corners = np.asarray(
+        (
+            (rxmin, rymin),
+            (rxmax, rymin),
+            (rxmax, rymax),
+            (rxmin, rymax),
+        ),
+        dtype=float,
+    )
+    if not np.isclose(float(rectangle_rotation_deg), 0.0):
+        angle = np.deg2rad(float(rectangle_rotation_deg))
+        cosine, sine = np.cos(angle), np.sin(angle)
+        local_x, local_y = rectangle_corners.T
+        rectangle_corners = np.column_stack(
+            (cosine * local_x - sine * local_y,
+             sine * local_x + cosine * local_y)
+        )
     axes[2].add_patch(
-        Rectangle(
-            (rxmin, rymin), rxmax - rxmin, rymax - rymin,
-            facecolor="#dbeaf5", edgecolor="#1f77b4", linewidth=1.4,
+        Polygon(
+            rectangle_corners,
+            closed=True,
+            facecolor="#dbeaf5",
+            edgecolor="#1f77b4",
+            linewidth=1.4,
         )
     )
     radius = 0.5 * min(xmax - xmin, ymax - ymin)

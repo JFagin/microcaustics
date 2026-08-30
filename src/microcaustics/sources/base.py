@@ -19,6 +19,63 @@ class SourceGeometry:
     wavelengths_angstrom: tuple[float, ...]
     band_names: tuple[str, ...]
 
+    @classmethod
+    def from_angular(
+        cls,
+        distances,
+        *,
+        shape: int | tuple[int, int],
+        field_of_view_uas: float | tuple[float, float],
+        bands: Mapping[str, float],
+    ) -> SourceGeometry:
+        """Construct physical source geometry from an angular field.
+
+        Parameters
+        ----------
+        distances:
+            A :class:`~microcaustics.LensingDistances` instance.
+        shape:
+            One square resolution or ``(ny, nx)``.
+        field_of_view_uas:
+            One square field size or ``(height, width)`` in microarcseconds.
+        bands:
+            Mapping from band name to observed wavelength in Angstrom.
+
+        Notes
+        -----
+        Source brightness remains expressed per projected physical area. This
+        constructor only removes the otherwise repetitive angular-to-metre
+        conversion from custom-source workflows.
+        """
+
+        resolved_shape = (
+            (int(shape), int(shape))
+            if isinstance(shape, int)
+            else tuple(int(value) for value in shape)
+        )
+        resolved_fov = (
+            (float(field_of_view_uas), float(field_of_view_uas))
+            if isinstance(field_of_view_uas, (int, float))
+            else tuple(float(value) for value in field_of_view_uas)
+        )
+        if len(resolved_shape) != 2 or len(resolved_fov) != 2:
+            raise ValueError("shape and field_of_view_uas must each contain two values")
+        if not bands:
+            raise ValueError("bands must contain at least one name and wavelength")
+        field_m = distances.uas_to_source_length(
+            torch.as_tensor(resolved_fov, dtype=torch.float32),
+            dtype=torch.float32,
+        )
+        return cls(
+            resolved_shape,
+            tuple(
+                float(length) / pixels
+                for length, pixels in zip(field_m, resolved_shape, strict=True)
+            ),
+            tuple(float(wavelength) for wavelength in bands.values()),
+            tuple(str(name) for name in bands),
+        )
+
     def __post_init__(self) -> None:
         if (
             len(self.shape) != 2
@@ -50,8 +107,11 @@ class PixelatedSource(Protocol):
     """Images produced by a static or time-dependent source model.
 
     ``brightness`` returns a tensor with shape ``[time, y, x, band]``. Values
-    may use any consistent surface-brightness normalization because lensed and
-    unlensed fluxes are evaluated from the same source.
+    used for photometry are observed spectral flux density per projected
+    source-plane area in ``Jy m^-2``. Integrating over source-pixel area then
+    returns physical flux density in Jy. Dimensionless profiles may still be
+    used for morphology or magnification-only calculations, but must be given
+    a physical normalization before an absolute light curve is requested.
     """
 
     geometry: SourceGeometry
@@ -80,11 +140,12 @@ def _as_times(value: torch.Tensor | Sequence[float] | float) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class StaticSource:
-    """A time-independent source image with arbitrary bands.
+    """A time-independent physical source image with arbitrary bands.
 
     The image must have shape ``[y, x, band]``. Rectangular images are
     supported. A later map operation decides whether padding is required by a
-    particular algorithm.
+    particular algorithm. Values are in ``Jy m^-2`` on the projected source
+    plane when this source is used for photometry.
     """
 
     image: torch.Tensor
@@ -120,12 +181,22 @@ class StaticSource:
     def metadata(self) -> Mapping[str, object]:
         """Return serializable source provenance."""
 
-        return {"type": "static", "name": self.name, "is_time_static": True}
+        return {
+            "type": "static",
+            "name": self.name,
+            "brightness_units": "Jy m^-2 projected source plane",
+            "integrated_flux_units": "Jy",
+            "is_time_static": True,
+        }
 
 
 @dataclass(frozen=True)
 class CallableSource:
-    """Adapt a user callable returning ``[time, y, x, band]`` brightness."""
+    """Adapt a callable returning physical ``[time, y, x, band]`` brightness.
+
+    The callable returns observed spectral flux density per projected
+    source-plane area in ``Jy m^-2`` when used for photometry.
+    """
 
     function: Callable[[torch.Tensor], torch.Tensor]
     geometry: SourceGeometry
@@ -164,6 +235,8 @@ class CallableSource:
         return {
             "type": "callable",
             "name": self.name,
+            "brightness_units": "Jy m^-2 projected source plane",
+            "integrated_flux_units": "Jy",
             "is_time_static": self.is_time_static,
             **dict(self.user_metadata or {}),
         }

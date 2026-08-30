@@ -320,23 +320,19 @@ class DynamicConfig:
 
 def production_ipm_config(
     *,
-    dynamic: bool,
     rays: int = 10_000_000,
     **overrides,
 ) -> IPMConfig:
-    """Return the validated high-accuracy tiled-IPM configuration.
+    """Return the validated dynamic tiled-IPM configuration.
 
-    Independent static maps use the complete ``k=1`` scout and therefore do
-    not need a scalar normalization correction. Dynamic sequences use the
-    faster ``k=2`` scout plus the one-time frame-zero ``k=1`` to ``k=2``
-    correction. All values remain ordinary dataclass fields. ``overrides``
-    may replace any setting for a documented convergence experiment.
+    High-level static-map calls automatically use a complete ``k=1`` scout.
+    Dynamic sequences use the faster ``k=2`` scout plus the one-time
+    frame-zero ``k=1`` to ``k=2`` correction. Users therefore do not select a
+    static/dynamic mode. ``overrides`` remains available for documented
+    numerical experiments.
 
     Parameters
     ----------
-    dynamic:
-        Select the validated dynamic scout/correction contract when true, or
-        the complete static ``k=1`` scout when false.
     rays:
         Requested fine base-cell budget.
     **overrides:
@@ -344,15 +340,17 @@ def production_ipm_config(
         validated baseline.
     """
 
+    if int(overrides.get("scout_ratio", 2)) == 1:
+        overrides.setdefault("dual_scout_scalar_correction", False)
     config = IPMConfig(
         rays=int(rays),
-        scout_ratio=2 if dynamic else 1,
+        scout_ratio=2,
         refinement=2,
         virtual_refinement=4,
         tiled=True,
         scout_halo_pixels=0.0,
         scout_dilation_cells=1,
-        dual_scout_scalar_correction=bool(dynamic),
+        dual_scout_scalar_correction=True,
         cell_chunk_size=524_288,
         far_field_approx=FarFieldApproxConfig(
             cells_per_axis=16,
@@ -361,6 +359,21 @@ def production_ipm_config(
             taylor_order=4,
             center_translation_order=10,
         ),
+    )
+    return replace(config, **overrides) if overrides else config
+
+
+def _production_static_ipm_config(
+    *,
+    rays: int = 10_000_000,
+    **overrides,
+) -> IPMConfig:
+    """Return the internal complete-scout configuration for one static map."""
+
+    config = production_ipm_config(
+        rays=rays,
+        scout_ratio=1,
+        dual_scout_scalar_correction=False,
     )
     return replace(config, **overrides) if overrides else config
 

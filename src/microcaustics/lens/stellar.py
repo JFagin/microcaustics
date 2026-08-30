@@ -19,20 +19,6 @@ _SECONDS_PER_DAY = 86_400.0
 _RADIANS_TO_MICROARCSECONDS = 180.0 / math.pi * 3600.0 * 1.0e6
 
 
-@dataclass(frozen=True)
-class SkyPosition:
-    """ICRS sky position used to project observer transverse motion."""
-
-    ra_deg: float
-    dec_deg: float
-
-    def __post_init__(self) -> None:
-        if not math.isfinite(float(self.ra_deg)) or not 0.0 <= self.ra_deg < 360.0:
-            raise ValueError("ra_deg must lie in [0, 360)")
-        if not math.isfinite(float(self.dec_deg)) or not -90.0 <= self.dec_deg <= 90.0:
-            raise ValueError("dec_deg must lie in [-90, 90]")
-
-
 @runtime_checkable
 class StellarKinematics(Protocol):
     """Physical prescription for independent stellar velocities."""
@@ -146,13 +132,20 @@ class SkyProjectedKinematics:
     Cartesian velocity pairs follow the local east/north axes, equivalent to
     increasing ICRS right ascension and declination. Lens and source peculiar
     velocities are proper velocities in their respective rest frames. The
-    CMB dipole is projected at ``sky_position`` and included by default.
+    CMB dipole is projected at ``ra_deg`` and ``dec_deg`` and included by
+    default. Use :meth:`sampled` to defer a reproducible peculiar-velocity draw
+    until the enclosing microlensing system supplies its redshifts.
     """
 
-    sky_position: SkyPosition
+    ra_deg: float
+    dec_deg: float
     stellar_dispersion_km_s: float = 170.0
-    lens_peculiar_velocity_km_s: tuple[float, float] = (0.0, 0.0)
-    source_peculiar_velocity_km_s: tuple[float, float] = (0.0, 0.0)
+    lens_peculiar_velocity_km_s: tuple[float, float] | None = (0.0, 0.0)
+    source_peculiar_velocity_km_s: tuple[float, float] | None = (0.0, 0.0)
+    peculiar_velocity_dispersion_km_s: float | None = None
+    omega_matter: float = 0.3
+    omega_lambda: float = 0.7
+    seed: int | None = None
     include_cmb_dipole: bool = True
     cmb_speed_km_s: float = 369.82
     cmb_galactic_longitude_deg: float = 264.021
@@ -161,8 +154,10 @@ class SkyProjectedKinematics:
     source_redshift: float | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.sky_position, SkyPosition):
-            raise TypeError("sky_position must be a SkyPosition")
+        if not math.isfinite(float(self.ra_deg)) or not 0.0 <= self.ra_deg < 360.0:
+            raise ValueError("ra_deg must lie in [0, 360)")
+        if not math.isfinite(float(self.dec_deg)) or not -90.0 <= self.dec_deg <= 90.0:
+            raise ValueError("dec_deg must lie in [-90, 90]")
         for name in (
             "stellar_dispersion_km_s",
             "cmb_speed_km_s",
@@ -170,13 +165,34 @@ class SkyProjectedKinematics:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
-        for name in (
+        sampled = self.peculiar_velocity_dispersion_km_s is not None
+        velocity_names = (
             "lens_peculiar_velocity_km_s",
             "source_peculiar_velocity_km_s",
-        ):
-            values = getattr(self, name)
-            if len(values) != 2 or any(not math.isfinite(float(v)) for v in values):
-                raise ValueError(f"{name} must contain two finite values")
+        )
+        if sampled:
+            if any(getattr(self, name) is not None for name in velocity_names):
+                raise ValueError(
+                    "sampled sky kinematics cannot also supply explicit peculiar velocities"
+                )
+            dispersion = float(self.peculiar_velocity_dispersion_km_s)
+            if not math.isfinite(dispersion) or dispersion < 0.0:
+                raise ValueError(
+                    "peculiar_velocity_dispersion_km_s must be finite and non-negative"
+                )
+            if self.seed is None:
+                import torch
+
+                object.__setattr__(self, "seed", int(torch.seed()))
+        else:
+            for name in velocity_names:
+                values = getattr(self, name)
+                if values is None or len(values) != 2 or any(
+                    not math.isfinite(float(v)) for v in values
+                ):
+                    raise ValueError(f"{name} must contain two finite values")
+        if not 0.0 <= self.omega_matter <= 1.0 or not 0.0 <= self.omega_lambda <= 2.0:
+            raise ValueError("omega_matter and omega_lambda are outside supported bounds")
         for name in ("lens_redshift", "source_redshift"):
             value = getattr(self, name)
             if value is not None and (not math.isfinite(float(value)) or value < 0.0):
@@ -194,10 +210,11 @@ class SkyProjectedKinematics:
         return matter ** (4.0 / 7.0) + dark_energy * (1.0 + matter / 2.0) / 70.0
 
     @classmethod
-    def sampled_peculiar_velocities(
+    def sampled(
         cls,
         *,
-        sky_position: SkyPosition,
+        ra_deg: float,
+        dec_deg: float,
         lens_redshift: float | None = None,
         source_redshift: float | None = None,
         peculiar_velocity_dispersion_km_s: float = 235.0,
@@ -206,12 +223,14 @@ class SkyProjectedKinematics:
         omega_lambda: float = 0.7,
         seed: int | None = None,
         include_cmb_dipole: bool = True,
-    ) -> SkyProjectedKinematics | SampledSkyKinematics:
-        """Draw reproducible lens/source peculiar velocities.
+    ) -> SkyProjectedKinematics:
+        """Describe reproducibly sampled lens/source peculiar velocities.
 
         The redshift scaling follows the growth-rate prescription used by the
-        production calculations. A separate seed avoids correlating bulk
-        velocities with the sampled stellar masses and positions.
+        production calculations. The draw is deferred until distances are
+        available, so callers do not repeat system redshifts. A separate seed
+        avoids correlating bulk velocities with the sampled stellar masses and
+        positions.
         """
 
         if peculiar_velocity_dispersion_km_s < 0.0:
@@ -220,35 +239,49 @@ class SkyProjectedKinematics:
             raise ValueError("omega_matter and omega_lambda are outside supported bounds")
         if (lens_redshift is None) != (source_redshift is None):
             raise ValueError("supply both lens_redshift and source_redshift, or neither")
-        if lens_redshift is None:
-            return SampledSkyKinematics(
-                sky_position=sky_position,
-                peculiar_velocity_dispersion_km_s=peculiar_velocity_dispersion_km_s,
-                stellar_dispersion_km_s=stellar_dispersion_km_s,
-                omega_matter=omega_matter,
-                omega_lambda=omega_lambda,
-                seed=seed,
-                include_cmb_dipole=include_cmb_dipole,
+        return cls(
+            ra_deg=ra_deg,
+            dec_deg=dec_deg,
+            stellar_dispersion_km_s=stellar_dispersion_km_s,
+            lens_peculiar_velocity_km_s=None,
+            source_peculiar_velocity_km_s=None,
+            peculiar_velocity_dispersion_km_s=peculiar_velocity_dispersion_km_s,
+            omega_matter=omega_matter,
+            omega_lambda=omega_lambda,
+            seed=seed,
+            include_cmb_dipole=include_cmb_dipole,
+            lens_redshift=lens_redshift,
+            source_redshift=source_redshift,
+        )
+
+    def _peculiar_velocities(
+        self,
+        distances: LensingDistances,
+    ) -> tuple[tuple[float, float], tuple[float, float]]:
+        if self.peculiar_velocity_dispersion_km_s is None:
+            assert self.lens_peculiar_velocity_km_s is not None
+            assert self.source_peculiar_velocity_km_s is not None
+            return (
+                self.lens_peculiar_velocity_km_s,
+                self.source_peculiar_velocity_km_s,
             )
-        assert source_redshift is not None
+        lens_redshift, source_redshift = self._redshifts(distances)
         import torch
 
         generator = torch.Generator(device="cpu")
-        if seed is None:
-            generator.seed()
-        else:
-            generator.manual_seed(int(seed))
-        f0 = cls._growth_rate(0.0, omega_matter, omega_lambda)
+        assert self.seed is not None
+        generator.manual_seed(int(self.seed))
+        f0 = self._growth_rate(0.0, self.omega_matter, self.omega_lambda)
         lens_sigma = (
-            peculiar_velocity_dispersion_km_s
+            self.peculiar_velocity_dispersion_km_s
             / math.sqrt(1.0 + lens_redshift)
-            * cls._growth_rate(lens_redshift, omega_matter, omega_lambda)
+            * self._growth_rate(lens_redshift, self.omega_matter, self.omega_lambda)
             / f0
         )
         source_sigma = (
-            peculiar_velocity_dispersion_km_s
+            self.peculiar_velocity_dispersion_km_s
             / math.sqrt(1.0 + source_redshift)
-            * cls._growth_rate(source_redshift, omega_matter, omega_lambda)
+            * self._growth_rate(source_redshift, self.omega_matter, self.omega_lambda)
             / f0
         )
         lens = tuple(
@@ -261,15 +294,7 @@ class SkyProjectedKinematics:
             for v in torch.randn(2, generator=generator, dtype=torch.float64)
             * source_sigma
         )
-        return cls(
-            sky_position=sky_position,
-            stellar_dispersion_km_s=stellar_dispersion_km_s,
-            lens_peculiar_velocity_km_s=lens,
-            source_peculiar_velocity_km_s=source,
-            include_cmb_dipole=include_cmb_dipole,
-            lens_redshift=lens_redshift,
-            source_redshift=source_redshift,
-        )
+        return lens, source
 
     def _redshifts(self, distances: LensingDistances) -> tuple[float, float]:
         lens = distances.lens_redshift if self.lens_redshift is None else self.lens_redshift
@@ -314,8 +339,8 @@ class SkyProjectedKinematics:
             (-0.4838350155, 0.7469822445, 0.4559837762),
         )
         icrs = tuple(sum(row[j] * galactic[j] for j in range(3)) for row in rotation)
-        ra = math.radians(self.sky_position.ra_deg)
-        dec = math.radians(self.sky_position.dec_deg)
+        ra = math.radians(self.ra_deg)
+        dec = math.radians(self.dec_deg)
         east = (-math.sin(ra), math.cos(ra), 0.0)
         north = (-math.sin(dec) * math.cos(ra), -math.sin(dec) * math.sin(ra), math.cos(dec))
         return (
@@ -330,15 +355,16 @@ class SkyProjectedKinematics:
         """Return the effective east/north angular drift of the star field."""
 
         lens_redshift, source_redshift = self._redshifts(distances)
+        lens_velocity, source_velocity = self._peculiar_velocities(distances)
         cmb = self._cmb_transverse_km_s()
         result = []
         for axis in range(2):
             angular_per_second = (
-                self.lens_peculiar_velocity_km_s[axis]
+                lens_velocity[axis]
                 * 1_000.0
                 / distances.lens_m
                 / (1.0 + lens_redshift)
-                - self.source_peculiar_velocity_km_s[axis]
+                - source_velocity[axis]
                 * 1_000.0
                 / distances.source_m
                 / (1.0 + source_redshift)
@@ -357,68 +383,6 @@ class SkyProjectedKinematics:
                 * _SECONDS_PER_DAY
             )
         return (result[0], result[1])
-
-
-@dataclass(frozen=True)
-class SampledSkyKinematics:
-    """Deferred sky-projected kinematics resolved from system redshifts.
-
-    This high-level specification avoids repeating lens and source redshifts
-    when constructing a stellar population. The deterministic velocity draw
-    is performed when the population is realized with its
-    :class:`LensingDistances`.
-    """
-
-    sky_position: SkyPosition
-    peculiar_velocity_dispersion_km_s: float = 235.0
-    stellar_dispersion_km_s: float = 170.0
-    omega_matter: float = 0.3
-    omega_lambda: float = 0.7
-    seed: int | None = None
-    include_cmb_dipole: bool = True
-
-    def __post_init__(self) -> None:
-        if self.seed is None:
-            import torch
-
-            object.__setattr__(self, "seed", int(torch.seed()))
-
-    def _resolved(self, distances: LensingDistances) -> SkyProjectedKinematics:
-        if distances.lens_redshift is None or distances.source_redshift is None:
-            raise ValueError(
-                "sampled sky kinematics require distances constructed from redshifts"
-            )
-        resolved = SkyProjectedKinematics.sampled_peculiar_velocities(
-            sky_position=self.sky_position,
-            lens_redshift=distances.lens_redshift,
-            source_redshift=distances.source_redshift,
-            peculiar_velocity_dispersion_km_s=(
-                self.peculiar_velocity_dispersion_km_s
-            ),
-            stellar_dispersion_km_s=self.stellar_dispersion_km_s,
-            omega_matter=self.omega_matter,
-            omega_lambda=self.omega_lambda,
-            seed=self.seed,
-            include_cmb_dipole=self.include_cmb_dipole,
-        )
-        assert isinstance(resolved, SkyProjectedKinematics)
-        return resolved
-
-    def component_dispersion_uas_per_day(
-        self, distances: LensingDistances
-    ) -> float:
-        """Return the stellar velocity dispersion in angular units."""
-
-        return self._resolved(distances).component_dispersion_uas_per_day(distances)
-
-    def mean_velocity_uas_per_day(
-        self, distances: LensingDistances
-    ) -> tuple[float, float]:
-        """Return the sampled effective bulk drift in angular units."""
-
-        return self._resolved(distances).mean_velocity_uas_per_day(distances)
-
-
 @dataclass(frozen=True)
 class StellarAperture:
     """The full circular lens-plane region populated by compact objects."""

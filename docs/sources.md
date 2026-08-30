@@ -5,6 +5,35 @@ source supplies a `SourceGeometry` and returns brightness with shape
 `[time, y, x, band]`. Band names and wavelengths are arbitrary. LSST `ugrizy`
 is an application choice, not a package constraint.
 
+For photometry, source brightness is observed spectral flux density per
+projected source-plane area in `Jy m^-2`. Multiplication by physical pixel area
+therefore produces light curves in Jy. Built-in disks and supernovae already
+satisfy this convention. `GaussianSource.total_flux` and
+`GaussianModel.total_flux` are integrated flux densities in Jy. A
+`StaticSource` or `CallableSource` supplied by a user must follow the same
+convention. Dimensionless profiles remain useful for morphology and
+magnification-only calculations, but need a physical normalization before
+absolute photometry is requested. `flux_to_magnitude` converts Jy directly to
+AB magnitudes using the fixed 3631 Jy definition.
+
+Custom pixelated sources can define their geometry directly in observable
+angular units. The constructor performs the source-plane distance conversion,
+so notebook and application code does not need a manual microarcsecond-to-metre
+constant:
+
+```python
+geometry = mc.SourceGeometry.from_angular(
+    distances,
+    shape=(512, 512),
+    field_of_view_uas=(8.0, 8.0),
+    bands=("blue", "red"),
+)
+source = mc.CallableSource(geometry, my_brightness_function)
+```
+
+The callable must return physical surface brightness in `Jy m^-2` when the
+result will be converted to absolute fluxes or AB magnitudes.
+
 Built-in lightweight sources include `StaticSource`, `GaussianSource`, an
 elliptical Gaussian with an optional smooth central hole, physical thin disks,
 and configurable expanding photospheres. `CallableSource` remains the shortest
@@ -14,17 +43,23 @@ radiation calculation.
 The physical wrappers `GaussianModel`, `ThinDiskModel`, and `KerrDiskModel`
 choose their own source support and pixel geometry. They can therefore be
 passed directly to `MicrolensingSystem`. `GaussianModel.from_angular` accepts
-observational widths in microarcseconds without manual unit conversion. A
-source field can also follow bulk motion without hand-written bounding-box
-arithmetic:
+observational widths in microarcseconds without manual unit conversion. Give
+the trajectory and duration to the system when a source also moves:
 
 ```python
-source_grid = source_model.recommended_grid(distances).covering_trajectory(
-    trajectory,
-    (0.0, 3650.0),
-    margin=1.05,
+system = mc.MicrolensingSystem.from_redshifts(
+    lens_redshift=0.04,
+    source_redshift=1.7,
+    macro=macro,
+    source=source_model,
+    stellar_population=population,
+    trajectory=trajectory,
+    duration_days=3650.0,
 )
 ```
+
+The source parameters determine its native angular support. The system then
+enlarges the map field, when necessary, to cover the complete trajectory.
 
 ## Expanding supernovae
 
@@ -52,7 +87,6 @@ source = mc.ExpandingPhotosphereSource(
     maximum_observer_time_days=180.0,
     evolution=evolution,
     resolution=256,
-    source_fov_margin=1.08,
 )
 ```
 
@@ -171,7 +205,7 @@ psi = reprocessed.transfer_function(delay_edges_days, magnification=mu)
 ```
 
 Transfer functions are also first-class standalone data products. They do not
-require a `MultiImageSimulation`:
+require a low-level `microcaustics.multi_image.MultiImageSimulation`:
 
 ```python
 steady = mc.steady_transfer_function(
@@ -225,21 +259,18 @@ pixelization. They choose a conservative angular field when passed to
 source = mc.ThinDiskModel(
     black_hole_mass_solar=1.0e9,
     eddington_ratio=0.1,
-    wavelengths_angstrom=(4800.0, 9700.0),
-    band_names=("blue", "red"),
+    bands={"blue": 4800.0, "red": 9700.0},  # Angstrom
     inclination_deg=45.0,
-    grid=mc.SourceGridConfig(
-        shape=1024,
-        enclosed_flux_fraction=0.999,
-        margin=1.05,
-    ),
+    resolution=1024,
+    enclosed_flux_fraction=0.999,
+    source_margin=1.05,
 )
 ```
 
 The reddest thin-disk band sets the common outer support. The Gaussian model
 uses the widest requested band and includes ellipticity, orientation, and an
-offset center in its bounding grid. Passing an explicit `source_grid` overrides
-the recommendation without changing the physical model.
+offset center in its bounding grid. Advanced callers may override the derived
+grid, but ordinary quasar and supernova calculations should not do so.
 
 The physical support radius is also used when constructing the complete
 stellar aperture. For a custom pixelated source whose grid includes known

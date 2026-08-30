@@ -14,7 +14,7 @@ from ._common import (
     paper_style,
     publication_style,
 )
-from .animations import save_fixed_palette_gif
+from .animations import animate_standardized_source_bands, save_fixed_palette_gif
 from .caustics import plot_anchor_gauge, plot_caustics
 from .light_curves import (
     plot_light_curve,
@@ -22,6 +22,7 @@ from .light_curves import (
     plot_photometric_observations,
 )
 from .maps import (
+    plot_caustic_diagnostics,
     plot_distance_map,
     plot_label_map,
     plot_magnification_map,
@@ -33,14 +34,19 @@ from .methods import (
     plot_lens_field_strategies,
 )
 from .paper_methods import (
+    render_live_paper_anchor_gauge,
+    render_live_paper_ipm_schematic,
     render_paper_anchor_gauge,
     render_paper_ipm_schematic,
     render_paper_sim5_validation,
 )
 from .sources import (
+    TemporalSourceStandardization,
     enclosed_flux_contour_levels,
     plot_rendered_macro_image,
     plot_source_brightness,
+    plot_standardized_source_bands,
+    standardize_source_over_time,
 )
 from .timing import plot_timing_breakdown, print_benchmark, runtime_description
 from .transfer import (
@@ -52,6 +58,7 @@ from .transfer import (
 __all__ = [
     "plot_anchor_gauge",
     "plot_caustics",
+    "plot_caustic_diagnostics",
     "plot_distance_map",
     "plot_far_field_method",
     "plot_label_map",
@@ -65,15 +72,20 @@ __all__ = [
     "plot_photometric_observations",
     "plot_rendered_macro_image",
     "plot_source_brightness",
+    "plot_standardized_source_bands",
     "plot_timing_breakdown",
     "plot_transfer_function",
     "plot_far_field_method",
     "enclosed_flux_contour_levels",
+    "standardize_source_over_time",
+    "TemporalSourceStandardization",
     "transfer_response_density",
     "print_benchmark",
     "runtime_description",
     "render_paper_ipm_schematic",
     "render_paper_anchor_gauge",
+    "render_live_paper_ipm_schematic",
+    "render_live_paper_anchor_gauge",
     "render_paper_sim5_validation",
     "add_scale_bar",
     "band_colors",
@@ -83,4 +95,5 @@ __all__ = [
     "hide_image_axes",
     "panel_colorbar",
     "save_fixed_palette_gif",
+    "animate_standardized_source_bands",
 ]

@@ -201,9 +201,42 @@ class SciPyOracleTests(unittest.TestCase):
         np.testing.assert_allclose(sn, expected_sn, rtol=2e-12, atol=2e-12)
         np.testing.assert_allclose(cn, expected_cn, rtol=2e-12, atol=2e-12)
 
+    def test_gaussian_psf_kernel_matches_scipy_window(self) -> None:
+        from scipy.signal.windows import gaussian
+
+        size = 17
+        fwhm_arcsec = 0.14
+        pixel_scale_arcsec = 0.04
+        oversample = 2
+        package = mc.gaussian_psf_kernel(
+            fwhm_arcsec,
+            pixel_scale_arcsec,
+            size=size,
+            oversample_factor=oversample,
+            dtype=torch.float64,
+        ).numpy()
+        sigma_pixels = (
+            fwhm_arcsec / (pixel_scale_arcsec / oversample) / 2.354820045
+        )
+        axis = gaussian(size, sigma_pixels)
+        expected = np.outer(axis, axis)
+        expected /= expected.sum()
+        np.testing.assert_allclose(package, expected, rtol=2.0e-14, atol=1.0e-16)
+
 
 @unittest.skipUnless(ASTROPY_AVAILABLE, "Astropy validation dependency is unavailable")
 class AstropyOracleTests(unittest.TestCase):
+    def test_ab_magnitude_matches_astropy_photometric_units(self) -> None:
+        import astropy.units as units
+
+        flux_jy = np.asarray([3631.0, 1.0, 1.0e-3, 1.0e-6])
+        package = mc.flux_to_magnitude(
+            torch.as_tensor(flux_jy, dtype=torch.float64)
+        ).numpy()
+        expected = (flux_jy * units.Jy).to_value(units.ABmag)
+        # microcaustics uses the conventional rounded 3631 Jy AB zero point.
+        np.testing.assert_allclose(package, expected, rtol=0.0, atol=7.0e-5)
+
     def test_torch_float32_flat_cosmology_matches_astropy(self) -> None:
         import astropy.units as units
         from astropy.cosmology import FlatLambdaCDM

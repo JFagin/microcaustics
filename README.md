@@ -12,7 +12,7 @@ tutorial. It shows a ten-year, $10^7$-ray, $1024^2$ dynamic IPM calculation with
 caustic network overlaid. Its map normalization, colorbar, and indexed GIF
 palette are fixed globally across all frames.
 
-The portable reference layer includes:
+The portable reference layer includes the following capabilities.
 
 - exact chunked point-mass ray tracing and analytic Jacobians.
 - source-independent uniform-grid inverse ray shooting (IRS).
@@ -22,7 +22,7 @@ The portable reference layer includes:
 - fused batches of unrelated static maps and moving-star map sequences on CUDA, with
   portable frame-by-frame equivalents.
 - critical curves, caustics, binary label maps, and distance maps.
-- arbitrary multiband pixelated/callable sources and analytic Gaussians.
+- physically calibrated multiband pixelated/callable sources and analytic Gaussians.
 - composable tabulated or callable intrinsic driving signals.
 - physical Page--Thorne thin disks with non-GR, approximate-GR, and primary
   full-Kerr observer transfers.
@@ -48,22 +48,30 @@ choose the correct command for the operating system and compute platform. In
 particular, select a CUDA build rather than the CPU build for an NVIDIA GPU.
 The exact CUDA wheel command changes between PyTorch releases.
 
-Verify the PyTorch installation before continuing:
+Verify the PyTorch installation before continuing.
 
 ```bash
 python -c "import torch; print('torch', torch.__version__); print('CUDA', torch.cuda.is_available(), torch.version.cuda); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU/MPS')"
 ```
 
-Then install this project in editable mode. Contributors who want to run the
-complete CPU test, documentation, and notebook toolchain can install:
+Install the tagged release directly from GitHub after PyTorch is available.
+
+```bash
+python -m pip install "microcaustics @ git+https://github.com/JFagin/microcaustics.git@v1.0.0"
+```
+
+Clone the repository when you want to run the notebooks, edit the source, or
+contribute changes. A complete development installation is available from the
+repository root.
 
 ```bash
 python -m pip install -e ".[dev,docs,notebooks,test,validation]"
 ```
 
-For an ordinary source installation without the development tools, use
+For an editable installation without development tools, use
 `python -m pip install -e .`. Plotting, notebooks, astronomy dependencies, and
-external validation packages remain optional extras.
+external validation packages remain optional extras. The standalone scripts
+are indexed in [`examples/README.md`](examples/README.md).
 
 The numerical core supports Python 3.10 and newer. The optional `caustics`
 interoperability layer requires Python 3.11 or newer because that is the
@@ -82,7 +90,7 @@ importable Triton package. This path is significantly faster than compiled PyTor
   Use the community-maintained
   [`triton-windows` distribution](https://github.com/triton-lang/triton-windows)
   and follow its current PyTorch/Triton compatibility table. For example, only
-  when that table assigns Triton 3.7 to the installed PyTorch release:
+  when that table assigns Triton 3.7 to the installed PyTorch release.
 
   ```powershell
   python -m pip uninstall -y triton
@@ -102,7 +110,7 @@ importable Triton package. This path is significantly faster than compiled PyTor
   eager/compiled PyTorch implementation. Apple MPS is supported where PyTorch
   supports the requested operations.
 
-Check the detected runtime:
+Check the detected runtime.
 
 ```bash
 microcaustics doctor
@@ -119,7 +127,7 @@ for cache, compiler, first-call timing, and out-of-memory guidance.
 The notebooks are the recommended introduction to the package because they
 show complete scientific workflows, physical coordinate conventions, and
 accelerator timing. Install the notebook dependencies and launch the
-collection with:
+collection with the following commands.
 
 ```bash
 python -m pip install -e ".[notebooks,science]"
@@ -127,33 +135,34 @@ jupyter lab examples/notebooks
 ```
 
 Start with
-[Getting started with maps and light curves](examples/notebooks/01_q2237_production_light_curve_and_gif.ipynb).
+[Getting started with maps and light curves](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb).
 It generates a ten-year dynamic magnification sequence, finite-source light
 curves with and without intrinsic variability, source-center caustic labels,
 and the animation shown above. The calculation uses the documented production
 IPM and far-field settings rather than a simplified plotting surrogate.
 
-The complete notebook guide is organized into five tracks:
+The complete notebook guide is organized into five tracks.
 
 | Track | Notebooks |
 |---|---|
-| Foundations | [Runtime and static maps](examples/notebooks/00_runtime_and_static_maps.ipynb), [getting started with maps and light curves](examples/notebooks/01_q2237_production_light_curve_and_gif.ipynb), [static IRS and IPM](examples/notebooks/02_static_irs_and_ipm.ipynb), [stellar populations and mass functions](examples/notebooks/03_stellar_populations_and_mass_functions.ipynb), [far-field approximation](examples/notebooks/04_far_field_approximation.ipynb), and [dynamic maps and light curves](examples/notebooks/05_dynamic_maps_and_light_curves.ipynb) |
-| Caustics and source physics | [Caustics and labels](examples/notebooks/06_caustics_and_labels.ipynb), [relativistic disks and transfer functions](examples/notebooks/07_relativistic_disks_and_transfer_functions.ipynb), [continuum reverberation mapping](examples/notebooks/08_continuum_reverberation_mapping.ipynb), [expanding supernovae](examples/notebooks/10_expanding_supernovae.ipynb), and [custom sources and variability](examples/notebooks/11_custom_sources_and_variability.ipynb) |
-| Strong-lens workflows | [Multi-image light curves and observations](examples/notebooks/09_multi_image_light_curves_and_observations.ipynb), [realistic strong-lens images](examples/notebooks/14_realistic_strong_lens_image.ipynb), and [the end-to-end lensed-quasar example](examples/notebooks/15_end_to_end_lensed_quasar.ipynb) |
-| Validation and performance | [Weisenbach IPM validation](examples/notebooks/12_weisenbach_ipm_visual_validation.ipynb), [SIM5 GR validation](examples/notebooks/13_sim5_gr_visual_validation.ipynb), [accuracy and performance](examples/notebooks/16_accuracy_and_performance.ipynb), and [the analytic single-point-lens test](examples/notebooks/20_single_point_lens_validation.ipynb) |
-| Production datasets | [Streaming and export](examples/notebooks/17_streaming_and_exporting_results.ipynb), [fixed-system training sets](examples/notebooks/18_q2237_training_set.ipynb), and [prior-sampled training sets](examples/notebooks/19_randomized_training_set.ipynb) |
+| Getting started | [Static maps and numerical methods](examples/notebooks/getting_started/00_static_maps_and_numerical_methods.ipynb), [Q2237 production light curves](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb), and [dynamic maps and light curves](examples/notebooks/getting_started/02_dynamic_maps_and_light_curves.ipynb) |
+| Methods | [Stellar populations and mass functions](examples/notebooks/methods/00_stellar_populations_and_mass_functions.ipynb), [far-field approximation](examples/notebooks/methods/01_far_field_approximation.ipynb), and [caustics and labels](examples/notebooks/methods/02_caustics_and_labels.ipynb) |
+| Source models | [Relativistic disks and reverberation](examples/notebooks/source_models/00_relativistic_disks_and_reverberation.ipynb), [expanding supernovae](examples/notebooks/source_models/01_expanding_supernovae.ipynb), and [custom sources and variability](examples/notebooks/source_models/02_custom_sources_and_variability.ipynb) |
+| Workflows | [Multi-image light curves and observations](examples/notebooks/workflows/00_multi_image_light_curves_and_observations.ipynb), [realistic strong-lens images](examples/notebooks/workflows/01_realistic_strong_lens_image.ipynb), [end-to-end lensed quasars](examples/notebooks/workflows/02_end_to_end_lensed_quasar.ipynb), [streaming and export](examples/notebooks/workflows/03_streaming_and_exporting_results.ipynb), and [simulation datasets](examples/notebooks/workflows/04_simulation_datasets.ipynb) |
+| Validation | [Weisenbach IPM](examples/notebooks/validation/00_weisenbach_ipm_visual_validation.ipynb), [SIM5 GR](examples/notebooks/validation/01_sim5_gr_visual_validation.ipynb), [accuracy and performance](examples/notebooks/validation/02_accuracy_and_performance.ipynb), and [analytic single-point lens](examples/notebooks/validation/03_single_point_lens_validation.ipynb) |
 
 The validation notebooks can use independently generated Weisenbach and SIM5
 products when those external codes are available. The remaining notebooks run
 only with the public `microcaustics` interface and their documented optional
 dependencies.
 
-## Getting started: maps and light curves
+## Getting started with maps and light curves
 
 This example follows the first tutorial notebook. It defines one Q2237 image
 B-like physical system, generates an independent magnification map, and then
-uses the same realization for a ten-year light curve with source-center
-caustic labels. The package derives the source grid, circular stellar field,
+generates a ten-year light curve with source-center caustic labels. The
+requested light-curve time axis automatically expands the stellar aperture
+and map geometry for the full trajectory. The package derives the source grid, circular stellar field,
 number of stars, Einstein radii, stellar velocities, and lens-plane bounds.
 
 ### 1. Define the lens, source, and stellar population
@@ -176,31 +185,23 @@ macro = mc.MacroLens(
 source = mc.KerrDiskModel(
     black_hole_mass_solar=10.0**9.08,
     eddington_ratio=0.34,
-    wavelengths_angstrom=(3671, 4827, 6223, 7546, 8691, 9712),
-    band_names=("u", "g", "r", "i", "z", "y"),
+    bands={"u": 3671, "g": 4827, "r": 6223,
+           "i": 7546, "z": 8691, "y": 9712},  # Angstrom
     spin=0.74,
     inclination_deg=10.0,
     position_angle_deg=175.0,
-    source_redshift=source_redshift,
     lamp_fraction=0.1,
     corona_height_above_isco_rg=20.0,
-    grid=mc.SourceGridConfig(
-        shape=1024,
-        enclosed_flux_fraction=0.999,
-        margin=1.05,
-    ),
+    resolution=1024,
+    enclosed_flux_fraction=0.999,
+    source_margin=1.05,
 )
 
-sky_position = mc.SkyPosition(
+kinematics = mc.SkyProjectedKinematics.sampled(
     ra_deg=340.126125,
     dec_deg=3.358611,
-)
-kinematics = mc.SkyProjectedKinematics.sampled_peculiar_velocities(
-    sky_position=sky_position,
     peculiar_velocity_dispersion_km_s=235.0,
     stellar_dispersion_km_s=170.0,
-    omega_matter=0.3,
-    omega_lambda=0.7,
     seed=2001,
 )
 population = mc.StellarPopulation.salpeter(
@@ -218,12 +219,17 @@ system = mc.MicrolensingSystem.from_redshifts(
     source=source,
     stellar_population=population,
     integration_domain="scout",     # "scout", "full", or "rectangle"
-    duration_days=3650,
     light_loss=0.01,
     safety_scale=1.5,
     stellar_motion_sigma_margin=5.0,
     seed=1001,
     caustic_grid_shape=8192,
+    runtime=mc.RuntimeConfig(
+        device="auto",               # CUDA, MPS, or CPU
+        backend="auto",              # Triton, compiled Torch, or eager Torch
+        dtype=torch.float32,
+        profiling="off",             # no timing-only synchronization
+    ),
 )
 ```
 
@@ -233,19 +239,35 @@ an explicit `LensingDistances` object for a different expansion history. The
 stellar-realization and peculiar-velocity seeds are separate, so both random
 processes remain independently reproducible.
 
+A single integer seed is enough for a reproducible calculation. The package
+derives stable independent streams for stars, source variability,
+observations, and each macroimage. A mapping can override only the desired
+components, for example `seed={"base": 1001, "stars": 42}`.
+
+Before allocating stars or compiling a kernel, inspect the derived geometry
+and resource scale with `system.summary(duration_days=3650)`. The returned
+dictionary can also be validated programmatically, and the call performs no
+simulation.
+
+`resolution` is the number of source pixels per axis, not a physical source
+size. Quasar models derive their angular field from the black-hole, accretion,
+wavelength, inclination, redshift, and enclosed-flux settings.
+Expanding-supernova models derive it from the largest photospheric radius over
+the requested evolution.
+When a source trajectory is supplied to `MicrolensingSystem`, its duration is
+also included automatically so the derived map field covers the complete
+path. An explicit `PlaneGrid` is only needed for a source-independent map or
+an intentionally pixelated custom source.
+
 ### 2. Generate and plot one magnification map
 
 An independent static map uses the complete `k=1` source scout. This avoids the
 dynamic sequence's one-time `k=1` to `k=2` normalization correction.
 
 ```python
-static_method = mc.production_ipm_config(
-    dynamic=False,
-    rays=10_000_000,
-)
 magnification_map = system.magnification_map(
     time_days=0.0,
-    method=static_method,
+    rays=10_000_000,
 )
 
 figure, ax = mcp.plot_magnification_map(
@@ -256,69 +278,36 @@ figure, ax = mcp.plot_magnification_map(
 )
 ```
 
+The operation infers the static `k=1` IPM preset. Common experiments remain
+plain keyword changes, for example
+`system.magnification_map(rays=5_000_000, refinement=3,
+virtual_refinement=4, far_field=True)`. Use `method="irs"` for inverse ray
+shooting, or set `integration_domain` on the system to `"scout"`, `"full"`,
+or `"rectangle"`.
+
 For a source-independent map, omit `source=` and supply only
 `source_grid=mc.PlaneGrid((1024, 1024), (height_uas, width_uas))`. The tuple
 order is `(y, x)`, and the field of view is in microarcseconds.
 
 ### 3. Generate a production light curve with labels
 
-The production path uses `N=10^7`, `k=2`, true refinement `r=2`, virtual
-refinement `v=4`, the local-exact complex-Taylor far field, temporal batching,
-and conservative endpoint-union scout reuse. All of these settings remain
-adjustable.
+The shortest call uses the complete validated production path. This means
+`N=10^7`, `k=2`, true refinement `r=2`, virtual refinement `v=4`, the
+local-exact complex-Taylor far field, temporal batching, conservative
+endpoint-union scout reuse, and aligned source-center labels.
 
 ```python
 
-# Local-exact plus complex-Taylor far-field approximation.
-far_field = mc.FarFieldApproxConfig(
-    cells_per_axis=16,          # local-membership partition
-    nodes_per_cell_axis=8,     # Taylor evaluation lattice per cell
-    exact_radius_cells=1.0,    # neighboring cells evaluated exactly
-    taylor_order=4,
-    center_translation_order=10,
-)
-
-# Production IPM settings. All values may be changed for convergence studies.
-method = mc.production_ipm_config(
-    dynamic=True,
-    rays=10_000_000,           # N
-    scout_ratio=2,             # k; used by the scout domain
-    refinement=2,              # r; true lens-equation refinement
-    virtual_refinement=4,      # v; interpolated polygon refinement
-    scout_halo_pixels=0.0,
-    scout_dilation_cells=1,
-    cell_chunk_size=524_288,
-    far_field_approx=far_field,
-)
-
-# Temporal batching and conservative endpoint-union scout reuse.
-schedule = mc.production_dynamic_config(
-    temporal_batch_size=40,
-    scout_refresh_frames=10,
-    endpoint_union=True,
-    reuse_static_maps=True,
-)
-
-caustics = mc.CausticConfig(
-    far_field_approx=far_field,
-    temporal_batch_size=40,
-    jacobian_chunk_size=1_048_576,
-    anchor_count=9,
-    gauge_count=9,
-)
-
-times_days = torch.arange(0.0, 3650.0 + 1.0, 25.0)
 result = system.light_curve_with_labels(
-    times_days,
-    method=method,
-    schedule=schedule,
-    caustics=caustics,
+    duration_days=3650,
+    map_cadence_days=25,
+    source_cadence_days=1,
     keep_maps_at_days=(0.0,),
 )
 
 light_curve = result.light_curve
 map_at_day_zero = result.maps[0.0]
-print(light_curve.flux)               # [147, 6]
+print(light_curve.flux)               # [3651, 6], daily source evolution
 print(result.crossing_labels)         # source-center parity
 print(result.crossing_events)         # label transitions
 print(result.center_distances_uas)    # nearest-caustic distance
@@ -333,6 +322,78 @@ figure, ax = mcp.plot_light_curve(
 )
 ```
 
+Here is the same production calculation with its principal numerical controls
+made explicit. These are ordinary configurations, so users can change any
+value for accuracy, speed, memory, or convergence studies.
+
+```python
+far_field = mc.FarFieldApproxConfig(
+    enabled=True,
+    cells_per_axis=16,          # local exact/far membership partition
+    nodes_per_cell_axis=8,      # Taylor evaluation lattice within each cell
+    exact_radius_cells=1.0,     # neighboring cells evaluated exactly
+    taylor_order=4,
+    center_translation_order=10,
+)
+
+method = mc.production_ipm_config(
+    rays=10_000_000,            # N
+    scout_ratio=2,              # k
+    refinement=2,               # r, true lens-equation refinement
+    virtual_refinement=4,       # v, interpolated polygon refinement
+    scout_halo_pixels=0.0,
+    scout_dilation_cells=1,
+    scout_trace_centers=True,
+    dual_scout_scalar_correction=True,  # one-time k=1 to k=2 correction
+    cell_chunk_size=524_288,
+    far_field_approx=far_field,
+)
+
+schedule = mc.production_dynamic_config(
+    temporal_batch_size=40,
+    light_curve_batch_size=None,  # autotune independent light-curve batches
+    fused_temporal_ipm=True,
+    pad_temporal_batches=True,
+    scout_refresh_frames=10,
+    endpoint_union=True,
+    reuse_static_maps=True,
+    minimum_cell_chunk_size=1_024,
+)
+
+labels = mc.CausticConfig(
+    far_field_approx=far_field,
+    temporal_batch_size=40,
+    jacobian_chunk_size=1_048_576,
+    determinant_cleanup="local",
+    minimum_sign_component_pixels=4,
+    anchor_count=9,
+    gauge_count=9,
+    anchor_inset_fraction=0.05,
+    gauge_inset_fraction=0.08,
+    anchor_radial_jitter_fraction=0.01,
+    gauge_radial_jitter_fraction=0.01,
+    minimum_safe_gauges=3,
+    weighted_temporal_alignment=True,
+    float64_label_fallback=False,
+)
+
+explicit_result = system.light_curve_with_labels(
+    duration_days=3650,
+    map_cadence_days=25,
+    source_cadence_days=1,
+    method=method,
+    schedule=schedule,
+    caustics=labels,
+    keep_maps_at_days=(0.0,),
+)
+```
+
+The short call inherits `far_field` from the method and the temporal batch size
+from the schedule. The expanded example repeats them intentionally so every
+effective value is visible and the three configurations can be modified
+independently. Lower-level label query and Triton chunk controls remain
+available in `CausticConfig` for unusual workloads.
+
 Only the requested day-zero map is retained. The other full-resolution maps
 are streamed through the finite-source photometry and label calculation rather
 than stored as a large cube. The first tutorial extends this same workflow to
@@ -343,18 +404,17 @@ GIF of all 147 maps.
 
 Compiled Torch and Triton kernels are cached by compatible execution shape.
 Reusing one `MicrolensingSystem` also reuses its seeded stellar realization.
-An explicit warmup can separate first-call compilation from production work:
+An explicit warmup can separate first-call compilation from production work.
 
 ```python
 # Use a representative temporal batch so the production batch shape is warm.
-system.warmup(times_days[:40], labels=True, method=method, schedule=schedule)
+warmup_times = torch.arange(0.0, 40.0 * 25.0, 25.0)
+system.warmup(warmup_times, labels=True)
 
 # Subsequent compatible calls reuse the realization and warmed kernels.
 next_result = system.light_curve_with_labels(
-    times_days,
-    method=method,
-    schedule=schedule,
-    caustics=caustics,
+    duration_days=3650,
+    map_cadence_days=25,
 )
 ```
 
@@ -363,19 +423,14 @@ shared map sequence. `batched_system_maps(...)` batches unrelated static
 systems without sharing their stars. Both interfaces reuse compatible compiled
 kernels instead of recompiling for every realization.
 
-For example, independent stellar realizations of the same macroimage can be
-generated together. Each seed produces a new star field, while the compatible
-Triton or compiled-Torch kernels are reused:
+Independent stellar realizations of the same macroimage can be generated
+together. Each seed produces a new star field. Compatible Triton or
+compiled-Torch kernels are reused.
 
 ```python
-from dataclasses import replace
-
-systems = [replace(system, seed=seed) for seed in range(1001, 1009)]
-static_method = mc.production_ipm_config(dynamic=False)  # complete k=1 scout
-
+systems = [system.with_seed(seed) for seed in range(1001, 1009)]
 maps = mc.batched_system_maps(
     systems,
-    method=static_method,
     batch_size=8,  # automatically reduced if necessary to avoid an OOM
 )
 ```
@@ -392,7 +447,7 @@ This compilation is cached and reused by later compatible realizations.
 
 Timing collection is disabled by default because GPU synchronization can
 reduce throughput. Request synchronized end-to-end or component timing only
-when it is needed:
+when it is needed.
 
 ```python
 runtime = mc.RuntimeConfig(profiling="total")
@@ -413,11 +468,11 @@ circular star population. The latter can use a separate
 For dynamic scout calculations, `scout_refresh_frames` is the reuse interval.
 Endpoint union retains the cells selected at both ends of each interval, which
 protects motion between refreshes. The far-field Taylor coefficients themselves
-are rebuilt at every epoch in the validated production mode; there is no hidden
+are rebuilt at every epoch in the validated production mode. There is no hidden
 temporal coefficient reuse. Disable the far-field approximation with
 `FarFieldApproxConfig(enabled=False)` for a direct point-mass reference calculation.
 
-The main accuracy and throughput controls in the example are:
+The main accuracy and throughput controls in the example are listed below.
 
 | Control | Meaning |
 |---|---|
@@ -431,6 +486,11 @@ The main accuracy and throughput controls in the example are:
 | `temporal_batch_size` | Number of consecutive maps processed by one fused temporal batch |
 | `cell_chunk_size` | Maximum spatial work chunk before automatic memory backoff |
 | `caustic_grid_shape` | Resolution of determinant, critical-curve, and source-center-label products |
+
+The production far-field configuration uses a `16 x 16` partition to decide
+which stars are evaluated exactly. Each partition cell contains an `8 x 8`
+Taylor evaluation lattice. The latter is the grid shown in the far-field
+schematic and should not be confused with the older interpolation method.
 
 The production constructors are presets rather than separate restricted code
 paths. Every value above may be overridden, and the same controls work with
@@ -456,9 +516,10 @@ report the realized compact convergence. They do not apply hidden light-loss
 rectangles or safety factors. See
 [`docs/lens_populations.md`](docs/lens_populations.md).
 
-The recommended constructors are `production_ipm_config(dynamic=False)` for
-an independent static map (`k=1`) and `production_ipm_config(dynamic=True)`
-for a moving sequence (`k=2` plus the one-time `k=1` normalization repair).
+High-level operations choose the production scout automatically. An
+independent static map uses `k=1`, while a moving sequence uses `k=2` plus the
+one-time `k=1` normalization repair. Call `production_ipm_config()` only when
+an advanced experiment needs an explicit numerical configuration.
 Both use `N=10_000_000, r=2, v=4` by default. These are not fixed constants. The implementation
 supports arbitrary sensible ray budgets and scout ratios, as well as
 `virtual_refinement >= refinement >= 1`. CUDA float32 automatically uses the
@@ -474,9 +535,9 @@ explicitly for convergence or safety studies.
 Compatible unrelated static star fields can be evaluated together with
 `batched_magnification_maps`. This is genuine independent-map batching. Each
 request has its own stars, far-field state, scout mask, result, and metadata.
-The [stellar-population notebook](examples/notebooks/03_stellar_populations_and_mass_functions.ipynb)
+The [stellar-population notebook](examples/notebooks/methods/00_stellar_populations_and_mass_functions.ipynb)
 demonstrates the interface across several stellar mass functions.
-The dedicated [far-field notebook](examples/notebooks/04_far_field_approximation.ipynb)
+The dedicated [far-field notebook](examples/notebooks/methods/01_far_field_approximation.ipynb)
 explains every `FarFieldApproxConfig` control, shows the production cell/node geometry,
 and demonstrates direct-raytrace accuracy and runtime validation before a
 setting is changed.
@@ -528,7 +589,7 @@ Operational guides cover [method selection](docs/choosing_methods.md),
 method selection and export into executable CUDA-aware workflows.
 
 Build the complete documentation site, including the API generated from
-tested source docstrings, with:
+tested source docstrings. It includes the following commands.
 
 ```bash
 python -m pip install -e ".[docs]"
@@ -545,19 +606,23 @@ reproducibility preset.
 
 Resolved lensed systems use the same physical interface. Supply a mapping of
 image names to local `MacroLens` objects, followed by the distances, source,
-stellar population, and measured arrival delays only once:
+stellar population, and measured arrival delays only once.
 
 ```python
-system = mc.MultiImageMicrolensingSystem(
+system = mc.MultiImageSystem(
     images={"A": macro_a, "B": macro_b, "C": macro_c, "D": macro_d},
     distances=distances,
     source=source,
     stellar_population=stellar_population,
     arrival_time_delays_days={"A": 0.0, "B": 7.4, "C": 2.1, "D": 11.8},
-    duration_days=3650,
     seed=1001,
 )
-curves = system.light_curves(times_days, include_labels=True)
+curves = system.light_curves(
+    duration_days=3650,
+    map_cadence_days=25,
+    source_cadence_days=1,
+    include_labels=True,
+)
 maps = system.magnification_maps()  # one independent static map per image
 ```
 
@@ -565,7 +630,7 @@ Each image receives an independent stellar realization. Shared numerical
 settings may be replaced by per-image mappings when necessary. The high-level
 interface applies cosmological time delays only to intrinsic source evolution
 while keeping lens motion in observer time. Global macro-model results can be
-passed directly to `MultiImageMicrolensingSystem.from_macroimage_solutions`.
+passed directly to `MultiImageSystem.from_macroimage_solutions`.
 The same object provides `dynamic_maps`, `caustics`, `labeled_caustics`,
 `multirate_light_curves`, and microlensing-weighted `transfer_functions`.
 See
@@ -594,15 +659,11 @@ Critical curves, caustics, parity labels, signed winding numbers, and distance
 queries are documented in [`docs/caustics.md`](docs/caustics.md). Full label
 maps are optional diagnostics. Center-only queries do not materialize them.
 
-Numerical solvers are migrated incrementally. Each migrated solver
-must match compact regression fixtures generated by the final paper code
-before it becomes part of the public API.
-
 ## Citation
 
 If `microcaustics` contributes to published work, please cite the accompanying
-methods paper rather than the GitHub repository. Its DOI, journal, volume, and page information will be
-added after publication.
+methods paper rather than the GitHub repository. The DOI and publication
+details will be added after publication.
 
 Questions, bug reports, and collaboration inquiries may be sent to Joshua
 Fagin at [faginjoshua@gmail.com](mailto:faginjoshua@gmail.com) or opened as a
@@ -611,9 +672,11 @@ GitHub issue.
 ## Author
 
 `microcaustics` was created and is maintained by
-[Joshua Fagin](https://orcid.org/0000-0001-8723-6136) contact: [faginjoshua@gmail.com](mailto:faginjoshua@gmail.com).
+[Joshua Fagin](https://orcid.org/0000-0001-8723-6136). He can be reached at
+[faginjoshua@gmail.com](mailto:faginjoshua@gmail.com).
 
-With contributions from:
+Contributors include the following authors.
+
 - [Connor Stone](https://orcid.org/0000-0002-9086-6398)
 - [James Hung-Hsu Chan](https://orcid.org/0000-0001-8797-725X)
 - [Sophia Miskiewicz](https://orcid.org/0000-0003-0631-9701)
@@ -659,11 +722,11 @@ motivate.
 - Chan et al. (2024),
   [*Reverberation Mapping of Lamp-post and Wind Structures in Accretion Thin Disks*](https://doi.org/10.48550/arXiv.2409.15669).
 - Page and Thorne (1974),
-  [*Disk-Accretion onto a Black Hole: Time-Averaged Structure of Accretion Disk*](https://doi.org/10.1086/152990)
+  [*Disk-Accretion onto a Black Hole: Time-Averaged Structure of Accretion Disk*](https://doi.org/10.1086/152990).
 - Bursa (2018),
   [*SIM5: Library for Ray-tracing and Radiation Transport in General Relativity*](https://ui.adsabs.harvard.edu/abs/2018ascl.soft11011B).
-- Gralla and Lupsasca(2020),
-  [*Null geodesics of the Kerr exterior*](https://doi.org/10.1103/PhysRevD.101.044032)
+- Gralla and Lupsasca (2020),
+  [*Null geodesics of the Kerr exterior*](https://doi.org/10.1103/PhysRevD.101.044032).
 ### Dynamic light curves, variability, and LSST-like workflows
 
 - Fagin et al. (2025),

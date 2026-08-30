@@ -39,16 +39,15 @@ class DocumentationIntegrityTests(unittest.TestCase):
                 relative = path.relative_to(PACKAGE_ROOT)
                 if retired in path.name.lower():
                     violations.append(f"retired filename: {relative}")
-                if path.suffix.lower() in text_suffixes and retired in path.read_text(
-                    encoding="utf-8"
-                ).lower():
+                if (
+                    path.suffix.lower() in text_suffixes
+                    and retired in path.read_text(encoding="utf-8").lower()
+                ):
                     violations.append(f"retired text: {relative}")
         self.assertEqual(violations, [])
 
     def test_q2237_method_figure_fixtures_are_distributed(self) -> None:
-        fixture_root = (
-            PACKAGE_ROOT / "examples" / "data" / "q2237b_method_figures"
-        )
+        fixture_root = PACKAGE_ROOT / "examples" / "data" / "q2237b_method_figures"
         expected = {
             "paper_anchor_gauge_method.png",
             "paper_anchor_gauge_method_data.npz",
@@ -121,7 +120,9 @@ class DocumentationIntegrityTests(unittest.TestCase):
         markdown = (PACKAGE_ROOT / "README.md", *(PACKAGE_ROOT / "docs").glob("*.md"))
         block_count = 0
         for path in markdown:
-            for index, block in enumerate(_python_blocks(path.read_text(encoding="utf-8"))):
+            for index, block in enumerate(
+                _python_blocks(path.read_text(encoding="utf-8"))
+            ):
                 block_count += 1
                 with self.subTest(path=path.name, block=index):
                     compile(block, f"{path}::python-block-{index}", "exec")
@@ -154,7 +155,9 @@ class DocumentationIntegrityTests(unittest.TestCase):
         self.assertEqual(missing, [], f"examples use unexported names: {missing}")
 
     def test_notebooks_are_valid_json_with_compilable_code_cells(self) -> None:
-        notebooks = tuple((PACKAGE_ROOT / "examples" / "notebooks").glob("*.ipynb"))
+        notebooks = tuple(
+            (PACKAGE_ROOT / "examples" / "notebooks").rglob("*.ipynb")
+        )
         self.assertGreaterEqual(len(notebooks), 16)
         code_cells = 0
         for path in notebooks:
@@ -170,29 +173,69 @@ class DocumentationIntegrityTests(unittest.TestCase):
                     compile(source, f"{path}::cell-{index}", "exec")
         self.assertGreaterEqual(code_cells, len(notebooks) * 2)
 
-    def test_primary_ipm_tutorials_use_the_manuscript_figure_renderer(self) -> None:
-        """Prevent tutorials 01/02 from drifting back to a generic schematic."""
+    def test_primary_ipm_tutorials_generate_the_approved_method_figure(self) -> None:
+        """Keep tutorials 01/02 on the live publication-style renderer."""
 
         for name in (
-            "01_q2237_production_light_curve_and_gif.ipynb",
-            "02_static_irs_and_ipm.ipynb",
+            "getting_started/01_q2237_production_light_curve_and_gif.ipynb",
+            "getting_started/00_static_maps_and_numerical_methods.ipynb",
         ):
             text = (PACKAGE_ROOT / "examples" / "notebooks" / name).read_text(
                 encoding="utf-8"
             )
-            self.assertIn("render_paper_ipm_schematic", text)
-            self.assertNotIn("plot_ipm_scout_method(", text)
+            self.assertIn("render_live_paper_ipm_schematic(", text)
+            self.assertNotIn("paper_tile_upsampling_schematic_data.npz", text)
+            self.assertNotIn("paper_far_field_schematic_data.npz", text)
+
+    def test_internal_method_tutorials_do_not_load_paper_run_arrays(self) -> None:
+        """Keep package-owned demonstrations reproducible from public APIs."""
+
+        forbidden = (
+            "paper_method_map_caustic_comparison_data.npz",
+            "final_paper_run_production_v4",
+        )
+        notebook_root = PACKAGE_ROOT / "examples" / "notebooks"
+        external_or_export_notebooks = {
+            "validation/00_weisenbach_ipm_visual_validation.ipynb",
+            "validation/01_sim5_gr_visual_validation.ipynb",
+            "workflows/03_streaming_and_exporting_results.ipynb",
+            "workflows/04_simulation_datasets.ipynb",
+        }
+        for path in notebook_root.rglob("*.ipynb"):
+            name = path.relative_to(notebook_root).as_posix()
+            if name in external_or_export_notebooks:
+                continue
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(name=name):
+                for value in forbidden:
+                    self.assertNotIn(value, text)
+                self.assertNotIn("paper_far_field_schematic_data.npz", text)
+                self.assertNotIn("paper_anchor_gauge_method_data.npz", text)
+                self.assertNotIn("paper_map_rmse_vs_nrays.json", text)
+
+    def test_notebooks_use_current_ipm_selector(self) -> None:
+        """The static/dynamic context now selects the scout automatically."""
+
+        for path in (PACKAGE_ROOT / "examples" / "notebooks").rglob("*.ipynb"):
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.name):
+                self.assertNotIn("dynamic=True", text)
+                self.assertNotIn("dynamic=False", text)
 
     def test_distributed_notebooks_contain_successful_saved_outputs(self) -> None:
         """Prevent a release from silently shipping cleared tutorial notebooks."""
 
-        notebooks = tuple((PACKAGE_ROOT / "examples" / "notebooks").glob("*.ipynb"))
+        notebooks = tuple(
+            (PACKAGE_ROOT / "examples" / "notebooks").rglob("*.ipynb")
+        )
         self.assertGreaterEqual(len(notebooks), 16)
         for path in notebooks:
             with self.subTest(path=path.name):
                 document = json.loads(path.read_text(encoding="utf-8"))
                 code_cells = [
-                    cell for cell in document["cells"] if cell.get("cell_type") == "code"
+                    cell
+                    for cell in document["cells"]
+                    if cell.get("cell_type") == "code"
                 ]
                 self.assertTrue(code_cells)
                 self.assertTrue(
@@ -200,9 +243,7 @@ class DocumentationIntegrityTests(unittest.TestCase):
                     f"{path.name} has unexecuted code cells",
                 )
                 outputs = [
-                    output
-                    for cell in code_cells
-                    for output in cell.get("outputs", ())
+                    output for cell in code_cells for output in cell.get("outputs", ())
                 ]
                 self.assertTrue(outputs, f"{path.name} has no saved outputs")
                 self.assertFalse(
@@ -211,32 +252,34 @@ class DocumentationIntegrityTests(unittest.TestCase):
                 )
 
     def test_release_notebook_sequence_is_complete(self) -> None:
-        names = {
-            path.name for path in (PACKAGE_ROOT / "examples" / "notebooks").glob("*.ipynb")
-        }
+        root = PACKAGE_ROOT / "examples" / "notebooks"
+        names = {path.relative_to(root).as_posix() for path in root.rglob("*.ipynb")}
         required = {
-            "01_q2237_production_light_curve_and_gif.ipynb",
-            "03_stellar_populations_and_mass_functions.ipynb",
-            "04_far_field_approximation.ipynb",
-            "05_dynamic_maps_and_light_curves.ipynb",
-            "06_caustics_and_labels.ipynb",
-            "07_relativistic_disks_and_transfer_functions.ipynb",
-            "15_end_to_end_lensed_quasar.ipynb",
-            "16_accuracy_and_performance.ipynb",
-            "17_streaming_and_exporting_results.ipynb",
+            "getting_started/00_static_maps_and_numerical_methods.ipynb",
+            "getting_started/01_q2237_production_light_curve_and_gif.ipynb",
+            "getting_started/02_dynamic_maps_and_light_curves.ipynb",
+            "methods/00_stellar_populations_and_mass_functions.ipynb",
+            "methods/01_far_field_approximation.ipynb",
+            "methods/02_caustics_and_labels.ipynb",
+            "source_models/00_relativistic_disks_and_reverberation.ipynb",
+            "workflows/02_end_to_end_lensed_quasar.ipynb",
+            "workflows/03_streaming_and_exporting_results.ipynb",
+            "workflows/04_simulation_datasets.ipynb",
+            "validation/02_accuracy_and_performance.ipynb",
         }
         self.assertEqual(required - names, set())
 
     def test_training_notebooks_locate_repository_examples_headlessly(self) -> None:
         """Training tutorials must not assume the repository is their CWD."""
 
-        for name, script in (
-            ("18_q2237_training_set.ipynb", "generate_q2237_training_set.py"),
-            ("19_randomized_training_set.ipynb", "generate_random_training_set.py"),
+        name = "workflows/04_simulation_datasets.ipynb"
+        text = (PACKAGE_ROOT / "examples" / "notebooks" / name).read_text(
+            encoding="utf-8"
+        )
+        for script in (
+            "generate_q2237_training_set.py",
+            "generate_random_training_set.py",
         ):
-            text = (PACKAGE_ROOT / "examples" / "notebooks" / name).read_text(
-                encoding="utf-8"
-            )
             self.assertIn("Path(mcp.__file__).resolve().parents[3]", text)
             self.assertIn(script, text)
 

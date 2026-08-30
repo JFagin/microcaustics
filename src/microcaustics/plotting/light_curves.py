@@ -23,6 +23,8 @@ def _curve_values(
         scale = np.nanmedian(values, axis=0, keepdims=True)
         values = np.divide(values, scale, out=np.full_like(values, np.nan), where=scale > 0)
     if magnitude:
+        if zero_point_flux is None and not normalize:
+            zero_point_flux = 3631.0
         if zero_point_flux is not None:
             if isinstance(zero_point_flux, dict):
                 scale = np.asarray(
@@ -99,7 +101,11 @@ def plot_light_curve(
         ax.set_ylabel(
             "Relative magnitude"
             if normalize
-            else ("Brightness [mag]" if zero_point_flux is not None else "Magnitude + constant")
+            else (
+                "Brightness [AB mag]"
+                if zero_point_flux is None
+                else "Brightness [mag]"
+            )
         )
         if invert_magnitude_axis:
             ax.invert_yaxis()

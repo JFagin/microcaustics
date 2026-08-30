@@ -1,8 +1,8 @@
 """Static and dynamic gravitational microlensing simulations.
 
-The top-level namespace intentionally contains only the small collection of
-types needed for ordinary simulations. More specialized source, caustic, and
-relativistic-disk tools live in their corresponding subpackages.
+The top-level namespace exposes the common simulation workflows and their
+configuration objects. Specialized implementations remain organized in the
+source, caustic, lens, and relativity subpackages.
 """
 
 from .batching import (
@@ -27,6 +27,12 @@ from .config import (
 from .dynamic import DynamicMapScheduler
 from .geometry import ImagePlaneGrid, PlaneGrid, PlaneRegion
 from .integrations import as_caustics_thin_lens
+from .io import (
+    load_light_curve,
+    load_magnification_map,
+    save_light_curve,
+    save_magnification_map,
+)
 from .lens import (
     BrokenPowerLawMassFunction,
     IsotropicKinematics,
@@ -34,8 +40,6 @@ from .lens import (
     MacroLens,
     PointMassField,
     PowerLawMassFunction,
-    SampledSkyKinematics,
-    SkyPosition,
     SkyProjectedKinematics,
     StaticKinematics,
     StellarAperture,
@@ -49,8 +53,7 @@ from .lens import (
     sample_uniform_circular_point_masses,
     sample_uniform_point_masses,
 )
-from .multi_image import MacroImageConfig, MultiImageSimulation
-from .multi_system import MultiImageMicrolensingSystem
+from .multi_system import MultiImageSystem
 from .observations import (
     PhotometricObservations,
     SurveyCadence,
@@ -60,14 +63,16 @@ from .observations import (
     sample_random_rubin_wfd_cadence,
 )
 from .photometry import (
+    AB_ZERO_POINT_JY,
     LightCurveRequest,
     flux_to_magnitude,
     light_curve_from_maps,
     multirate_streaming_light_curve,
+    source_light_curve,
     streaming_light_curve,
     streaming_light_curves,
-    zero_point_flux_for_magnitude,
 )
+from .random import derive_seed
 from .relativity import (
     AxisLamppostProfile,
     AxisLamppostRayTransfer,
@@ -204,6 +209,7 @@ __all__ = [
     "DistanceMap",
     "DrivingSignal",
     "ExpandingPhotosphereSource",
+    "AB_ZERO_POINT_JY",
     "flux_to_magnitude",
     "find_rubin_opsim_database",
     "GaussianSource",
@@ -219,12 +225,13 @@ __all__ = [
     "MultirateLabeledLightCurve",
     "LightCurve",
     "LightCurveRequest",
+    "load_light_curve",
+    "load_magnification_map",
     "LinearTrajectory",
     "LightCurveComparison",
     "LensingDistances",
     "MacroLens",
     "MacroModel",
-    "MacroImageConfig",
     "MacroImageLightCurve",
     "MacroImageSolution",
     "MacroImageTransferFunctions",
@@ -235,10 +242,9 @@ __all__ = [
     "MicrolensingSystem",
     "ModulatedSource",
     "MultiImageLightCurves",
-    "MultiImageMicrolensingSystem",
+    "MultiImageSystem",
     "MultiImageMapFrame",
     "MultiImageTransferFunctions",
-    "MultiImageSimulation",
     "PhotometricObservations",
     "ObserverCoordinateTrace",
     "ObserverScreen",
@@ -255,14 +261,15 @@ __all__ = [
     "PrimaryKerrTrace",
     "PowerLawMassFunction",
     "IsotropicKinematics",
-    "SkyPosition",
     "SkyProjectedKinematics",
-    "SampledSkyKinematics",
     "StaticKinematics",
     "StellarAperture",
     "StellarKinematics",
     "StellarPopulation",
     "PowerLawExponentialPhotosphere",
+    "save_light_curve",
+    "save_magnification_map",
+    "source_light_curve",
     "production_dynamic_config",
     "production_ipm_config",
     "ResolvedRuntime",
@@ -307,7 +314,6 @@ __all__ = [
     "sample_random_rubin_wfd_cadence",
     "streaming_light_curve",
     "streaming_light_curves",
-    "zero_point_flux_for_magnitude",
     "streaming_microlensed_transfer_functions",
     "steady_transfer_function",
     "trace_primary_equatorial",
@@ -315,6 +321,7 @@ __all__ = [
     "compare_light_curves",
     "compare_magnification_maps",
     "driving_signal_from_psd",
+    "derive_seed",
     "kroupa_mass_function",
     "lognormal_damped_random_walk",
     "paper_type_ia_supernova_source",

@@ -23,7 +23,6 @@ source = mc.ExpandingPhotosphereSource(
     maximum_observer_time_days=180.0,
     evolution=evolution,
     resolution=256,
-    source_fov_margin=1.08,
 )
 
 observer_times = torch.arange(0.0, 181.0)

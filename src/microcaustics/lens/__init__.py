@@ -16,8 +16,6 @@ from .populations import (
 )
 from .stellar import (
     IsotropicKinematics,
-    SampledSkyKinematics,
-    SkyPosition,
     SkyProjectedKinematics,
     StaticKinematics,
     StellarAperture,
@@ -34,9 +32,7 @@ __all__ = [
     "PointMassField",
     "PowerLawMassFunction",
     "IsotropicKinematics",
-    "SkyPosition",
     "SkyProjectedKinematics",
-    "SampledSkyKinematics",
     "StaticKinematics",
     "StellarAperture",
     "StellarKinematics",

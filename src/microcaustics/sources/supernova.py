@@ -112,9 +112,9 @@ class PowerLawExponentialPhotosphere:
         luminosity = self.luminosity(rest_times_days)
         radius = self.radius(rest_times_days)
         denominator = 4.0 * math.pi * _SIGMA_SB * radius.square()
-        temperature = (luminosity / denominator.clamp_min(1e-30)).clamp_min(
-            1e-30
-        ).pow(0.25)
+        temperature = (
+            (luminosity / denominator.clamp_min(1e-30)).clamp_min(1e-30).pow(0.25)
+        )
         return temperature.clamp(
             min=self.temperature_floor_k,
             max=self.temperature_ceiling_k,
@@ -160,9 +160,7 @@ class PhotosphereAppearance:
             "position_angle_rad": self.position_angle_rad,
             "limb_darkening": self.limb_darkening,
             "achromatic_phase_rest_days": self.achromatic_phase_rest_days,
-            "chromatic_transition_rest_days": (
-                self.chromatic_transition_rest_days
-            ),
+            "chromatic_transition_rest_days": (self.chromatic_transition_rest_days),
             "chromatic_limb_slope": self.chromatic_limb_slope,
             "uv_blanketing_wavelength_angstrom": (
                 self.uv_blanketing_wavelength_angstrom
@@ -193,9 +191,7 @@ class PhotosphereAppearance:
             "position_angle_rad": self.position_angle_rad,
             "limb_darkening": self.limb_darkening,
             "achromatic_phase_rest_days": self.achromatic_phase_rest_days,
-            "chromatic_transition_rest_days": (
-                self.chromatic_transition_rest_days
-            ),
+            "chromatic_transition_rest_days": (self.chromatic_transition_rest_days),
             "chromatic_limb_slope": self.chromatic_limb_slope,
             "uv_blanketing_wavelength_angstrom": (
                 self.uv_blanketing_wavelength_angstrom
@@ -229,7 +225,8 @@ class ExpandingPhotosphereSource:
         self,
         *,
         redshift: float,
-        wavelengths_angstrom: Sequence[float],
+        wavelengths_angstrom: Sequence[float] | None = None,
+        bands: Mapping[str, float] | None = None,
         maximum_observer_time_days: float,
         evolution: PhotosphereEvolution,
         band_names: Sequence[str] | None = None,
@@ -276,6 +273,15 @@ class ExpandingPhotosphereSource:
         if not self.name:
             raise ValueError("name must be non-empty")
 
+        if bands is not None:
+            if wavelengths_angstrom is not None or band_names is not None:
+                raise ValueError(
+                    "supply bands or wavelengths_angstrom/band_names, not both"
+                )
+            band_names = tuple(str(name) for name in bands)
+            wavelengths_angstrom = tuple(float(value) for value in bands.values())
+        if wavelengths_angstrom is None:
+            raise ValueError("bands must be supplied")
         wavelengths = tuple(float(value) for value in wavelengths_angstrom)
         if not wavelengths or any(
             not math.isfinite(value) or value <= 0 for value in wavelengths
@@ -368,9 +374,9 @@ class ExpandingPhotosphereSource:
         return float(self.maximum_photosphere_radius_m)
 
     def _sample_maximum_radius(self) -> float:
-        rest_maximum = (
-            self.maximum_observer_time_days - self.explosion_time_days
-        ) / (1.0 + self.redshift)
+        rest_maximum = (self.maximum_observer_time_days - self.explosion_time_days) / (
+            1.0 + self.redshift
+        )
         rest_times = torch.linspace(0.0, rest_maximum, 2049, dtype=torch.float64)
         radii = torch.as_tensor(self.evolution.radius(rest_times))
         if radii.shape != rest_times.shape:
@@ -425,20 +431,18 @@ class ExpandingPhotosphereSource:
     ) -> torch.Tensor:
         radius_grid = radius[:, None, None].clamp_min(1e-30)
         rho2 = (x[None] / radius_grid).square()
-        rho2 += (
-            y[None] / (self.appearance.axis_ratio * radius_grid)
-        ).square()
+        rho2 += (y[None] / (self.appearance.axis_ratio * radius_grid)).square()
         inside = rho2 <= 1.0
         mu = torch.sqrt((1.0 - rho2).clamp(0.0, 1.0))
-        elapsed = (
-            rest_times - self.appearance.achromatic_phase_rest_days
-        ).clamp_min(0.0)
+        elapsed = (rest_times - self.appearance.achromatic_phase_rest_days).clamp_min(
+            0.0
+        )
         phase = 1.0 - torch.exp(
             -elapsed / self.appearance.chromatic_transition_rest_days
         )
-        wavelength_lever = torch.log(
-            5_500.0 / wavelengths_rest.clamp_min(1.0)
-        ).clamp(-1.0, 2.0)
+        wavelength_lever = torch.log(5_500.0 / wavelengths_rest.clamp_min(1.0)).clamp(
+            -1.0, 2.0
+        )
         limb = (
             self.appearance.limb_darkening
             + self.appearance.chromatic_limb_slope
@@ -453,16 +457,14 @@ class ExpandingPhotosphereSource:
         rest_times: torch.Tensor,
         wavelengths_rest: torch.Tensor,
     ) -> torch.Tensor:
-        elapsed = (
-            rest_times - self.appearance.achromatic_phase_rest_days
-        ).clamp_min(0.0)
+        elapsed = (rest_times - self.appearance.achromatic_phase_rest_days).clamp_min(
+            0.0
+        )
         phase = 1.0 - torch.exp(
             -elapsed / self.appearance.chromatic_transition_rest_days
         )
         lever = (
-            self.appearance.uv_blanketing_wavelength_angstrom
-            / wavelengths_rest
-            - 1.0
+            self.appearance.uv_blanketing_wavelength_angstrom / wavelengths_rest - 1.0
         ).clamp_min(0.0)
         tau = self.appearance.uv_blanketing_tau_early + phase * (
             self.appearance.uv_blanketing_tau_late
@@ -540,9 +542,7 @@ class ExpandingPhotosphereSource:
         x, y = self._coordinates(device=resolved_device, dtype=resolved_dtype)
         profile_function = self.spatial_profile
         if profile_function is None:
-            profile = self._built_in_profile(
-                x, y, radius, rest_times, wavelengths_rest
-            )
+            profile = self._built_in_profile(x, y, radius, rest_times, wavelengths_rest)
         else:
             profile = torch.as_tensor(
                 profile_function(x, y, radius, rest_times, wavelengths_rest),
@@ -581,9 +581,7 @@ class ExpandingPhotosphereSource:
         )
         modifier_function = self.spectral_modifier
         if modifier_function is None:
-            modifier = self._built_in_spectral_modifier(
-                rest_times, wavelengths_rest
-            )
+            modifier = self._built_in_spectral_modifier(rest_times, wavelengths_rest)
         else:
             modifier = torch.as_tensor(
                 modifier_function(rest_times, wavelengths_rest),

@@ -232,7 +232,7 @@ def observe_multi_image_light_curves(
     curves: MultiImageLightCurves,
     cadence: SurveyCadence,
     *,
-    zero_point_flux: float | Mapping[str, float],
+    zero_point_flux: float | Mapping[str, float] = 3631.0,
     seed: int | None = None,
     add_noise: bool = True,
     gamma_by_band: Mapping[str, float] | None = None,
@@ -240,9 +240,9 @@ def observe_multi_image_light_curves(
 ) -> PhotometricObservations:
     """Sample resolved light curves at survey visits and add Rubin-like noise.
 
-    ``zero_point_flux`` explicitly defines the flux unit used by the source.
-    Use ``3631`` for fluxes in Jy and AB magnitudes. Arbitrary normalized source
-    models can instead provide a scalar or a per-band mapping in their units.
+    Source light curves are physical flux densities in Jy, so the default
+    converts them directly to AB magnitudes using the 3631 Jy zero point.
+    ``zero_point_flux`` is retained for explicitly calibrated non-AB systems.
     """
 
     if isinstance(zero_point_flux, Mapping):

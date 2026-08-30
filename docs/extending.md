@@ -27,7 +27,8 @@ mixed populations require no solver changes.
 
 ## Macro models and resolved systems
 
-Known image properties may be supplied directly with `MacroImageConfig`.
+Known image properties may be supplied through the advanced
+`microcaustics.multi_image.MacroImageConfig` interface.
 External macro solvers can implement `MacroModel` or use `CallableMacroModel`.
 The optional caustics adapter accepts models supported by that package.
 

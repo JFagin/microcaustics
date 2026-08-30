@@ -1,11 +1,11 @@
-# High-level physical-system construction redesign
+# Physical system interface
 
-This document defines the additive interface for constructing complete
-microlensing calculations from physical inputs. The existing low-level source,
-lens, solver, batching, caustic, and multi-image interfaces will remain public
-and unchanged.
+This guide explains how to construct complete microlensing calculations from
+physical inputs. Most users can work with `MicrolensingSystem` while lower-level
+source, lens, solver, batching, caustic, and multi-image interfaces remain
+available for specialized calculations.
 
-## Design goals
+## What the interface handles
 
 The ordinary workflow should not require a user to calculate source-plane
 support, lens-plane aperture, stellar count, Einstein radii, or angular
@@ -27,7 +27,7 @@ The high-level interface must support all current workflows.
 
 ## Physical specifications and realized objects
 
-The redesign separates physical specifications from realized tensors.
+The interface separates physical specifications from realized tensors.
 
 - `StellarPopulation` describes a mass function, spatial distribution, and
   kinematics.
@@ -84,7 +84,6 @@ The built-in models currently include the following.
 - `StaticKinematics`
 - `IsotropicKinematics`
 - `SkyProjectedKinematics`
-- `SampledSkyKinematics`
 
 The sky-projected models combine sky position, CMB motion, lens and source
 peculiar velocities, and stellar dispersion. Their sampled form may defer the
@@ -120,7 +119,9 @@ The physical stellar aperture and numerical integration region are distinct.
 For a sampled realistic population, the package always constructs the full
 circular stellar field from the source support, macro eigenvalues, mass
 moments, light-loss tolerance, safety scale, duration, and motion. This
-stellar realization remains unchanged when integration methods are compared.
+physical stellar realization remains unchanged when integration methods are
+compared. Its coordinate components may be expressed in the shear eigenframe
+for the rectangular strategy.
 
 The integration region chooses where rays or IPM cells originate.
 
@@ -129,7 +130,9 @@ The integration region chooses where rays or IPM cells originate.
 - `IntegrationDomain.FULL` evaluates every cell in the complete bounding
   domain.
 - `IntegrationDomain.RECTANGLE` evaluates the conventional smaller launch
-  rectangle.
+  rectangle. Built-in physical sources are evaluated in a consistently
+  shear-aligned numerical frame, including their position angle and
+  trajectory, so no source raster is rotated or resampled.
 
 All stars in the full circular population contribute to all three methods.
 Selecting a rectangle never truncates the stellar field.
@@ -171,18 +174,21 @@ system = mc.MicrolensingSystem.from_redshifts(
 )
 ```
 
-The resolved object exposes at least the following values.
+Common realized values are available directly on the system.
 
 ```python
-realization = system.realize()
-realization.system
-realization.source_grid
-realization.source_region
-realization.stars
-realization.stellar_aperture
-realization.lens_region
-realization.simulation
+system.realized_stars
+system.resolved_source_grid
+system.resolved_lens_region
+system.stellar_aperture
+system.metadata()
 ```
+
+Use `system.with_seed(new_seed)` to create an independent stellar realization
+without repeating the physical setup. Compatible compiled kernels are reused.
+
+Advanced integrations can use `system.realization` to access the underlying
+low-level simulation and every derived object together.
 
 Convenience methods delegate to the existing numerical implementation.
 
@@ -231,24 +237,10 @@ be shared. Known or inferred cosmological delays remain supported.
 Fast center labels and complete diagnostic label maps remain separate opt-in
 products.
 
-## Compatibility and migration
+## Lower-level access
 
-The redesign is additive. It does not remove or silently change
 `MicrolensingSimulation`, `PointMassField`, `PlaneRegion`, `PlaneGrid`, source
-classes, solver configurations, batching requests, or multi-image classes.
-
-The implemented high-level layer follows this migration order.
-
-1. Preserve the low-level construction, maps, light curves, and labels as
-   parity fixtures.
-2. Resolve physical stellar populations, kinematics, and source support once.
-3. Construct the complete circular stellar aperture independently of the
-   selected numerical integration region.
-4. Delegate maps, dynamic sequences, labels, batching, transfer functions,
-   and multi-image workflows to the validated numerical implementation.
-5. Validate reproducibility and exact high-level versus low-level parity.
-
-The primary README will use the high-level Q2237 construction. Population and
-far-field tutorials will retain lower-level examples because those notebooks
-teach how the individual components work. Validation notebooks retain direct
-control over every grid and integration domain.
+classes, solver configurations, batching requests, and multi-image classes are
+public. Population and far-field tutorials use some of these objects because
+they teach the numerical components directly. Validation notebooks also keep
+explicit control over grids and integration domains.

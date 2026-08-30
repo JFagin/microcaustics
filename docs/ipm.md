@@ -68,9 +68,9 @@ boundaries smoother, but cannot recover information absent from the true
 
 ## Suggested starting points
 
-- **Independent static map.** `production_ipm_config(dynamic=False)` selects
+- **Independent static map.** The high-level static operation selects
   `N=10_000_000, k=1, r=2, v=4` by default.
-- **Dynamic production sequence.** `production_ipm_config(dynamic=True)` selects
+- **Dynamic production sequence.** The high-level dynamic operation selects
   `N=10_000_000, k=2, r=2, v=4` and computes the one-time `k=1` to `k=2`
   normalization repair.
 - **Fast exploratory map.** Reduce `N`, keep `r=2, v=4`, and validate the chosen

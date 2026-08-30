@@ -31,6 +31,23 @@ than array indices. Helpers are also provided for map residuals, label and
 distance maps, anchor/gauge layouts, sources, transfer functions, rendered
 macroimages, survey observations, and timing breakdowns.
 
+The standard magnification, label, distance, and winding diagnostics can be
+drawn together without reproducing notebook-specific layout code:
+
+```python
+figure, axes = mcp.plot_caustic_diagnostics(
+    magnification_map,
+    binary_label_map,
+    distance_to_caustic_map,
+    winding_number_map,
+    caustics=caustic_field,
+    scale_bar_uas=1.0,
+)
+```
+
+The binary and winding panels use discrete integer colorbars. All four panels
+share the same physical orientation and field extent.
+
 Image panels can follow the compact paper convention directly:
 `show_axes=False` removes redundant ticks and labels while retaining a thin
 panel frame, `add_scale_bar` adds a
@@ -89,15 +106,16 @@ convergence and shear. Evolve a thin disk daily between sparse map epochs. And
 produce resolved noisy survey light curves over ten years.
 
 The relativistic disk layer also works independently of microlensing.
-`08_continuum_reverberation_mapping.ipynb` constructs full-Kerr lamppost
+`source_models/00_relativistic_disks_and_reverberation.ipynb` constructs full-Kerr lamppost
 transfer functions and daily multiband continuum-reverberation light curves
 without creating a magnification map.
 
-`18_q2237_training_set.ipynb` and `19_randomized_training_set.ipynb` show five
-labeled light curves as vertical panels and distinguish first-call from warmed
-generation. Their script companions accept `--gpus 0 1 ...`, spawn one worker
+`workflows/04_simulation_datasets.ipynb` shows both fixed-system and
+prior-sampled labeled light curves as vertical panels and distinguishes
+first-call from warmed generation. Its script companions accept
+`--gpus 0 1 ...`, spawn one worker
 per device, and reuse compiled kernels for the remainder of each worker's
-shard. `20_single_point_lens_validation.ipynb` compares the IPM map, critical
+shard. `validation/03_single_point_lens_validation.ipynb` compares the IPM map, critical
 curve, and caustic directly with the analytic point-lens solution.
 
 The survey notebooks accept a Rubin OpSim SQLite database through
