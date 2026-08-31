@@ -253,7 +253,7 @@ class AstropyOracleTests(unittest.TestCase):
             expected = (
                 cosmology.angular_diameter_distance(lens_redshift).to_value(units.m),
                 cosmology.angular_diameter_distance(source_redshift).to_value(units.m),
-                cosmology.angular_diameter_distance(
+                cosmology.angular_diameter_distance_z1z2(
                     lens_redshift, source_redshift
                 ).to_value(units.m),
             )
@@ -287,7 +287,7 @@ class AstropyOracleTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             distances.lens_to_source_m,
-            cosmology.angular_diameter_distance(
+            cosmology.angular_diameter_distance_z1z2(
                 lens_redshift,
                 source_redshift,
             ).to_value(units.m),
