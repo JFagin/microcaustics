@@ -73,7 +73,7 @@ compile time. Measure warmed steady-state calls separately with
 
 ## CUDA out of memory
 
-`RuntimeConfig.memory_fraction` reserves headroom. The scheduler can reduce
+`RuntimeConfig.memory_fraction` defaults to 0.95. The scheduler can reduce
 IPM cell chunks and split temporal batches losslessly after an allocation
 failure. Automatic tuning rejects configurations above its memory ceiling.
 These mechanisms never change `N`, `k`, `r`, `v`, or physical geometry.

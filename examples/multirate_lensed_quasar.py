@@ -30,8 +30,8 @@ base_source = mc.GaussianSource(geometry, sigma_m=2.0e11)
 driver = mc.broken_power_law_driving_signal(
     torch.arange(-20.0, 61.0),
     break_timescale_days=200.0,
-    low_frequency_slope=1.0,
-    high_frequency_slope=3.0,
+    alpha_L=1.0,
+    alpha_R=3.0,
     standard_deviation=0.1,
     seed=8,
     extrapolation="hold",

@@ -96,7 +96,6 @@ class PublicWorkflowTests(unittest.TestCase):
                 schedule=mc.DynamicConfig(
                     temporal_batch_size=2,
                     fused_temporal_ipm=True,
-                    pad_temporal_batches=False,
                     scout_refresh_frames=1,
                 ),
             )
@@ -183,7 +182,6 @@ class PublicWorkflowTests(unittest.TestCase):
         schedule = mc.DynamicConfig(
             temporal_batch_size=2,
             fused_temporal_ipm=True,
-            pad_temporal_batches=False,
             scout_refresh_frames=1,
         )
         maps = tuple(
@@ -233,7 +231,6 @@ class PublicWorkflowTests(unittest.TestCase):
                     schedule=mc.DynamicConfig(
                         temporal_batch_size=temporal_batch,
                         fused_temporal_ipm=True,
-                        pad_temporal_batches=False,
                         scout_refresh_frames=1,
                     ),
                 )
@@ -280,7 +277,6 @@ class PublicWorkflowTests(unittest.TestCase):
             schedule=mc.DynamicConfig(
                 temporal_batch_size=1,
                 light_curve_batch_size=1,
-                pad_temporal_batches=False,
                 scout_refresh_frames=1,
             ),
         )
@@ -289,7 +285,6 @@ class PublicWorkflowTests(unittest.TestCase):
             schedule=mc.DynamicConfig(
                 temporal_batch_size=4,
                 light_curve_batch_size=3,
-                pad_temporal_batches=False,
                 scout_refresh_frames=1,
             ),
         )
@@ -481,7 +476,6 @@ class PublicWorkflowTests(unittest.TestCase):
                     method=method,
                     schedule=mc.DynamicConfig(
                         temporal_batch_size=2,
-                        pad_temporal_batches=False,
                     ),
                 )
                 torch.testing.assert_close(curve.flux, curve.unlensed_flux)

@@ -654,7 +654,7 @@ def streaming_light_curves(
 
     temporal_batch = resolved_schedule.temporal_batch_size
     if temporal_batch is None:
-        temporal_batch = min(int(times.numel()), 40 if device.type == "cuda" else 1)
+        temporal_batch = min(int(times.numel()), 49 if device.type == "cuda" else 1)
     temporal_batch = max(1, int(temporal_batch))
     curve_batch = resolved_schedule.light_curve_batch_size
     if curve_batch is None:

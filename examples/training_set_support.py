@@ -9,7 +9,7 @@ defaults.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
@@ -213,7 +213,7 @@ def runtime_for_device(device: str) -> mc.RuntimeConfig:
         backend=mc.Backend.TRITON if cuda else mc.Backend.TORCH_EAGER,
         dtype="float32",
         strict_backend=cuda,
-        memory_fraction=0.90,
+        memory_fraction=0.95,
     )
 
 
@@ -235,7 +235,7 @@ def _thin_disk(
     model = mc.ThinDiskModel(
         black_hole_mass_solar=black_hole_mass_solar,
         eddington_ratio=eddington_ratio,
-        bands=dict(zip(BAND_NAMES, WAVELENGTHS_ANGSTROM, strict=True)),
+        bands_angstrom=dict(zip(BAND_NAMES, WAVELENGTHS_ANGSTROM, strict=True)),
         source_redshift=source_redshift,
         spin=spin,
         inclination_deg=inclination_deg,
@@ -243,7 +243,7 @@ def _thin_disk(
         relativity="approximate",
         support_lamp_fraction=0.1,
         support_corona_height_above_isco_rg=20.0,
-        resolution=source_resolution,
+        source_grid_shape=source_resolution,
         enclosed_flux_fraction=0.999,
         source_margin=1.05,
     )
@@ -251,8 +251,8 @@ def _thin_disk(
     driver = mc.broken_power_law_driving_signal(
         times_days,
         break_timescale_days=200.0,
-        low_frequency_slope=1.0,
-        high_frequency_slope=3.0,
+        alpha_L=1.0,
+        alpha_R=3.0,
         standard_deviation=0.10,
         seed=int(driver_seed),
         extrapolation="hold",
@@ -298,7 +298,7 @@ def q2237_b_system(
         mass_ratio=100.0,
         kinematics=mc.IsotropicKinematics(dispersion_km_s=180.0),
     )
-    system = mc.MicrolensingSystem.from_redshifts(
+    system = mc.MicrolensingSystem(
         lens_redshift=lens_redshift,
         source_redshift=source_redshift,
         macro=macro,
@@ -385,7 +385,7 @@ def random_system(
         mass_ratio=100.0,
         kinematics=mc.IsotropicKinematics(dispersion_km_s=180.0),
     )
-    system = mc.MicrolensingSystem.from_redshifts(
+    system = mc.MicrolensingSystem(
         lens_redshift=lens_redshift,
         source_redshift=source_redshift,
         macro=macro,
@@ -431,14 +431,11 @@ def generate_labeled_example(
     """Generate sparse dynamic maps/labels and a fine-cadence light curve."""
 
     method = mc.production_ipm_config(rays=int(rays))
-    schedule = mc.production_dynamic_config()
     caustics = mc.CausticConfig(
         far_field_approx=method.far_field_approx,
-        temporal_batch_size=40,
         jacobian_chunk_size=1_048_576,
         anchor_count=9,
         gauge_count=9,
-        float64_label_fallback=False,
     )
     center_magnifications: list[torch.Tensor] = []
 
@@ -457,7 +454,6 @@ def generate_labeled_example(
         map_times_days,
         flux_times_days,
         method=method,
-        schedule=schedule,
         caustics=caustics,
         map_observer=retain_center_magnification,
     )
@@ -467,6 +463,72 @@ def generate_labeled_example(
         torch.stack(center_magnifications).cpu().numpy().astype(np.float32, copy=False)
     )
     return result, center_series, elapsed
+
+
+class _CenterMagnificationCollector:
+    """Collect one device scalar per streamed map without framewise transfers."""
+
+    def __init__(self) -> None:
+        self.values: list[torch.Tensor] = []
+
+    def __call__(self, _index, frame) -> None:
+        values = frame.magnification_map.values
+        self.values.append(
+            values[values.shape[0] // 2, values.shape[1] // 2].detach().clone()
+        )
+
+    def reset(self) -> None:
+        """Discard a partial attempt before CUDA OOM backoff retries it."""
+
+        self.values.clear()
+
+    def numpy(self) -> np.ndarray:
+        """Transfer the complete collected series once."""
+
+        return torch.stack(self.values).cpu().numpy().astype(np.float32, copy=False)
+
+
+def generate_labeled_examples(
+    systems: Sequence[TrainingSystem],
+    map_times_days: torch.Tensor,
+    flux_times_days: torch.Tensor,
+    *,
+    rays: int,
+    curves_per_batch: int,
+) -> tuple[
+    tuple[tuple[mc.MultirateLabeledLightCurve, np.ndarray, float], ...],
+    mc.IndependentLightCurveBatch,
+]:
+    """Generate independent labeled systems concurrently on one device."""
+
+    systems = tuple(systems)
+    if not systems:
+        raise ValueError("at least one training system is required")
+    method = mc.production_ipm_config(rays=int(rays))
+    caustics = mc.CausticConfig(
+        far_field_approx=method.far_field_approx,
+        jacobian_chunk_size=1_048_576,
+        anchor_count=9,
+        gauge_count=9,
+    )
+    collectors = tuple(_CenterMagnificationCollector() for _ in systems)
+    batch = mc.batched_system_light_curves(
+        tuple(system.system for system in systems),
+        map_times_days,
+        flux_times_days,
+        curves_per_batch=int(curves_per_batch),
+        include_labels=True,
+        method=method,
+        caustics=caustics,
+        map_observers=collectors,
+        oom_backoff=True,
+    )
+    amortized = batch.seconds_per_curve
+    generated = tuple(
+        (result, collector.numpy(), amortized)
+        for result, collector in zip(batch.light_curves, collectors, strict=True)
+    )
+    return generated, batch
 
 
 def save_example(
@@ -555,7 +617,9 @@ def save_example(
         "timing_components_seconds": dict(curve.timing.component_seconds),
         "steady_seconds": float(curve.timing.steady_seconds),
         "method": asdict(mc.production_ipm_config()),
-        "dynamic_schedule": asdict(mc.production_dynamic_config()),
+        "dynamic_schedule": asdict(
+            mc.production_dynamic_config(temporal_batch_size=30)
+        ),
     }
     # Convert enum-like values and nested tensors only through JSON's explicit
     # string fallback. Numerical arrays stay in the NPZ rather than metadata.

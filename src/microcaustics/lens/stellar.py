@@ -133,15 +133,15 @@ class SkyProjectedKinematics:
     increasing ICRS right ascension and declination. Lens and source peculiar
     velocities are proper velocities in their respective rest frames. The
     CMB dipole is projected at ``ra_deg`` and ``dec_deg`` and included by
-    default. Use :meth:`sampled` to defer a reproducible peculiar-velocity draw
-    until the enclosing microlensing system supplies its redshifts.
+    default. Set ``peculiar_velocity_dispersion_km_s`` to draw reproducible
+    lens and source peculiar velocities after the system supplies redshifts.
     """
 
     ra_deg: float
     dec_deg: float
     stellar_dispersion_km_s: float = 170.0
-    lens_peculiar_velocity_km_s: tuple[float, float] | None = (0.0, 0.0)
-    source_peculiar_velocity_km_s: tuple[float, float] | None = (0.0, 0.0)
+    lens_peculiar_velocity_km_s: tuple[float, float] | None = None
+    source_peculiar_velocity_km_s: tuple[float, float] | None = None
     peculiar_velocity_dispersion_km_s: float | None = None
     omega_matter: float = 0.3
     omega_lambda: float = 0.7
@@ -165,11 +165,15 @@ class SkyProjectedKinematics:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
-        sampled = self.peculiar_velocity_dispersion_km_s is not None
         velocity_names = (
             "lens_peculiar_velocity_km_s",
             "source_peculiar_velocity_km_s",
         )
+        if self.peculiar_velocity_dispersion_km_s is None and all(
+            getattr(self, name) is None for name in velocity_names
+        ):
+            object.__setattr__(self, "peculiar_velocity_dispersion_km_s", 235.0)
+        sampled = self.peculiar_velocity_dispersion_km_s is not None
         if sampled:
             if any(getattr(self, name) is not None for name in velocity_names):
                 raise ValueError(
@@ -208,51 +212,6 @@ class SkyProjectedKinematics:
         matter = omega_matter * (1.0 + redshift) ** 3 / expansion2
         dark_energy = omega_lambda / expansion2
         return matter ** (4.0 / 7.0) + dark_energy * (1.0 + matter / 2.0) / 70.0
-
-    @classmethod
-    def sampled(
-        cls,
-        *,
-        ra_deg: float,
-        dec_deg: float,
-        lens_redshift: float | None = None,
-        source_redshift: float | None = None,
-        peculiar_velocity_dispersion_km_s: float = 235.0,
-        stellar_dispersion_km_s: float = 170.0,
-        omega_matter: float = 0.3,
-        omega_lambda: float = 0.7,
-        seed: int | None = None,
-        include_cmb_dipole: bool = True,
-    ) -> SkyProjectedKinematics:
-        """Describe reproducibly sampled lens/source peculiar velocities.
-
-        The redshift scaling follows the growth-rate prescription used by the
-        production calculations. The draw is deferred until distances are
-        available, so callers do not repeat system redshifts. A separate seed
-        avoids correlating bulk velocities with the sampled stellar masses and
-        positions.
-        """
-
-        if peculiar_velocity_dispersion_km_s < 0.0:
-            raise ValueError("peculiar_velocity_dispersion_km_s must be non-negative")
-        if not 0.0 <= omega_matter <= 1.0 or not 0.0 <= omega_lambda <= 2.0:
-            raise ValueError("omega_matter and omega_lambda are outside supported bounds")
-        if (lens_redshift is None) != (source_redshift is None):
-            raise ValueError("supply both lens_redshift and source_redshift, or neither")
-        return cls(
-            ra_deg=ra_deg,
-            dec_deg=dec_deg,
-            stellar_dispersion_km_s=stellar_dispersion_km_s,
-            lens_peculiar_velocity_km_s=None,
-            source_peculiar_velocity_km_s=None,
-            peculiar_velocity_dispersion_km_s=peculiar_velocity_dispersion_km_s,
-            omega_matter=omega_matter,
-            omega_lambda=omega_lambda,
-            seed=seed,
-            include_cmb_dipole=include_cmb_dipole,
-            lens_redshift=lens_redshift,
-            source_redshift=source_redshift,
-        )
 
     def _peculiar_velocities(
         self,

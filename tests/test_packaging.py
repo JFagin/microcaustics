@@ -14,7 +14,10 @@ import venv
 from contextlib import redirect_stdout
 from pathlib import Path
 
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 RUN_BUILD_SMOKE = os.environ.get("MICROCAUSTICS_RUN_BUILD_SMOKE", "").lower() in {

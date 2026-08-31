@@ -27,10 +27,10 @@ class SupernovaSourceTests(unittest.TestCase):
     def test_band_mapping_replaces_parallel_name_and_wavelength_inputs(self) -> None:
         source = mc.ExpandingPhotosphereSource(
             redshift=0.5,
-            bands={"blue": 4_500.0, "red": 7_500.0},
+            bands_angstrom={"blue": 4_500.0, "red": 7_500.0},
             maximum_observer_time_days=100.0,
             evolution=simple_evolution(),
-            resolution=16,
+            source_grid_shape=16,
             luminosity_distance_m=1.0e25,
         )
         self.assertEqual(source.band_names, ("blue", "red"))
@@ -43,7 +43,7 @@ class SupernovaSourceTests(unittest.TestCase):
             band_names=("blue", "red"),
             maximum_observer_time_days=100.0,
             evolution=simple_evolution(),
-            resolution=32,
+            source_grid_shape=32,
             explosion_time_days=5.0,
             luminosity_distance_m=1.0e25,
         )
@@ -62,7 +62,7 @@ class SupernovaSourceTests(unittest.TestCase):
             wavelengths_angstrom=(7_500.0,),
             maximum_observer_time_days=100.0,
             evolution=simple_evolution(),
-            resolution=32,
+            source_grid_shape=32,
         )
         brightness = source.brightness(torch.tensor([30.0], dtype=torch.float32))
         self.assertEqual(brightness.dtype, torch.float32)
@@ -75,7 +75,7 @@ class SupernovaSourceTests(unittest.TestCase):
             wavelengths_angstrom=(6_000.0,),
             maximum_observer_time_days=80.0,
             evolution=simple_evolution(),
-            resolution=40,
+            source_grid_shape=40,
             source_fov_margin=1.1,
             luminosity_distance_m=1.0e25,
         )
@@ -94,7 +94,7 @@ class SupernovaSourceTests(unittest.TestCase):
             wavelengths_angstrom=(5_000.0, 8_000.0),
             maximum_observer_time_days=60.0,
             evolution=simple_evolution(),
-            resolution=24,
+            source_grid_shape=24,
             luminosity_distance_m=1.0e25,
             appearance=mc.PhotosphereAppearance(limb_darkening=0.0),
         )
@@ -132,7 +132,7 @@ class SupernovaSourceTests(unittest.TestCase):
             wavelengths_angstrom=(3_671.0, 4_827.0, 6_223.0, 7_546.0),
             band_names=("u", "g", "r", "i"),
             maximum_observer_time_days=200.0,
-            resolution=128,
+            source_grid_shape=128,
         )
         peak_observer_days = 18.0 * (1.0 + source.redshift)
         brightness = source.brightness(

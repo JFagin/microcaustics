@@ -153,7 +153,7 @@ class RuntimeConfig:
     backend: Backend | str = Backend.AUTO
     dtype: str | torch.dtype = torch.float32
     strict_backend: bool = False
-    memory_fraction: float = 0.85
+    memory_fraction: float = 0.95
     torch_compile_mode: str | None = None
     profiling: ProfilingLevel | str = ProfilingLevel.OFF
 
@@ -214,7 +214,9 @@ class IPMConfig:
     ``virtual_refinement`` (``v``) controls their interpolated polygon
     representation without additional lens-equation evaluations. The paper
     production setting is ``N=10M, k=2, r=2, v=4``, but these values are not
-    hard-coded.
+    hard-coded. ``compact_sparse_nodes`` deduplicates shared boundary nodes
+    among retained cells before ray tracing. It reduces production memory and
+    work without changing the mapped-cell geometry.
     """
 
     rays: int = 10_000_000
@@ -230,6 +232,7 @@ class IPMConfig:
     scout_trace_centers: bool = True
     dual_scout_scalar_correction: bool = False
     cell_chunk_size: int = 65_536
+    compact_sparse_nodes: bool = False
     far_field_approx: FarFieldApproxConfig = field(default_factory=FarFieldApproxConfig)
 
     def __post_init__(self) -> None:
@@ -284,26 +287,25 @@ class DynamicConfig:
 
     ``temporal_batch_size`` controls the number of map frames presented to a
     fused solver. When omitted, CUDA autotuning begins from the validated
-    production size of forty. ``fused_temporal_ipm=False`` retains the readable
-    independent-frame path for validation. ``pad_temporal_batches`` permits a
-    short CUDA tail to reuse the compiled batch shape. Padded maps are never
+    production size of forty-nine. ``fused_temporal_ipm=False`` retains the readable
+    independent-frame path for validation. A short CUDA tail is padded
+    internally so it can reuse the compiled batch shape. Padded maps are never
     returned.
 
     ``scout_refresh_frames`` controls an approximate optimization for moving
-    point-mass fields. With ``endpoint_union=True``, the selected fine cells
-    from both ends of each refresh interval are retained throughout that
-    interval. Set the refresh interval to one to recompute every frame.
-    Static lens fields are detected and reused exactly.
+    point-mass fields. The selected fine cells from both ends of each refresh
+    interval are always retained throughout that interval. Set the refresh
+    interval to one to recompute every frame. Static fields are reused exactly.
     """
 
     temporal_batch_size: int | None = None
     light_curve_batch_size: int | None = None
     fused_temporal_ipm: bool = True
-    pad_temporal_batches: bool = True
+    pad_temporal_batches: bool = field(default=True, init=False, repr=False)
     scout_refresh_frames: int = 10
-    endpoint_union: bool = True
+    endpoint_union: bool = field(default=True, init=False, repr=False)
     tuning: AutoTuningConfig = field(default_factory=AutoTuningConfig)
-    reuse_static_maps: bool = True
+    reuse_static_maps: bool = field(default=True, init=False, repr=False)
     minimum_cell_chunk_size: int = 1_024
 
     def __post_init__(self) -> None:
@@ -326,10 +328,11 @@ def production_ipm_config(
     """Return the validated dynamic tiled-IPM configuration.
 
     High-level static-map calls automatically use a complete ``k=1`` scout.
-    Dynamic sequences use the faster ``k=2`` scout plus the one-time
-    frame-zero ``k=1`` to ``k=2`` correction. Users therefore do not select a
-    static/dynamic mode. ``overrides`` remains available for documented
-    numerical experiments.
+    Dynamic sequences use the faster corner-only ``k=2`` scout plus the
+    one-time frame-zero ``k=1`` to ``k=2`` correction. Users therefore do not
+    select a static/dynamic mode. ``overrides`` remains available for
+    documented numerical experiments, including conservative center-assisted
+    scouting with ``scout_trace_centers=True``.
 
     Parameters
     ----------
@@ -350,8 +353,10 @@ def production_ipm_config(
         tiled=True,
         scout_halo_pixels=0.0,
         scout_dilation_cells=1,
+        scout_trace_centers=False,
         dual_scout_scalar_correction=True,
         cell_chunk_size=524_288,
+        compact_sparse_nodes=True,
         far_field_approx=FarFieldApproxConfig(
             cells_per_axis=16,
             nodes_per_cell_axis=8,
@@ -373,6 +378,7 @@ def _production_static_ipm_config(
     config = production_ipm_config(
         rays=rays,
         scout_ratio=1,
+        scout_trace_centers=True,
         dual_scout_scalar_correction=False,
     )
     return replace(config, **overrides) if overrides else config
@@ -381,18 +387,16 @@ def _production_static_ipm_config(
 def production_dynamic_config(**overrides) -> DynamicConfig:
     """Return the validated dynamic scheduling configuration.
 
-    The preset uses a forty-frame fused temporal batch and a ten-frame
+    The preset uses a forty-nine-frame fused temporal batch and a ten-frame
     endpoint-union scout refresh. It deliberately keeps the far-field time
     stride at one. Every epoch receives independently constructed Taylor
     coefficients.
     """
 
     config = DynamicConfig(
-        temporal_batch_size=40,
+        temporal_batch_size=49,
         fused_temporal_ipm=True,
-        pad_temporal_batches=True,
         scout_refresh_frames=10,
-        endpoint_union=True,
     )
     return replace(config, **overrides) if overrides else config
 
@@ -405,15 +409,20 @@ class CausticConfig:
     This object controls how it is evaluated and how finite-field caustics are
     converted into robust source-region labels. Anchors and gauges use distinct,
     reproducibly jittered paths just inside the source boundary. Nine of each is
-    the validated production layout.
+    the validated production layout. ``minimum_determinant_sign_pixels``
+    removes unresolved determinant-sign islands and zero disables that cleanup.
+    ``minimum_alignment_gauges`` is the minimum trusted gauge set used for
+    temporal parity alignment. When ``temporal_batch_size`` is omitted in a
+    light-curve call, labels inherit the map/light-curve temporal batch. Set it
+    explicitly only when label memory or throughput benefits from a different
+    batch size.
     """
 
     far_field_approx: FarFieldApproxConfig = field(default_factory=FarFieldApproxConfig)
     tuning: AutoTuningConfig = field(default_factory=AutoTuningConfig)
     temporal_batch_size: int | None = None
     jacobian_chunk_size: int = 1_048_576
-    determinant_cleanup: str = "local"
-    minimum_sign_component_pixels: int = 4
+    minimum_determinant_sign_pixels: int = 4
     anchor_count: int = 9
     gauge_count: int = 9
     anchor_inset_fraction: float = 0.05
@@ -423,27 +432,27 @@ class CausticConfig:
     anchor_radial_jitter_fraction: float = 0.01
     gauge_radial_jitter_fraction: float = 0.01
     safe_gauge_distance_uas: float = 0.0
-    minimum_safe_gauges: int = 3
+    minimum_alignment_gauges: int = 3
     weighted_temporal_alignment: bool = True
     crossing_distance_uas: float | None = None
     point_chunk_size: int = 4096
     segment_chunk_size: int = 16384
     triton_segment_block: int = 256
-    float64_label_fallback: bool = False
 
     def __post_init__(self) -> None:
         for name in (
             "jacobian_chunk_size",
-            "minimum_sign_component_pixels",
             "anchor_count",
             "gauge_count",
-            "minimum_safe_gauges",
+            "minimum_alignment_gauges",
             "point_chunk_size",
             "segment_chunk_size",
             "triton_segment_block",
         ):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"{name} must be positive")
+        if int(self.minimum_determinant_sign_pixels) < 0:
+            raise ValueError("minimum_determinant_sign_pixels must be non-negative")
         if self.temporal_batch_size is not None and self.temporal_batch_size < 1:
             raise ValueError("temporal_batch_size must be positive when supplied")
         for name in (
@@ -461,9 +470,5 @@ class CausticConfig:
             raise ValueError("crossing_distance_uas must be non-negative")
         if self.triton_segment_block not in {64, 128, 256, 512, 1024}:
             raise ValueError("triton_segment_block must be a power of two from 64 to 1024")
-        cleanup = str(self.determinant_cleanup).lower()
-        if cleanup not in {"none", "local"}:
-            raise ValueError("determinant_cleanup must be 'none' or 'local'")
-        object.__setattr__(self, "determinant_cleanup", cleanup)
-        if self.minimum_safe_gauges > self.gauge_count:
-            raise ValueError("minimum_safe_gauges cannot exceed gauge_count")
+        if self.minimum_alignment_gauges > self.gauge_count:
+            raise ValueError("minimum_alignment_gauges cannot exceed gauge_count")

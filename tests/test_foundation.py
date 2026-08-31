@@ -45,22 +45,32 @@ from microcaustics import (
     resolve_runtime,
     thin_disk_flux_radius_rg,
 )
+from microcaustics.config import _production_static_ipm_config
 from microcaustics.lens import kroupa_mass_function, salpeter_mass_function
 from microcaustics.runtime import warn_backend_fallback
 from microcaustics.sources import GaussianSource, SourceGeometry
 
 
 class FoundationTests(unittest.TestCase):
+    def test_production_runtime_memory_cap(self) -> None:
+        self.assertEqual(RuntimeConfig().memory_fraction, 0.95)
+
     def test_gravitational_radius_uses_public_units(self) -> None:
         self.assertAlmostEqual(float(gravitational_radius_m(1.0)), 1476.625, places=3)
 
     def test_production_preset_supports_explicit_complete_scout(self) -> None:
         dynamic = production_ipm_config()
-        static = production_ipm_config(scout_ratio=1)
+        static = _production_static_ipm_config()
+        conservative = production_ipm_config(scout_trace_centers=True)
         self.assertEqual(static.scout_ratio, 1)
         self.assertFalse(static.dual_scout_scalar_correction)
+        self.assertTrue(static.scout_trace_centers)
+        self.assertTrue(conservative.scout_trace_centers)
         self.assertEqual(dynamic.scout_ratio, 2)
         self.assertTrue(dynamic.dual_scout_scalar_correction)
+        self.assertFalse(dynamic.scout_trace_centers)
+        self.assertTrue(dynamic.compact_sparse_nodes)
+        self.assertFalse(IPMConfig().compact_sparse_nodes)
         self.assertEqual(static.scout_halo_pixels, 0.0)
         self.assertEqual(dynamic.scout_halo_pixels, 0.0)
         self.assertEqual(static.scout_dilation_cells, 1)
@@ -68,7 +78,7 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(dynamic.far_field_approx.cells_per_axis, 16)
         self.assertEqual(dynamic.far_field_approx.nodes_per_cell_axis, 8)
         schedule = production_dynamic_config()
-        self.assertEqual(schedule.temporal_batch_size, 40)
+        self.assertEqual(schedule.temporal_batch_size, 49)
         self.assertEqual(schedule.scout_refresh_frames, 10)
         self.assertTrue(schedule.endpoint_union)
 
@@ -1296,6 +1306,109 @@ class FoundationTests(unittest.TestCase):
                 )
                 self.assertEqual(result.metadata["scout_ratio"], scout_ratio)
 
+    def test_compact_sparse_ipm_matches_cell_local_nodes(self) -> None:
+        """Deduplicating shared nodes must preserve the portable IPM map."""
+
+        simulation = MicrolensingSimulation.create(
+            MacroLens(convergence=0.17, shear=0.06),
+            PointMassField(
+                torch.tensor([-0.45, 0.35], dtype=torch.float64),
+                torch.tensor([0.25, -0.15], dtype=torch.float64),
+                torch.tensor([0.18, 0.12], dtype=torch.float64),
+            ),
+            runtime=RuntimeConfig(
+                device="cpu",
+                backend=Backend.TORCH_EAGER,
+                dtype="float64",
+            ),
+        )
+        common = dict(
+            rays=64,
+            scout_ratio=2,
+            refinement=3,
+            virtual_refinement=5,
+            tiled=True,
+            scout_trace_centers=False,
+            scout_dilation_cells=1,
+            cell_chunk_size=7,
+            far_field_approx=FarFieldApproxConfig(enabled=False),
+        )
+        lens_region = PlaneRegion((3.0, 3.0))
+        source_grid = PlaneGrid((7, 8), (1.4, 1.6))
+        dense = simulation.magnification_map(
+            lens_region,
+            source_grid,
+            method=IPMConfig(compact_sparse_nodes=False, **common),
+        )
+        compact = simulation.magnification_map(
+            lens_region,
+            source_grid,
+            method=IPMConfig(compact_sparse_nodes=True, **common),
+        )
+        torch.testing.assert_close(compact.values, dense.values, rtol=0.0, atol=0.0)
+        self.assertTrue(compact.metadata["compact_sparse_nodes"])
+        self.assertLess(
+            compact.metadata["compact_unique_nodes"],
+            compact.metadata["selected_fine_cells"] * 16,
+        )
+
+    def test_compact_sparse_temporal_ipm_matches_cell_local_nodes(self) -> None:
+        """The fused temporal scheduler must preserve compact-node parity."""
+
+        simulation = MicrolensingSimulation.create(
+            MacroLens(convergence=0.12, shear=0.04),
+            PointMassField(
+                torch.tensor([-0.4, 0.3]),
+                torch.tensor([0.2, -0.1]),
+                torch.tensor([0.16, 0.11]),
+                torch.tensor([0.002, -0.001]),
+                torch.tensor([-0.001, 0.0015]),
+            ),
+            runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
+        )
+        common = dict(
+            rays=36,
+            scout_ratio=2,
+            refinement=2,
+            virtual_refinement=4,
+            tiled=True,
+            scout_trace_centers=False,
+            cell_chunk_size=11,
+            far_field_approx=FarFieldApproxConfig(enabled=False),
+        )
+        schedule = DynamicConfig(
+            temporal_batch_size=3,
+            scout_refresh_frames=3,
+            fused_temporal_ipm=True,
+        )
+        arguments = (
+            PlaneRegion((3.0, 3.0)),
+            PlaneGrid((5, 6), (1.2, 1.4)),
+            [0.0, 1.0, 2.0],
+        )
+        dense = list(
+            simulation.dynamic_maps(
+                *arguments,
+                method=IPMConfig(compact_sparse_nodes=False, **common),
+                schedule=schedule,
+            )
+        )
+        compact = list(
+            simulation.dynamic_maps(
+                *arguments,
+                method=IPMConfig(compact_sparse_nodes=True, **common),
+                schedule=schedule,
+            )
+        )
+        for actual, expected in zip(compact, dense, strict=True):
+            torch.testing.assert_close(
+                actual.values,
+                expected.values,
+                rtol=2.0e-7,
+                atol=2.0e-7,
+            )
+            self.assertTrue(actual.metadata["compact_sparse_nodes"])
+
     def test_tiled_scout_matches_full_field_for_linear_mapping(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.2, shear=0.1, shear_angle_rad=0.3),
@@ -1613,7 +1726,7 @@ class FoundationTests(unittest.TestCase):
                 CausticConfig(
                     anchor_count=anchor_count,
                     gauge_count=gauge_count,
-                    minimum_safe_gauges=min(3, gauge_count),
+                    minimum_alignment_gauges=min(3, gauge_count),
                 ),
             )
             labels = outputs[0].labels
@@ -2015,7 +2128,6 @@ class FoundationTests(unittest.TestCase):
                 schedule=DynamicConfig(
                     temporal_batch_size=2,
                     scout_refresh_frames=3,
-                    endpoint_union=True,
                 ),
             )
         )
@@ -2057,8 +2169,6 @@ class FoundationTests(unittest.TestCase):
         common = dict(
             temporal_batch_size=2,
             scout_refresh_frames=3,
-            endpoint_union=True,
-            pad_temporal_batches=False,
         )
         fused = list(
             simulation.dynamic_maps(
@@ -2124,8 +2234,6 @@ class FoundationTests(unittest.TestCase):
                 schedule=DynamicConfig(
                     temporal_batch_size=4,
                     scout_refresh_frames=3,
-                    endpoint_union=True,
-                    pad_temporal_batches=False,
                 ),
             )
         )
@@ -2164,8 +2272,6 @@ class FoundationTests(unittest.TestCase):
                 schedule=DynamicConfig(
                     temporal_batch_size=3,
                     scout_refresh_frames=1,
-                    endpoint_union=True,
-                    pad_temporal_batches=False,
                 ),
             )
         )
@@ -2206,7 +2312,6 @@ class FoundationTests(unittest.TestCase):
                 schedule=DynamicConfig(
                     temporal_batch_size=2,
                     fused_temporal_ipm=True,
-                    pad_temporal_batches=False,
                 ),
             )
         )

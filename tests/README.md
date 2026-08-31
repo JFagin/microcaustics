@@ -61,13 +61,15 @@ Install the optional validation dependencies with:
 python -m pip install -e ".[test,validation]"
 ```
 
-NumPy, SciPy, and Astropy checks run automatically when installed.
-Lenstronomy is kept out of the fast loop because its first import may compile
-and cache dependencies:
+NumPy, SciPy, and Astropy checks run automatically when installed. GitHub
+Actions installs lenstronomy and enables its comparisons in a dedicated oracle
+job. Keeping the environment gate prevents lenstronomy's expensive first import
+from slowing every operating-system and Python-version job. Run that same job
+locally with:
 
 ```powershell
 $env:MICROCAUSTICS_RUN_LENSTRONOMY = "1"
-python -m unittest tests.test_external_oracles.LenstronomyOracleTests -v
+python -m pytest -q tests/test_external_oracles.py
 ```
 
 These libraries are validation-only dependencies. None is imported by the

@@ -50,7 +50,7 @@ driver = mc.broken_power_law_driving_signal(
 disk = mc.KerrDiskModel(
     black_hole_mass_solar=10**9.08,
     eddington_ratio=0.34,
-    bands={"u": 3671.0, "g": 4827.0, "r": 6223.0},
+    bands_angstrom={"u": 3671.0, "g": 4827.0, "r": 6223.0},
     spin=0.74,
     inclination_deg=10.0,
     position_angle_deg=175.0,
@@ -58,7 +58,7 @@ disk = mc.KerrDiskModel(
     lamp_fraction=0.1,
     corona_height_above_isco_rg=20.0,
     driving_signal=driver,
-    resolution=1024,
+    source_grid_shape=1024,
     source_margin=1.05,
 )
 source = disk.pixelate(distances, runtime=runtime)

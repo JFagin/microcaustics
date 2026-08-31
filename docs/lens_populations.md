@@ -28,7 +28,7 @@ For the complete observer-frame velocity construction, include the sky
 position and lens/source peculiar motions:
 
 ```python
-kinematics = mc.SkyProjectedKinematics.sampled(
+kinematics = mc.SkyProjectedKinematics(
     ra_deg=340.126125,
     dec_deg=3.358611,
     peculiar_velocity_dispersion_km_s=235,

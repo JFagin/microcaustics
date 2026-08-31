@@ -17,8 +17,8 @@ class MicrolensingSystemTests(unittest.TestCase):
         model = mc.ThinDiskModel(
             black_hole_mass_solar=1.0e8,
             eddington_ratio=0.1,
-            bands={"blue": 4_800.0, "red": 9_700.0},
-            resolution=24,
+            bands_angstrom={"blue": 4_800.0, "red": 9_700.0},
+            source_grid_shape=24,
             enclosed_flux_fraction=0.995,
             source_margin=1.05,
         )
@@ -179,10 +179,10 @@ class MicrolensingSystemTests(unittest.TestCase):
         source = mc.GaussianModel.from_angular(
             self.distances,
             sigma_uas=0.12,
-            bands={"optical": 6_000.0},
+            bands_angstrom={"optical": 6_000.0},
             axis_ratio=0.6,
             position_angle_rad=math.radians(23.0),
-            resolution=24,
+            source_grid_shape=24,
         )
         population = mc.StellarPopulation.salpeter(count=12)
         common = dict(
@@ -235,8 +235,8 @@ class MicrolensingSystemTests(unittest.TestCase):
         source = mc.GaussianModel.from_angular(
             self.distances,
             sigma_uas=0.1,
-            bands={"optical": 6_000.0},
-            resolution=16,
+            bands_angstrom={"optical": 6_000.0},
+            source_grid_shape=16,
         )
         realization = mc.MicrolensingSystem(
             macro=mc.MacroLens(0.3, 0.2, shear_angle_deg=angle_deg),
@@ -289,8 +289,8 @@ class MicrolensingSystemTests(unittest.TestCase):
         )
         self.assertEqual(realization.sky_to_local_rotation_deg, 0.0)
 
-    def test_system_from_redshifts_hides_distance_construction(self) -> None:
-        system = mc.MicrolensingSystem.from_redshifts(
+    def test_system_constructor_hides_distance_construction(self) -> None:
+        system = mc.MicrolensingSystem(
             lens_redshift=0.25,
             source_redshift=1.2,
             H0=70.0,
@@ -304,6 +304,62 @@ class MicrolensingSystemTests(unittest.TestCase):
         self.assertEqual(system.distances.lens_redshift, 0.25)
         self.assertEqual(system.distances.source_redshift, 1.2)
         self.assertGreater(system.distances.lens_to_source_m, 0.0)
+
+    def test_redshift_system_can_replace_source_without_rebuilding_geometry(self) -> None:
+        original = mc.GaussianSource(
+            mc.SourceGeometry(
+                shape=self.source_grid.shape,
+                pixel_scale_m=(1.0e10, 1.0e10),
+                wavelengths_angstrom=(5_000.0,),
+                band_names=("optical",),
+            ),
+            sigma_m=1.0e10,
+        )
+        replacement = mc.GaussianSource(
+            original.geometry,
+            sigma_m=1.5e10,
+        )
+        system = mc.MicrolensingSystem(
+            lens_redshift=0.25,
+            source_redshift=1.2,
+            macro=self.macro,
+            source=original,
+            stars=self._stars(),
+            lens_region=self.lens_region,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        changed = system.with_source(replacement)
+        self.assertIs(changed.source, replacement)
+        self.assertIs(changed.distances, system.distances)
+
+    def test_light_curve_warmup_selects_schedule_batch_automatically(self) -> None:
+        source = mc.GaussianSource(
+            mc.SourceGeometry(
+                shape=self.source_grid.shape,
+                pixel_scale_m=(1.0e10, 1.0e10),
+                wavelengths_angstrom=(5_000.0,),
+                band_names=("optical",),
+            ),
+            sigma_m=1.0e10,
+        )
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            source=source,
+            source_grid=self.source_grid,
+            stars=self._stars(),
+            lens_region=self.lens_region,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        result = system.warmup_light_curve(
+            method=self.method,
+            schedule=mc.DynamicConfig(
+                temporal_batch_size=2,
+                fused_temporal_ipm=False,
+                scout_refresh_frames=1,
+            ),
+        )
+        self.assertEqual(result.times_days.numel(), 2)
 
     def test_common_realized_properties_are_available_on_system(self) -> None:
         system = mc.MicrolensingSystem(
@@ -324,15 +380,33 @@ class MicrolensingSystemTests(unittest.TestCase):
         from microcaustics.system import _production_dynamic_settings
 
         method = mc.production_ipm_config()
+        self.assertEqual(mc.production_dynamic_config().temporal_batch_size, 49)
         schedule, caustics = _production_dynamic_settings(method, None)
-        self.assertEqual(schedule.temporal_batch_size, 40)
+        self.assertEqual(schedule.temporal_batch_size, 30)
         self.assertIsNotNone(caustics)
         assert caustics is not None
-        self.assertEqual(caustics.temporal_batch_size, 40)
+        self.assertEqual(caustics.temporal_batch_size, 30)
         self.assertEqual(caustics.far_field_approx, method.far_field_approx)
 
-    def test_multi_image_system_from_redshifts_shares_geometry(self) -> None:
-        system = mc.MultiImageSystem.from_redshifts(
+    def test_caustic_batch_inherits_schedule_and_can_be_overridden(self) -> None:
+        from microcaustics.system import _production_dynamic_settings
+
+        method = mc.production_ipm_config()
+        schedule = mc.production_dynamic_config(temporal_batch_size=7)
+        _, inherited = _production_dynamic_settings(
+            method, schedule, mc.CausticConfig()
+        )
+        _, overridden = _production_dynamic_settings(
+            method,
+            schedule,
+            mc.CausticConfig(temporal_batch_size=3),
+        )
+        assert inherited is not None and overridden is not None
+        self.assertEqual(inherited.temporal_batch_size, 7)
+        self.assertEqual(overridden.temporal_batch_size, 3)
+
+    def test_multi_image_system_constructor_shares_redshift_geometry(self) -> None:
+        system = mc.MultiImageSystem(
             lens_redshift=0.25,
             source_redshift=1.2,
             H0=70.0,
@@ -346,8 +420,8 @@ class MicrolensingSystemTests(unittest.TestCase):
         self.assertIs(system.image("A").distances, system.image("B").distances)
         self.assertEqual(system.image("A").distances.lens_redshift, 0.25)
 
-    def test_sampled_sky_kinematics_can_defer_redshifts(self) -> None:
-        kinematics = mc.SkyProjectedKinematics.sampled(
+    def test_sky_kinematics_can_defer_redshifts(self) -> None:
+        kinematics = mc.SkyProjectedKinematics(
             ra_deg=10.0,
             dec_deg=-5.0,
             seed=91,
@@ -604,7 +678,7 @@ class MicrolensingSystemTests(unittest.TestCase):
         self.assertAlmostEqual(actual[0], expected_x, places=18)
         self.assertAlmostEqual(actual[1], expected_y, places=18)
 
-    def test_sampled_sky_kinematics_is_reproducible(self) -> None:
+    def test_sky_kinematics_sampling_is_reproducible(self) -> None:
         kwargs = {
             "ra_deg": 340.126125,
             "dec_deg": 3.358611,
@@ -612,8 +686,8 @@ class MicrolensingSystemTests(unittest.TestCase):
             "source_redshift": 1.2,
             "seed": 91,
         }
-        first = mc.SkyProjectedKinematics.sampled(**kwargs)
-        second = mc.SkyProjectedKinematics.sampled(**kwargs)
+        first = mc.SkyProjectedKinematics(**kwargs)
+        second = mc.SkyProjectedKinematics(**kwargs)
         self.assertEqual(
             first.mean_velocity_uas_per_day(self.distances),
             second.mean_velocity_uas_per_day(self.distances),
@@ -1430,7 +1504,7 @@ class MicrolensingSystemTests(unittest.TestCase):
             wavelengths_angstrom=(4_800.0, 7_500.0),
             maximum_observer_time_days=30.0,
             band_names=("blue", "red"),
-            resolution=24,
+            source_grid_shape=24,
             luminosity_distance_m=4.0e25,
         )
         system = mc.MicrolensingSystem(
@@ -1498,10 +1572,10 @@ class MicrolensingSystemTests(unittest.TestCase):
         )
         caustic_config = mc.CausticConfig(
             far_field_approx=mc.FarFieldApproxConfig(enabled=False),
-            minimum_sign_component_pixels=1,
+            minimum_determinant_sign_pixels=1,
             anchor_count=3,
             gauge_count=3,
-            minimum_safe_gauges=1,
+            minimum_alignment_gauges=1,
         )
         actual = system.light_curve_with_labels(
             (0.0,),

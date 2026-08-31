@@ -23,8 +23,8 @@ from .config import (
 from .geometry import PlaneGrid, PlaneRegion
 from .lens import LensingDistances, MacroLens, PointMassField, StellarPopulation
 from .multi_image import MacroImageConfig, MultiImageSimulation, _times_for_image
-from .runtime import ResolvedRuntime
 from .random import derive_seed
+from .runtime import ResolvedRuntime
 from .sources import PhysicalSourceModel, PixelatedSource, ThermalReprocessingSource
 from .system import (
     IntegrationDomain,
@@ -74,6 +74,9 @@ class MultiImageSystem:
     independent seeded :class:`MicrolensingSystem` for every image. Existing
     fully constructed systems remain accepted for per-image expert control.
 
+    Standard workflows supply ``lens_redshift`` and ``source_redshift`` once.
+    Explicit :class:`LensingDistances` remain available for another cosmology.
+
     Arrival delays shift only source emission. Map evolution remains on the
     observer-time axis. A scalar ``seed`` is treated as a reproducible base
     seed, with stable independent image seeds derived from each image name. A
@@ -90,6 +93,12 @@ class MultiImageSystem:
     caustic_configs: CausticConfig | Mapping[str, CausticConfig] | None = None
     source: PixelatedSource | PhysicalSourceModel | None = None
     distances: LensingDistances | None = None
+    lens_redshift: float | None = None
+    source_redshift: float | None = None
+    H0: float = 67.66
+    Om0: float = 0.30966
+    distance_dtype: torch.dtype = torch.float32
+    distance_device: torch.device | str | None = "auto"
     source_grid: PlaneGrid | None = None
     stellar_population: StellarPopulation | Mapping[str, StellarPopulation] | None = (
         None
@@ -113,36 +122,6 @@ class MultiImageSystem:
     ) = None
     lens_region: PlaneRegion | Mapping[str, PlaneRegion] | None = None
     caustic_grid_shape: int | tuple[int, int] = 8192
-
-    @classmethod
-    def from_redshifts(
-        cls,
-        *,
-        lens_redshift: float,
-        source_redshift: float,
-        H0: float = 67.66,
-        Om0: float = 0.30966,
-        cosmology=None,
-        distance_dtype: torch.dtype = torch.float32,
-        distance_device: torch.device | str | None = "auto",
-        **kwargs,
-    ) -> MultiImageSystem:
-        """Construct all macroimages from one shared redshift geometry."""
-
-        if "distances" in kwargs:
-            raise TypeError(
-                "from_redshifts derives distances; do not also supply distances"
-            )
-        distances = LensingDistances.from_redshifts(
-            lens_redshift,
-            source_redshift,
-            cosmology=cosmology,
-            H0=H0,
-            Om0=Om0,
-            dtype=distance_dtype,
-            device=distance_device,
-        )
-        return cls(distances=distances, **kwargs)
 
     @classmethod
     def from_macroimage_solutions(
@@ -188,6 +167,31 @@ class MultiImageSystem:
         )
 
     def __post_init__(self) -> None:
+        if self.distances is None and (
+            self.lens_redshift is not None or self.source_redshift is not None
+        ):
+            if self.lens_redshift is None or self.source_redshift is None:
+                raise ValueError(
+                    "supply both lens_redshift and source_redshift"
+                )
+            object.__setattr__(
+                self,
+                "distances",
+                LensingDistances.from_redshifts(
+                    self.lens_redshift,
+                    self.source_redshift,
+                    H0=self.H0,
+                    Om0=self.Om0,
+                    dtype=self.distance_dtype,
+                    device=self.distance_device,
+                ),
+            )
+            object.__setattr__(self, "lens_redshift", None)
+            object.__setattr__(self, "source_redshift", None)
+        elif self.distances is not None and (
+            self.lens_redshift is not None or self.source_redshift is not None
+        ):
+            raise ValueError("supply redshifts or distances, not both")
         images = dict(self.images)
         if not images:
             raise ValueError("at least one macroimage is required")
@@ -330,6 +334,22 @@ class MultiImageSystem:
                 **self.arrival_time_delays_days,
                 **supplied,
             },
+        )
+
+    def with_source(
+        self,
+        source: PixelatedSource | PhysicalSourceModel,
+    ) -> MultiImageSystem:
+        """Return all macroimages with one replacement shared source."""
+
+        return replace(
+            self,
+            images={
+                name: image.with_source(source)
+                for name, image in self.images.items()
+            },
+            source=source,
+            source_grid=None,
         )
 
     def _build_simulation(

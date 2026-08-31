@@ -17,6 +17,56 @@ except Exception:  # pragma: no cover - depends on optional runtime
 if triton is not None:
 
     @triton.jit
+    def _v4_basis(index, component: tl.constexpr):
+        if component == 0:
+            return tl.where(
+                index == 0,
+                1.0,
+                tl.where(index == 1, 0.375, tl.where(index == 3, -0.125, 0.0)),
+            )
+        if component == 1:
+            return tl.where(
+                index == 1,
+                0.75,
+                tl.where(index == 2, 1.0, tl.where(index == 3, 0.75, 0.0)),
+            )
+        return tl.where(
+            index == 3,
+            0.375,
+            tl.where(index == 4, 1.0, tl.where(index == 1, -0.125, 0.0)),
+        )
+
+
+    @triton.jit
+    def _materialize_biquadratic_v4_kernel(
+        raw_x,
+        raw_y,
+        out_x,
+        out_y,
+        n_cells,
+        NODE_BLOCK: tl.constexpr,
+    ):
+        cell = tl.program_id(0)
+        lane = tl.arange(0, NODE_BLOCK)
+        valid = (cell < n_cells) & (lane < 25)
+        node_i = lane // 5
+        node_j = lane - node_i * 5
+        value_x = 0.0
+        value_y = 0.0
+        for source_i in tl.static_range(3):
+            weight_i = _v4_basis(node_i, component=source_i)
+            for source_j in tl.static_range(3):
+                weight = weight_i * _v4_basis(
+                    node_j, component=source_j
+                )
+                source = cell * 9 + source_i * 3 + source_j
+                value_x += weight * tl.load(raw_x + source)
+                value_y += weight * tl.load(raw_y + source)
+        output = cell * 25 + lane
+        tl.store(out_x + output, value_x, mask=valid)
+        tl.store(out_y + output, value_y, mask=valid)
+
+    @triton.jit
     def _edge_x(x0, y0, x1, y1, y):
         dy = y1 - y0
         safe = tl.where(tl.abs(dy) > 1.1754944e-38, dy, 1.0)
@@ -375,6 +425,43 @@ def triton_ipm_available() -> bool:
     """Whether the CUDA float32 direct-cell rasterizer can be launched."""
 
     return bool(triton is not None and torch.cuda.is_available())
+
+
+def materialize_biquadratic_v4_triton(
+    node_x: torch.Tensor,
+    node_y: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate a 5×5 quadratic lattice from mapped 3×3 r=2 nodes."""
+
+    if not triton_ipm_available():
+        raise RuntimeError("Triton IPM interpolation is unavailable")
+    if node_x.shape != node_y.shape or tuple(node_x.shape[-2:]) != (3, 3):
+        raise ValueError("biquadratic v=4 interpolation requires 3×3 node grids")
+    if node_x.device.type != "cuda" or node_x.dtype != torch.float32:
+        raise ValueError("Triton IPM interpolation requires CUDA float32")
+    leading = node_x.shape[:-2]
+    n_cells = int(node_x.numel() // 9)
+    raw_x = node_x.reshape(n_cells, 3, 3).contiguous()
+    raw_y = node_y.reshape(n_cells, 3, 3).contiguous()
+    output_x = torch.empty(
+        (n_cells, 5, 5), dtype=node_x.dtype, device=node_x.device
+    )
+    output_y = torch.empty_like(output_x)
+    if n_cells:
+        _materialize_biquadratic_v4_kernel[(n_cells,)](
+            raw_x,
+            raw_y,
+            output_x,
+            output_y,
+            n_cells,
+            NODE_BLOCK=32,
+            num_warps=1,
+            num_stages=1,
+        )
+    return (
+        output_x.reshape(*leading, 5, 5),
+        output_y.reshape(*leading, 5, 5),
+    )
 
 
 @dataclass

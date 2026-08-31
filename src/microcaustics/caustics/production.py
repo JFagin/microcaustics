@@ -487,7 +487,16 @@ def _batched_sparse_marching_segments(
             dim=0,
         )
         return batched_sparse_marching_squares_zero_triton(
-            f0, f1, f2, f3, x0, x1, y0, y1, edge_boundary
+            f0,
+            f1,
+            f2,
+            f3,
+            x0,
+            x1,
+            y0,
+            y1,
+            edge_boundary,
+            return_flat=True,
         )
     except Exception as error:
         warn_backend_fallback("batched Triton sparse marching squares", error)
@@ -701,6 +710,9 @@ def caustic_fields_from_far_fields(
     )
     ragged_caustics = None
     ragged_boundary_threats = None
+    flat_source_filtered = False
+    critical_rows = None
+    boundary_rows = None
     ragged_endpoint_started = None
     if sparse_marching_batch is not None and batched is not None:
         # Marching squares produces a different endpoint count in every
@@ -710,20 +722,67 @@ def caustic_fields_from_far_fields(
         # neither padding nor additional lens evaluations.
         ragged_endpoint_started = perf_counter()
         critical_rows = sparse_marching_batch[0]
-        mapped_x, mapped_y = batched.raytrace_ragged(
-            tuple(row[..., 0].reshape(-1) for row in critical_rows),
-            tuple(row[..., 1].reshape(-1) for row in critical_rows),
-        )
-        ragged_caustics = tuple(
-            torch.stack((source_x, source_y), dim=-1).reshape_as(critical)
-            for critical, source_x, source_y in zip(
-                critical_rows,
-                mapped_x,
-                mapped_y,
-                strict=True,
+        if len(sparse_marching_batch) > 2:
+            flat_critical = sparse_marching_batch[2]
+            flat_boundary = sparse_marching_batch[3]
+            flat_frames = sparse_marching_batch[4]
+            lengths = sparse_marching_batch[5]
+            flat_x, flat_y = batched.raytrace_indexed_flat(
+                flat_critical[..., 0].reshape(-1),
+                flat_critical[..., 1].reshape(-1),
+                flat_frames.repeat_interleave(2),
             )
-        )
-        if source_region is not None:
+            flat_caustic = torch.stack((flat_x, flat_y), dim=-1).reshape(-1, 2, 2)
+            if source_region is not None:
+                keep = _segments_intersecting_region(flat_caustic, source_region)
+                flat_critical = flat_critical[keep]
+                flat_boundary = flat_boundary[keep]
+                flat_frames = flat_frames[keep]
+                flat_caustic = flat_caustic[keep]
+                kept_lengths = torch.bincount(
+                    flat_frames.to(torch.int64), minlength=len(times)
+                ).detach().cpu().tolist()
+                flat_source_filtered = True
+            else:
+                kept_lengths = lengths
+            critical_rows = tuple(flat_critical.split(tuple(map(int, kept_lengths))))
+            boundary_rows = tuple(flat_boundary.split(tuple(map(int, kept_lengths))))
+            ragged_caustics = tuple(flat_caustic.split(tuple(map(int, kept_lengths))))
+            if source_region is not None:
+                xmin, xmax, ymin, ymax = source_region.bounds_uas
+                inside = (
+                    (flat_caustic[..., 0] >= xmin)
+                    & (flat_caustic[..., 0] <= xmax)
+                    & (flat_caustic[..., 1] >= ymin)
+                    & (flat_caustic[..., 1] <= ymax)
+                )
+                threatening = (flat_boundary & inside).any(dim=1).to(torch.int32)
+                threat_counts = torch.zeros(
+                    len(times), device=runtime.device, dtype=torch.int32
+                )
+                threat_counts.scatter_add_(
+                    0, flat_frames.to(torch.int64), threatening
+                )
+                ragged_boundary_threats = tuple(
+                    bool(value)
+                    for value in (threat_counts > 0).detach().cpu().tolist()
+                )
+        else:
+            mapped_x, mapped_y = batched.raytrace_ragged(
+                tuple(row[..., 0].reshape(-1) for row in critical_rows),
+                tuple(row[..., 1].reshape(-1) for row in critical_rows),
+            )
+        if ragged_caustics is None:
+            ragged_caustics = tuple(
+                torch.stack((source_x, source_y), dim=-1).reshape_as(critical)
+                for critical, source_x, source_y in zip(
+                    critical_rows,
+                    mapped_x,
+                    mapped_y,
+                    strict=True,
+                )
+            )
+        if source_region is not None and ragged_boundary_threats is None:
             ragged_boundary_threats = tuple(
                 bool(value)
                 for value in torch.stack(
@@ -761,15 +820,23 @@ def caustic_fields_from_far_fields(
                     )
                 )
             else:
-                critical = sparse_marching_batch[0][frame]
-                sparse_boundary = sparse_marching_batch[1][frame]
+                critical = (
+                    sparse_marching_batch[0][frame]
+                    if critical_rows is None
+                    else critical_rows[frame]
+                )
+                sparse_boundary = (
+                    sparse_marching_batch[1][frame]
+                    if boundary_rows is None
+                    else boundary_rows[frame]
+                )
                 rasterizer = "triton_sparse_temporal_compact"
         else:
             det_frame = determinant[frame]
-            if config.determinant_cleanup == "local":
+            if config.minimum_determinant_sign_pixels > 0:
                 det_frame = _clean_small_sign_islands(
                     det_frame,
-                    config.minimum_sign_component_pixels,
+                    config.minimum_determinant_sign_pixels,
                 )
             runtime.synchronize()
             cleanup_seconds += perf_counter() - phase
@@ -813,7 +880,7 @@ def caustic_fields_from_far_fields(
                     else ragged_boundary_threats[frame]
                 ),
             )
-        if source_region is not None and caustic.numel():
+        if source_region is not None and caustic.numel() and not flat_source_filtered:
             keep = _segments_intersecting_region(caustic, source_region)
             critical = critical[keep]
             caustic = caustic[keep]
@@ -851,12 +918,12 @@ def caustic_fields_from_far_fields(
                     "source_region_filtered": bool(source_region is not None),
                     "marching_squares": rasterizer,
                     "determinant_cleanup": (
-                        config.determinant_cleanup
-                        if not sparse
-                        else "sparse_cell_topology"
+                        "local"
+                        if not sparse and config.minimum_determinant_sign_pixels > 0
+                        else ("none" if not sparse else "sparse_cell_topology")
                     ),
-                    "minimum_sign_component_pixels": (
-                        config.minimum_sign_component_pixels
+                    "minimum_determinant_sign_pixels": (
+                        config.minimum_determinant_sign_pixels
                     ),
                     "segment_representation": "independent_linear_segments",
                     # Filled with one batched device transfer after all
@@ -1056,6 +1123,11 @@ def dynamic_labeled_maps(
     times = tuple(float(value) for value in times_days)
     schedule = DynamicConfig() if map_schedule is None else map_schedule
     config = CausticConfig() if caustic_config is None else caustic_config
+    if config.temporal_batch_size is None:
+        inherited_batch = schedule.temporal_batch_size
+        if inherited_batch is None:
+            inherited_batch = 49 if simulation.runtime.device.type == "cuda" else 1
+        config = replace(config, temporal_batch_size=int(inherited_batch))
     caustic_tuning_result = None
     if config.tuning.enabled:
         from ..tuning import autotune_caustics

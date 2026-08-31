@@ -314,7 +314,7 @@ class AstropyOracleTests(unittest.TestCase):
 
 @unittest.skipUnless(
     LENSTRONOMY_AVAILABLE and RUN_LENSTRONOMY,
-    "set MICROCAUSTICS_RUN_LENSTRONOMY=1 for the slow lenstronomy oracle",
+    "set MICROCAUSTICS_RUN_LENSTRONOMY=1 for the lenstronomy oracle",
 )
 class LenstronomyOracleTests(unittest.TestCase):
     def test_macro_deflection_jacobian_and_magnification(self) -> None:

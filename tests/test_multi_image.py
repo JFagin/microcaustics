@@ -240,7 +240,7 @@ class MultiImageTests(unittest.TestCase):
                 jacobian_chunk_size=64,
                 anchor_count=5,
                 gauge_count=7,
-                minimum_safe_gauges=3,
+                minimum_alignment_gauges=3,
             ),
         )
         result = MultiImageSimulation((image,)).multirate_light_curves(
@@ -289,7 +289,7 @@ class MultiImageTests(unittest.TestCase):
                 jacobian_chunk_size=64,
                 anchor_count=5,
                 gauge_count=7,
-                minimum_safe_gauges=3,
+                minimum_alignment_gauges=3,
             ),
         )
         result = MultiImageSimulation((image,)).light_curves(

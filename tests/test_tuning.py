@@ -99,7 +99,6 @@ class AutoTuningTests(unittest.TestCase):
         schedule = mc.DynamicConfig(
             temporal_batch_size=1,
             scout_refresh_frames=2,
-            pad_temporal_batches=False,
             tuning=tuning,
         )
         request = dict(
@@ -145,7 +144,7 @@ class AutoTuningTests(unittest.TestCase):
                 jacobian_chunk_size=64,
                 anchor_count=5,
                 gauge_count=7,
-                minimum_safe_gauges=3,
+                minimum_alignment_gauges=3,
                 tuning=tuning,
             ),
         )

@@ -160,7 +160,7 @@ truncated experiments.
 The recommended observational interface is
 
 ```python
-system = mc.MicrolensingSystem.from_redshifts(
+system = mc.MicrolensingSystem(
     lens_redshift=0.0395,
     source_redshift=1.695,
     H0=70.0,
@@ -204,7 +204,7 @@ system.transfer_functions(...)
 The high-level layer performs setup once and adds no per-frame numerical work.
 Use `keep_maps_at_days=(...)` on a light-curve call to return a small selected
 set of maps directly. Streaming observers remain available when every frame
-must be exported. `system.warmup(...)` performs and returns a representative
+must be exported. `system.warmup_light_curve(...)` performs and returns a representative
 call so compatible compiled kernels can be reused explicitly.
 
 ## Numerical settings
@@ -216,7 +216,7 @@ objects used by the low-level interface.
 
 The default dynamic calculation uses 10 million rays, scout ratio 2,
 refinement 2, virtual refinement 4, the validated Taylor far field, a
-40-frame temporal batch, a ten-frame endpoint-union scout refresh, and the
+49-frame temporal batch, a ten-frame endpoint-union scout refresh, and the
 frame-zero scout-ratio normalization correction. Source-center labels use nine
 anchors and nine gauges on an 8192-square determinant grid.
 

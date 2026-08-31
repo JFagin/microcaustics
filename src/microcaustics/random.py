@@ -18,7 +18,7 @@ def derive_seed(seed: int | None, component: str) -> int | None:
     label = str(component).strip()
     if not label:
         raise ValueError("component must be non-empty")
-    payload = f"microcaustics:{int(seed)}:{label}".encode("utf-8")
+    payload = f"microcaustics:{int(seed)}:{label}".encode()
     return int.from_bytes(
         hashlib.blake2b(payload, digest_size=8).digest(), "little"
     ) & (2**63 - 1)

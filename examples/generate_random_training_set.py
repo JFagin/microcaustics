@@ -19,7 +19,12 @@ import secrets
 from pathlib import Path
 
 import torch
-from training_set_support import generate_labeled_example, random_system, save_example
+from training_set_support import (
+    generate_labeled_example,
+    generate_labeled_examples,
+    random_system,
+    save_example,
+)
 
 
 def _worker(
@@ -43,36 +48,77 @@ def _worker(
         float(args.days) + 0.5 * float(args.source_cadence_days),
         float(args.source_cadence_days),
     )
-    for local_index, index in enumerate(indices):
+    pending = tuple(
+        index
+        for index in indices
+        if args.overwrite or not (output / f"light_curve_{index:05d}.npz").exists()
+    )
+    for index in indices:
         target = output / f"light_curve_{index:05d}.npz"
-        if target.exists() and not args.overwrite:
+        if index not in pending:
             print(f"[worker {worker}] reuse {target.name}", flush=True)
-            continue
-        system = random_system(
-            seed=args.seed + index,
-            device=device,
-            times_days=flux_times,
-            source_resolution=args.source_resolution,
-            label_resolution=args.label_resolution,
+    if not pending:
+        return
+
+    first_index = pending[0]
+    first_system = random_system(
+        seed=args.seed + first_index,
+        device=device,
+        times_days=flux_times,
+        source_resolution=args.source_resolution,
+        label_resolution=args.label_resolution,
+    )
+    first_result, first_centers, first_elapsed = generate_labeled_example(
+        first_system, map_times, flux_times, rays=args.rays
+    )
+    saved = save_example(
+        output, first_index, first_result, first_centers, first_system.source,
+        first_system.metadata, runtime_seconds=first_elapsed, worker=worker,
+    )
+    print(
+        f"[worker {worker} {device}] {saved.name}: {first_elapsed:.3f} s "
+        "(first call, compile + execute)",
+        flush=True,
+    )
+
+    remaining = pending[1:]
+    for start in range(0, len(remaining), args.curves_per_batch):
+        group_indices = remaining[start : start + args.curves_per_batch]
+        group_systems = tuple(
+            random_system(
+                seed=args.seed + index,
+                device=device,
+                times_days=flux_times,
+                source_resolution=args.source_resolution,
+                label_resolution=args.label_resolution,
+            )
+            for index in group_indices
         )
-        result, center_magnifications, elapsed = generate_labeled_example(
-            system, map_times, flux_times, rays=args.rays
+        generated, batch_report = generate_labeled_examples(
+            group_systems,
+            map_times,
+            flux_times,
+            rays=args.rays,
+            curves_per_batch=args.curves_per_batch,
         )
-        saved = save_example(
-            output,
-            index,
-            result,
-            center_magnifications,
-            system.source,
-            system.metadata,
-            runtime_seconds=elapsed,
-            worker=worker,
-        )
-        phase = "first call (compile + execute)" if local_index == 0 else "warmed"
-        print(
-            f"[worker {worker} {device}] {saved.name}: {elapsed:.3f} s ({phase})",
-            flush=True,
-        )
+        for index, system, (result, centers, elapsed) in zip(
+            group_indices, group_systems, generated, strict=True
+        ):
+            metadata = {
+                **system.metadata,
+                "requested_curves_per_batch": batch_report.requested_curves_per_batch,
+                "executed_curve_batch_sizes": batch_report.executed_batch_sizes,
+                "curve_batch_oom_reductions": batch_report.oom_reductions,
+            }
+            saved = save_example(
+                output, index, result, centers, system.source, metadata,
+                runtime_seconds=elapsed, worker=worker,
+            )
+            print(
+                f"[worker {worker} {device}] {saved.name}: {elapsed:.3f} s "
+                f"(warmed, curves_per_batch={args.curves_per_batch})",
+                flush=True,
+            )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -96,12 +142,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rays", type=int, default=10_000_000)
     parser.add_argument("--source-resolution", type=int, default=1024)
     parser.add_argument("--label-resolution", type=int, default=8192)
+    parser.add_argument(
+        "--curves-per-batch",
+        type=int,
+        default=1,
+        help="independent systems evaluated concurrently on each GPU",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
-    if args.count < 1 or args.epochs < 2 or args.source_cadence_days <= 0.0:
+    if (
+        args.count < 1
+        or args.epochs < 2
+        or args.source_cadence_days <= 0.0
+        or args.curves_per_batch < 1
+    ):
         parser.error(
-            "--count and --source-cadence-days must be positive and "
-            "--epochs must be at least two"
+            "--count, --source-cadence-days, and --curves-per-batch must be "
+            "positive and --epochs must be at least two"
         )
     return args
 

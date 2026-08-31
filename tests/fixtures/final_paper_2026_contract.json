@@ -10,8 +10,8 @@
     "flux_path": "map_to_flux",
     "source_box_refresh_frames": 10,
     "source_box_reuse": "two_sided_endpoint_union",
-    "temporal_batch_frames": 40,
-    "caustic_batch_frames": 40,
+    "temporal_batch_frames": 49,
+    "caustic_batch_frames": 49,
     "far_field": {
       "cells_per_axis": 16,
       "exact_radius_cells": 1.0,

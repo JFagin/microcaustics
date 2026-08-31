@@ -434,22 +434,6 @@ def label_caustic_fields(
                 point_chunk_size=config.point_chunk_size,
                 segment_chunk_size=config.segment_chunk_size,
             )
-    float64_replay = bool(config.float64_label_fallback and dtype != torch.float64)
-    if float64_replay:
-        # This opt-in audit path replays only the 19 production queries, not
-        # the determinant grid or caustic extraction. The default production
-        # method remains entirely float32 because the canonical-vertex and
-        # half-open predicates have made this repair unnecessary in tests.
-        counts64, distances64 = _crossing_counts_and_distances_portable(
-            segments.to(torch.float64),
-            valid,
-            anchors.to(torch.float64),
-            crossing_points.to(torch.float64),
-            query_points.to(torch.float64),
-            point_chunk_size=config.point_chunk_size,
-            segment_chunk_size=config.segment_chunk_size,
-        )
-        counts, distances = counts64, distances64
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     label_seconds = perf_counter() - started
@@ -504,7 +488,7 @@ def label_caustic_fields(
                 safe &= torch.isfinite(previous_distance)
                 safe &= previous_distance > config.safe_gauge_distance_uas
             safe &= current_distance > config.safe_gauge_distance_uas
-            if int(safe.sum()) < config.minimum_safe_gauges:
+            if int(safe.sum()) < config.minimum_alignment_gauges:
                 safe = torch.isfinite(current_distance)
             differences = raw_gauges[safe] ^ previous[safe]
             if differences.numel():
@@ -556,7 +540,6 @@ def label_caustic_fields(
                 "center_distance_cap_uas": center_distance_cap_uas,
                 "half_open_vertex_rule": True,
                 "triton_fused_crossing_distance": use_triton,
-                "float64_label_replay": float64_replay,
                 "caustic_segments": field.segment_count,
             },
             timing=TimingBreakdown(

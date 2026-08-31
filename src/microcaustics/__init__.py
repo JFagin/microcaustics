@@ -6,9 +6,14 @@ source, caustic, lens, and relativity subpackages.
 """
 
 from .batching import (
+    IndependentBatchTuningResult,
+    IndependentBatchTuningTrial,
+    IndependentLightCurveBatch,
     StaticMapRequest,
     batched_magnification_maps,
+    batched_system_light_curves,
     batched_system_maps,
+    tune_system_light_curve_batch,
 )
 from .benchmarking import CallableBenchmark, benchmark_callable
 from .config import (
@@ -277,6 +282,9 @@ __all__ = [
     "RuntimeConfig",
     "StaticSource",
     "StaticMapRequest",
+    "IndependentLightCurveBatch",
+    "IndependentBatchTuningTrial",
+    "IndependentBatchTuningResult",
     "SurveyCadence",
     "SourceTrajectory",
     "SourceGeometry",
@@ -337,7 +345,9 @@ __all__ = [
     "solve_macroimages",
     "benchmark_callable",
     "batched_magnification_maps",
+    "batched_system_light_curves",
     "batched_system_maps",
+    "tune_system_light_curve_batch",
     "autotune_caustics",
     "autotune_dynamic_irs",
     "autotune_dynamic_maps",

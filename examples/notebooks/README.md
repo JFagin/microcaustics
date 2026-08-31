@@ -60,7 +60,9 @@ sequence shown below.
   expanding supernovae and arbitrary custom sources.
 - `workflows/` covers multi-image observations, macro-image rendering, a full
   lensed-quasar calculation, streaming/export, and one consolidated dataset
-  notebook with fixed-system and prior-sampled training sets.
+  notebook with fixed-system and prior-sampled training sets. The dataset
+  notebook directly executes `batched_system_light_curves` for independent
+  stellar realizations and also shows the multi-GPU command-line workflow.
 - `validation/` contains the independent Weisenbach and SIM5 comparisons,
   convergence/performance studies, and the analytic single-point-lens test.
 

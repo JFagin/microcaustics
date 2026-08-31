@@ -1,9 +1,11 @@
-"""Batch compatible, scientifically independent static map requests."""
+"""Batch scientifically independent map and light-curve calculations."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 import torch
@@ -12,9 +14,52 @@ from .config import IPMConfig
 from .geometry import PlaneGrid, PlaneRegion
 
 if TYPE_CHECKING:
+    from .config import CausticConfig, DynamicConfig, IRSConfig
     from .results import MagnificationMap
     from .simulation import MicrolensingSimulation
     from .system import MicrolensingRealization, MicrolensingSystem
+
+
+@dataclass(frozen=True)
+class IndependentLightCurveBatch:
+    """Results and execution metadata for independent light curves.
+
+    ``curves_per_batch`` is CUDA concurrency, not the number of sources
+    contracted through one shared magnification-map sequence. Every returned
+    curve was generated from its own :class:`MicrolensingSystem` realization.
+    """
+
+    light_curves: tuple[object, ...]
+    requested_curves_per_batch: int
+    executed_batch_sizes: tuple[int, ...]
+    oom_reductions: int
+    wall_seconds: float
+
+    @property
+    def seconds_per_curve(self) -> float:
+        """Return the amortized wall time per independent light curve."""
+
+        return self.wall_seconds / max(len(self.light_curves), 1)
+
+
+@dataclass(frozen=True)
+class IndependentBatchTuningTrial:
+    """One measured independent-curve concurrency candidate."""
+
+    curves_per_batch: int
+    wall_seconds: float | None
+    seconds_per_curve: float | None
+    peak_memory_bytes: int | None
+    accepted: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class IndependentBatchTuningResult:
+    """Selected concurrency and all trials from representative systems."""
+
+    curves_per_batch: int
+    trials: tuple[IndependentBatchTuningTrial, ...]
 
 
 @dataclass(frozen=True)
@@ -237,3 +282,345 @@ def batched_system_maps(
         method=methods[0],
         batch_size=batch_size,
     )
+
+
+def _is_cuda_oom(error: BaseException) -> bool:
+    """Return whether an exception represents CUDA memory exhaustion."""
+
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(error).lower()
+    return "out of memory" in message and ("cuda" in message or "triton" in message)
+
+
+def _curve_flux(result: object) -> torch.Tensor:
+    curve = getattr(result, "light_curve", result)
+    return torch.as_tensor(curve.flux)
+
+
+def _curve_labels(result: object) -> torch.Tensor | None:
+    labels = getattr(result, "crossing_labels", None)
+    return None if labels is None else torch.as_tensor(labels)
+
+
+def _run_independent_curve(
+    realization: MicrolensingRealization,
+    map_times_days: Sequence[float],
+    flux_times_days: Sequence[float] | None,
+    *,
+    include_labels: bool,
+    method: IPMConfig | IRSConfig | None,
+    schedule: DynamicConfig | None,
+    caustics: CausticConfig | None,
+    map_observer,
+    stream: torch.cuda.Stream | None,
+) -> object:
+    """Execute one independent curve on an optional private CUDA stream."""
+
+    kwargs = {
+        "method": method,
+        "schedule": schedule,
+        "map_observer": map_observer,
+    }
+    if include_labels:
+        kwargs["caustics"] = caustics
+
+    def calculate() -> object:
+        if flux_times_days is None:
+            function = (
+                realization.light_curve_with_labels
+                if include_labels
+                else realization.light_curve
+            )
+            return function(map_times_days, **kwargs)
+        function = (
+            realization.multirate_light_curve_with_labels
+            if include_labels
+            else realization.multirate_light_curve
+        )
+        return function(map_times_days, flux_times_days, **kwargs)
+
+    if stream is None:
+        return calculate()
+    with torch.cuda.device(realization.simulation.runtime.device):
+        with torch.cuda.stream(stream):
+            result = calculate()
+        stream.synchronize()
+    return result
+
+
+def _run_independent_group(
+    realizations: Sequence[MicrolensingRealization],
+    map_times_days: Sequence[float],
+    flux_times_days: Sequence[float] | None,
+    *,
+    include_labels: bool,
+    method: IPMConfig | IRSConfig | None,
+    schedule: DynamicConfig | None,
+    caustics: CausticConfig | None,
+    map_observers: Sequence[object | None],
+) -> tuple[object, ...]:
+    """Run one concurrency group while preserving input order."""
+
+    device = realizations[0].simulation.runtime.device
+    if device.type != "cuda" or len(realizations) == 1:
+        return tuple(
+            _run_independent_curve(
+                realization,
+                map_times_days,
+                flux_times_days,
+                include_labels=include_labels,
+                method=method,
+                schedule=schedule,
+                caustics=caustics,
+                map_observer=observer,
+                stream=None,
+            )
+            for realization, observer in zip(
+                realizations, map_observers, strict=True
+            )
+        )
+    streams = tuple(torch.cuda.Stream(device=device) for _ in realizations)
+    with ThreadPoolExecutor(max_workers=len(realizations)) as executor:
+        futures = tuple(
+            executor.submit(
+                _run_independent_curve,
+                realization,
+                map_times_days,
+                flux_times_days,
+                include_labels=include_labels,
+                method=method,
+                schedule=schedule,
+                caustics=caustics,
+                map_observer=observer,
+                stream=stream,
+            )
+            for realization, observer, stream in zip(
+                realizations, map_observers, streams, strict=True
+            )
+        )
+        return tuple(future.result() for future in futures)
+
+
+def batched_system_light_curves(
+    systems: Sequence[MicrolensingSystem | MicrolensingRealization],
+    map_times_days: Sequence[float],
+    flux_times_days: Sequence[float] | None = None,
+    *,
+    curves_per_batch: int = 1,
+    include_labels: bool = False,
+    method: IPMConfig | IRSConfig | None = None,
+    schedule: DynamicConfig | None = None,
+    caustics: CausticConfig | None = None,
+    map_observers: Sequence[object | None] | None = None,
+    oom_backoff: bool = True,
+) -> IndependentLightCurveBatch:
+    """Generate independent systems concurrently on one CUDA device.
+
+    Every input owns its stellar realization, source and trajectory. Compatible
+    compiled kernels are reused, but no map or physical state is shared. On a
+    CUDA out-of-memory error the current concurrency is halved and retried.
+    CPU and Apple MPS calls retain the same API and execute sequentially.
+
+    Tune ``curves_per_batch`` with :func:`tune_system_light_curve_batch` on
+    representative systems. It is intentionally explicit because the optimum
+    depends on stellar count, map geometry, labels and accelerator memory.
+    """
+
+    systems = tuple(systems)
+    if not systems:
+        raise ValueError("at least one microlensing system is required")
+    requested = int(curves_per_batch)
+    if requested < 1:
+        raise ValueError("curves_per_batch must be positive")
+    realizations = tuple(
+        item if hasattr(item, "simulation") else item.realize() for item in systems
+    )
+    observers = (
+        (None,) * len(realizations)
+        if map_observers is None
+        else tuple(map_observers)
+    )
+    if len(observers) != len(realizations):
+        raise ValueError("map_observers must match the number of systems")
+    device = realizations[0].simulation.runtime.device
+    for realization in realizations[1:]:
+        if realization.simulation.runtime.device != device:
+            raise ValueError("one independent batch must use a single device")
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    start_time = perf_counter()
+    outputs: list[object] = []
+    executed: list[int] = []
+    oom_reductions = 0
+    start = 0
+    current = min(requested, len(realizations))
+    while start < len(realizations):
+        count = min(current, len(realizations) - start)
+        group = realizations[start : start + count]
+        group_observers = observers[start : start + count]
+        try:
+            outputs.extend(
+                _run_independent_group(
+                    group,
+                    map_times_days,
+                    flux_times_days,
+                    include_labels=include_labels,
+                    method=method,
+                    schedule=schedule,
+                    caustics=caustics,
+                    map_observers=group_observers,
+                )
+            )
+            executed.append(count)
+            start += count
+        except BaseException as error:
+            if not oom_backoff or not _is_cuda_oom(error) or count == 1:
+                raise
+            oom_reductions += 1
+            for observer in group_observers:
+                reset = getattr(observer, "reset", None)
+                if callable(reset):
+                    reset()
+            current = max(1, count // 2)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return IndependentLightCurveBatch(
+        light_curves=tuple(outputs),
+        requested_curves_per_batch=requested,
+        executed_batch_sizes=tuple(executed),
+        oom_reductions=oom_reductions,
+        wall_seconds=perf_counter() - start_time,
+    )
+
+
+def tune_system_light_curve_batch(
+    systems: Sequence[MicrolensingSystem | MicrolensingRealization],
+    map_times_days: Sequence[float],
+    flux_times_days: Sequence[float] | None = None,
+    *,
+    candidates: Sequence[int] = (1, 2, 3, 4),
+    include_labels: bool = False,
+    method: IPMConfig | IRSConfig | None = None,
+    schedule: DynamicConfig | None = None,
+    caustics: CausticConfig | None = None,
+    verify_numerics: bool = True,
+    rtol: float = 5.0e-5,
+    atol: float = 5.0e-6,
+) -> IndependentBatchTuningResult:
+    """Benchmark independent-curve concurrency on representative systems.
+
+    The systems should resemble the intended workload. The function reports
+    rejected OOM candidates and verifies fluxes and labels against sequential
+    execution by default. Tuning is never run implicitly by production calls.
+    """
+
+    systems = tuple(systems)
+    values = tuple(dict.fromkeys(int(value) for value in candidates))
+    if not values or any(value < 1 for value in values):
+        raise ValueError("candidates must contain positive integers")
+    common = dict(
+        include_labels=include_labels,
+        method=method,
+        schedule=schedule,
+        caustics=caustics,
+        oom_backoff=False,
+    )
+    # Pay first-call compilation before collecting the sequential reference.
+    batched_system_light_curves(
+        systems,
+        map_times_days,
+        flux_times_days,
+        curves_per_batch=1,
+        **common,
+    )
+    reference = batched_system_light_curves(
+        systems,
+        map_times_days,
+        flux_times_days,
+        curves_per_batch=1,
+        **common,
+    )
+    trials: list[IndependentBatchTuningTrial] = []
+    for candidate in values:
+        device = (
+            systems[0].simulation.runtime.device
+            if hasattr(systems[0], "simulation")
+            else systems[0].realize().simulation.runtime.device
+        )
+        try:
+            if candidate != 1:
+                batched_system_light_curves(
+                    systems,
+                    map_times_days,
+                    flux_times_days,
+                    curves_per_batch=candidate,
+                    **common,
+                )
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            measured = (
+                reference
+                if candidate == 1
+                else batched_system_light_curves(
+                    systems,
+                    map_times_days,
+                    flux_times_days,
+                    curves_per_batch=candidate,
+                    **common,
+                )
+            )
+            accepted = True
+            reason = None
+            if verify_numerics:
+                for expected, actual in zip(
+                    reference.light_curves, measured.light_curves, strict=True
+                ):
+                    if not torch.allclose(
+                        _curve_flux(expected), _curve_flux(actual), rtol=rtol, atol=atol
+                    ):
+                        accepted = False
+                        reason = "flux verification failed"
+                        break
+                    expected_labels = _curve_labels(expected)
+                    actual_labels = _curve_labels(actual)
+                    if expected_labels is not None and not torch.equal(
+                        expected_labels, actual_labels
+                    ):
+                        accepted = False
+                        reason = "label verification failed"
+                        break
+            peak = (
+                int(torch.cuda.max_memory_allocated(device))
+                if device.type == "cuda"
+                else None
+            )
+            trials.append(
+                IndependentBatchTuningTrial(
+                    candidate,
+                    measured.wall_seconds,
+                    measured.seconds_per_curve,
+                    peak,
+                    accepted,
+                    reason,
+                )
+            )
+        except BaseException as error:
+            if not _is_cuda_oom(error):
+                raise
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            trials.append(
+                IndependentBatchTuningTrial(
+                    candidate, None, None, None, False, "CUDA out of memory"
+                )
+            )
+    accepted_trials = [trial for trial in trials if trial.accepted]
+    if not accepted_trials:
+        raise RuntimeError("no independent-curve batch candidate was accepted")
+    selected = min(accepted_trials, key=lambda trial: trial.seconds_per_curve)
+    return IndependentBatchTuningResult(selected.curves_per_batch, tuple(trials))

@@ -450,8 +450,8 @@ def broken_power_law_driving_signal(
     times_days: torch.Tensor | Sequence[float],
     *,
     break_timescale_days: float = 200.0,
-    low_frequency_slope: float = 1.0,
-    high_frequency_slope: float = 3.0,
+    alpha_L: float = 1.0,
+    alpha_R: float = 3.0,
     mean_amplitude: float | Sequence[float] | torch.Tensor = 1.0,
     standard_deviation: float | Sequence[float] | torch.Tensor = 0.3,
     seed: int | None = None,
@@ -459,12 +459,16 @@ def broken_power_law_driving_signal(
     dtype: torch.dtype = torch.float64,
     device: torch.device | str = "cpu",
 ) -> TabulatedDrivingSignal:
-    """Generate the paper's padded lognormal broken-PSD driving signal."""
+    """Generate a padded lognormal broken-power-law driving signal.
+
+    ``alpha_L`` and ``alpha_R`` are the positive low- and high-frequency PSD
+    slopes on the two sides of the break.
+    """
 
     psd = BrokenPowerLawPSD(
         break_timescale_days=break_timescale_days,
-        low_frequency_slope=low_frequency_slope,
-        high_frequency_slope=high_frequency_slope,
+        low_frequency_slope=alpha_L,
+        high_frequency_slope=alpha_R,
     )
     sample_count = int(torch.as_tensor(times_days).numel())
     return driving_signal_from_psd(

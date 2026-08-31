@@ -47,7 +47,7 @@ observational widths in microarcseconds without manual unit conversion. Give
 the trajectory and duration to the system when a source also moves:
 
 ```python
-system = mc.MicrolensingSystem.from_redshifts(
+system = mc.MicrolensingSystem(
     lens_redshift=0.04,
     source_redshift=1.7,
     macro=macro,
@@ -86,7 +86,7 @@ source = mc.ExpandingPhotosphereSource(
     band_names=("blue", "middle", "red"),
     maximum_observer_time_days=180.0,
     evolution=evolution,
-    resolution=256,
+    source_grid_shape=256,
 )
 ```
 
@@ -135,8 +135,8 @@ PSD, not a damped random walk:
 signal = mc.broken_power_law_driving_signal(
     regularly_sampled_times,
     break_timescale_days=200.0,
-    low_frequency_slope=1.0,
-    high_frequency_slope=3.0,
+    alpha_L=1.0,
+    alpha_R=3.0,
     standard_deviation=0.3,
     seed=17,
 )
@@ -259,9 +259,9 @@ pixelization. They choose a conservative angular field when passed to
 source = mc.ThinDiskModel(
     black_hole_mass_solar=1.0e9,
     eddington_ratio=0.1,
-    bands={"blue": 4800.0, "red": 9700.0},  # Angstrom
+    bands_angstrom={"blue": 4800.0, "red": 9700.0},
     inclination_deg=45.0,
-    resolution=1024,
+    source_grid_shape=1024,
     enclosed_flux_fraction=0.999,
     source_margin=1.05,
 )

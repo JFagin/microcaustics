@@ -22,7 +22,7 @@ source = mc.ExpandingPhotosphereSource(
     band_names=("g", "r", "i"),
     maximum_observer_time_days=180.0,
     evolution=evolution,
-    resolution=256,
+    source_grid_shape=256,
 )
 
 observer_times = torch.arange(0.0, 181.0)

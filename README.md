@@ -118,7 +118,8 @@ microcaustics doctor
 
 For a timing or validation run that must not silently fall back to PyTorch,
 request `RuntimeConfig(device="cuda", backend="triton", dtype="float32",
-strict_backend=True)`. See the
+strict_backend=True)`. The default CUDA memory ceiling is 95 percent, and
+lossless OOM recovery reduces chunks or splits batches when necessary. See the
 [portability and troubleshooting guide](docs/portability_and_troubleshooting.md)
 for cache, compiler, first-call timing, and out-of-memory guidance.
 
@@ -185,19 +186,19 @@ macro = mc.MacroLens(
 source = mc.KerrDiskModel(
     black_hole_mass_solar=10.0**9.08,
     eddington_ratio=0.34,
-    bands={"u": 3671, "g": 4827, "r": 6223,
-           "i": 7546, "z": 8691, "y": 9712},  # Angstrom
+    bands_angstrom={"u": 3671, "g": 4827, "r": 6223,
+                     "i": 7546, "z": 8691, "y": 9712},
     spin=0.74,
     inclination_deg=10.0,
     position_angle_deg=175.0,
     lamp_fraction=0.1,
     corona_height_above_isco_rg=20.0,
-    resolution=1024,
+    source_grid_shape=1024,          # pixels per source-plane axis
     enclosed_flux_fraction=0.999,
     source_margin=1.05,
 )
 
-kinematics = mc.SkyProjectedKinematics.sampled(
+kinematics = mc.SkyProjectedKinematics(
     ra_deg=340.126125,
     dec_deg=3.358611,
     peculiar_velocity_dispersion_km_s=235.0,
@@ -210,32 +211,26 @@ population = mc.StellarPopulation.salpeter(
     kinematics=kinematics,
 )
 
-system = mc.MicrolensingSystem.from_redshifts(
+system = mc.MicrolensingSystem(
     lens_redshift=lens_redshift,
     source_redshift=source_redshift,
     H0=70.0,                         # km s^-1 Mpc^-1
-    Om0=0.3,
+    Om0=0.3,                         # present-day matter density
     macro=macro,
     source=source,
     stellar_population=population,
     integration_domain="scout",     # "scout", "full", or "rectangle"
-    light_loss=0.01,
-    safety_scale=1.5,
-    stellar_motion_sigma_margin=5.0,
+    light_loss=0.01,                 # stellar-aperture truncation tolerance
+    safety_scale=1.5,                # expand the derived circular star field
+    stellar_motion_sigma_margin=5.0, # motion allowance over the full duration
     seed=1001,
-    caustic_grid_shape=8192,
-    runtime=mc.RuntimeConfig(
-        device="auto",               # CUDA, MPS, or CPU
-        backend="auto",              # Triton, compiled Torch, or eager Torch
-        dtype=torch.float32,
-        profiling="off",             # no timing-only synchronization
-    ),
+    caustic_grid_shape=8192,         # detA pixels per axis for labels
 )
 ```
 
-The redshift constructor evaluates a flat matter-plus-cosmological-constant
-geometry directly with Torch float32. Supply an external Astropy cosmology or
-an explicit `LensingDistances` object for a different expansion history. The
+The system evaluates a flat matter-plus-cosmological-constant geometry in
+Torch float32. Supply an explicit `LensingDistances` object for a different
+expansion history. The
 stellar-realization and peculiar-velocity seeds are separate, so both random
 processes remain independently reproducible.
 
@@ -249,7 +244,7 @@ and resource scale with `system.summary(duration_days=3650)`. The returned
 dictionary can also be validated programmatically, and the call performs no
 simulation.
 
-`resolution` is the number of source pixels per axis, not a physical source
+`source_grid_shape` is the number of source pixels per axis, not a physical source
 size. Quasar models derive their angular field from the black-hole, accretion,
 wavelength, inclination, redshift, and enclosed-flux settings.
 Expanding-supernova models derive it from the largest photospheric radius over
@@ -298,27 +293,48 @@ endpoint-union scout reuse, and aligned source-center labels.
 
 ```python
 
-result = system.light_curve_with_labels(
+microlensing_only = system.light_curve_with_labels(
     duration_days=3650,
     map_cadence_days=25,
-    source_cadence_days=1,
     keep_maps_at_days=(0.0,),
 )
 
-light_curve = result.light_curve
-map_at_day_zero = result.maps[0.0]
-print(light_curve.flux)               # [3651, 6], daily source evolution
-print(result.crossing_labels)         # source-center parity
-print(result.crossing_events)         # label transitions
-print(result.center_distances_uas)    # nearest-caustic distance
+map_at_day_zero = microlensing_only.maps[0.0]
+print(microlensing_only.light_curve.flux)  # 147 map epochs by 6 bands
+print(microlensing_only.crossing_labels)   # source-center parity
+print(microlensing_only.crossing_events)   # label transitions
+print(microlensing_only.center_distances_uas)
 print(map_at_day_zero.values)         # [1024, 1024]
 
 figure, ax = mcp.plot_light_curve(
-    light_curve,
+    microlensing_only.light_curve,
     bands=("i",),
     normalize=True,
     show_unlensed=True,
     title="Q2237 image B-like light curve",
+)
+```
+
+Intrinsic variability can be evaluated daily while the dynamic maps remain
+on the faster 25-day cadence. The two PSD slopes are explicit user controls.
+
+```python
+driver_times = torch.arange(0.0, 3651.0, 1.0)
+driver = mc.broken_power_law_driving_signal(
+    driver_times,
+    break_timescale_days=200.0,  # PSD break timescale
+    alpha_L=1.0,                 # low-frequency PSD slope
+    alpha_R=3.0,                 # high-frequency PSD slope
+    standard_deviation=0.10,     # fractional driving variability
+    seed=3001,
+    extrapolation="hold",        # hold the endpoint over small delay offsets
+)
+
+variable_system = system.with_source(source.with_driving_signal(driver))
+combined = variable_system.light_curve_with_labels(
+    duration_days=3650,
+    map_cadence_days=25,         # microlensing map cadence
+    source_cadence_days=1,       # intrinsic source cadence
 )
 ```
 
@@ -329,52 +345,40 @@ value for accuracy, speed, memory, or convergence studies.
 ```python
 far_field = mc.FarFieldApproxConfig(
     enabled=True,
-    cells_per_axis=16,          # local exact/far membership partition
-    nodes_per_cell_axis=8,      # Taylor evaluation lattice within each cell
-    exact_radius_cells=1.0,     # neighboring cells evaluated exactly
-    taylor_order=4,
-    center_translation_order=10,
+    cells_per_axis=16,           # far-field spatial partition
+    nodes_per_cell_axis=8,       # evaluation nodes per partition cell
+    exact_radius_cells=1.0,      # larger values trace more nearby stars exactly
+    taylor_order=4,              # higher values improve the far-star expansion
+    center_translation_order=10, # accuracy when translating cell expansions
 )
 
 method = mc.production_ipm_config(
     rays=10_000_000,            # N
-    scout_ratio=2,              # k
-    refinement=2,               # r, true lens-equation refinement
-    virtual_refinement=4,       # v, interpolated polygon refinement
-    scout_halo_pixels=0.0,
-    scout_dilation_cells=1,
-    scout_trace_centers=True,
+    scout_ratio=2,               # k, lower values use a denser scout
+    refinement=2,                # r, true lens-equation refinement
+    virtual_refinement=4,        # v, interpolated polygon refinement
+    scout_halo_pixels=0.0,       # optional source-pixel coverage halo
+    scout_dilation_cells=1,      # conservative neighboring-cell expansion
     dual_scout_scalar_correction=True,  # one-time k=1 to k=2 correction
-    cell_chunk_size=524_288,
+    cell_chunk_size=524_288,     # lower this to reduce peak memory
     far_field_approx=far_field,
 )
 
 schedule = mc.production_dynamic_config(
-    temporal_batch_size=40,
-    light_curve_batch_size=None,  # autotune independent light-curve batches
-    fused_temporal_ipm=True,
-    pad_temporal_batches=True,
-    scout_refresh_frames=10,
-    endpoint_union=True,
-    reuse_static_maps=True,
-    minimum_cell_chunk_size=1_024,
+    temporal_batch_size=30,      # optimized for the combined LC + label path
+    light_curve_batch_size=None,  # optional sources sharing this map sequence
+    fused_temporal_ipm=True,     # disable only for implementation validation
+    scout_refresh_frames=10,     # lower for more frequent scout refreshes
 )
 
 labels = mc.CausticConfig(
     far_field_approx=far_field,
-    temporal_batch_size=40,
-    jacobian_chunk_size=1_048_576,
-    determinant_cleanup="local",
-    minimum_sign_component_pixels=4,
-    anchor_count=9,
+    # Labels inherit the shared 30-frame map batch. LC-only calls use the
+    # 49-frame production preset because they omit detA and marching squares.
+    anchor_count=9,              # more points add alignment redundancy
     gauge_count=9,
-    anchor_inset_fraction=0.05,
-    gauge_inset_fraction=0.08,
-    anchor_radial_jitter_fraction=0.01,
-    gauge_radial_jitter_fraction=0.01,
-    minimum_safe_gauges=3,
-    weighted_temporal_alignment=True,
-    float64_label_fallback=False,
+    minimum_determinant_sign_pixels=4,  # remove unresolved sign islands
+    minimum_alignment_gauges=3, # minimum trusted temporal alignment set
 )
 
 explicit_result = system.light_curve_with_labels(
@@ -388,11 +392,11 @@ explicit_result = system.light_curve_with_labels(
 )
 ```
 
-The short call inherits `far_field` from the method and the temporal batch size
-from the schedule. The expanded example repeats them intentionally so every
-effective value is visible and the three configurations can be modified
-independently. Lower-level label query and Triton chunk controls remain
-available in `CausticConfig` for unusual workloads.
+The short labeled call uses a shared 30-frame map and label batch. An LC-only
+call uses the 49-frame production preset. The expanded example repeats the
+settings intentionally so every effective value is visible. Lower-level label
+query and Triton chunk controls remain available in `CausticConfig` for
+unusual workloads.
 
 Only the requested day-zero map is retained. The other full-resolution maps
 are streamed through the finite-source photometry and label calculation rather
@@ -408,8 +412,7 @@ An explicit warmup can separate first-call compilation from production work.
 
 ```python
 # Use a representative temporal batch so the production batch shape is warm.
-warmup_times = torch.arange(0.0, 40.0 * 25.0, 25.0)
-system.warmup(warmup_times, labels=True)
+system.warmup_light_curve(labels=True)
 
 # Subsequent compatible calls reuse the realization and warmed kernels.
 next_result = system.light_curve_with_labels(
@@ -419,9 +422,11 @@ next_result = system.light_curve_with_labels(
 ```
 
 `system.light_curves(...)` batches multiple sources or trajectories through a
-shared map sequence. `batched_system_maps(...)` batches unrelated static
-systems without sharing their stars. Both interfaces reuse compatible compiled
-kernels instead of recompiling for every realization.
+shared map sequence. This is what `light_curve_batch_size` controls.
+`batched_system_maps(...)` batches unrelated static systems without sharing
+their stars. `batched_system_light_curves(...)` runs complete independent
+systems concurrently. All three interfaces reuse compatible compiled kernels
+instead of recompiling for every realization.
 
 Independent stellar realizations of the same macroimage can be generated
 together. Each seed produces a new star field. Compatible Triton or
@@ -434,6 +439,27 @@ maps = mc.batched_system_maps(
     batch_size=8,  # automatically reduced if necessary to avoid an OOM
 )
 ```
+
+The same systems can produce independent dynamic light curves. Each retains
+its own stars, source, trajectory, variability, maps, and labels.
+
+```python
+batch = mc.batched_system_light_curves(
+    systems,
+    map_times_days=range(0, 3651, 25),
+    flux_times_days=range(0, 3651),
+    curves_per_batch=3,  # complete independent systems, not shared maps
+    include_labels=True,
+)
+curves = batch.light_curves
+print(batch.seconds_per_curve, batch.executed_batch_sizes)
+```
+
+CUDA memory exhaustion reduces only the active concurrency and retries the
+same numerical calculation. The best concurrency depends on the star count,
+map geometry, labels, and GPU. It can be measured explicitly with
+`mc.tune_system_light_curve_batch(..., candidates=(1, 2, 3, 4))`. Tuning is
+not run silently during production.
 
 Different convergence, shear, redshift, stellar, trajectory, variability, and
 disk parameter values also reuse an existing compatible kernel specialization.
@@ -484,6 +510,8 @@ The main accuracy and throughput controls in the example are listed below.
 | `FarFieldApproxConfig` | Local partition, exact-neighbor radius, Taylor order, and node resolution |
 | `scout_refresh_frames` | Number of dynamic epochs sharing an endpoint-union scout selection |
 | `temporal_batch_size` | Number of consecutive maps processed by one fused temporal batch |
+| `light_curve_batch_size` | Number of sources or trajectories sampled from one shared map sequence |
+| `curves_per_batch` | Number of complete independent systems run concurrently on one GPU |
 | `cell_chunk_size` | Maximum spatial work chunk before automatic memory backoff |
 | `caustic_grid_shape` | Resolution of determinant, critical-curve, and source-center-label products |
 
@@ -588,14 +616,6 @@ Operational guides cover [method selection](docs/choosing_methods.md),
 [streaming data products](docs/data_products.md). The final notebooks turn
 method selection and export into executable CUDA-aware workflows.
 
-Build the complete documentation site, including the API generated from
-tested source docstrings. It includes the following commands.
-
-```bash
-python -m pip install -e ".[docs]"
-mkdocs build --strict
-```
-
 Custom bands, pixelated sources, and intrinsic variability are described in
 [`docs/sources.md`](docs/sources.md). Source evaluation remains independent of
 map cadence and of the selected microlensing solver. The configurable
@@ -611,13 +631,23 @@ stellar population, and measured arrival delays only once.
 ```python
 system = mc.MultiImageSystem(
     images={"A": macro_a, "B": macro_b, "C": macro_c, "D": macro_d},
-    distances=distances,
+    lens_redshift=lens_redshift,
+    source_redshift=source_redshift,
+    H0=70.0,
+    Om0=0.3,
     source=source,
     stellar_population=stellar_population,
     arrival_time_delays_days={"A": 0.0, "B": 7.4, "C": 2.1, "D": 11.8},
     seed=1001,
 )
-curves = system.light_curves(
+microlensing_only = system.light_curves(
+    duration_days=3650,
+    map_cadence_days=25,
+    include_labels=True,
+)
+
+variable_system = system.with_source(source.with_driving_signal(driver))
+microlensing_and_variability = variable_system.light_curves(
     duration_days=3650,
     map_cadence_days=25,
     source_cadence_days=1,

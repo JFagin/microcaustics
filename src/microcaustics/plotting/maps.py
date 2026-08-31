@@ -305,7 +305,8 @@ def plot_caustic_diagnostics(
     """
 
     require_matplotlib()
-    from matplotlib import colormaps, pyplot as plt
+    from matplotlib import colormaps
+    from matplotlib import pyplot as plt
     from matplotlib.colors import BoundaryNorm
 
     products = (label_map, distance_map, winding_map)

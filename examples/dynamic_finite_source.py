@@ -61,7 +61,6 @@ light_curve = system.light_curve(
         temporal_batch_size=3,
         fused_temporal_ipm=True,
         scout_refresh_frames=3,
-        endpoint_union=True,
     ),
 )
 

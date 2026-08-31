@@ -79,7 +79,7 @@ curves = simulation.light_curves(
     requests,
     method=ipm,
     schedule=mc.DynamicConfig(
-        temporal_batch_size=40,
+        temporal_batch_size=49,
         light_curve_batch_size=8,
     ),
 )
@@ -99,12 +99,10 @@ lens state. The scheduler calculates one map and reuses its tensor exactly.
 
 For a moving tiled-IPM field, `scout_refresh_frames > 1` is an explicit
 approximation. Scouts are evaluated at the beginning and end of each interval.
-with `endpoint_union=True`, all fine cells selected by either endpoint are
-retained throughout the interval. A refresh value of one recomputes the scout
-at every frame and disables temporal scout reuse. Setting
-`endpoint_union=False` also evaluates every real frame's scout and uses their
-conservative union within the fused batch. Full-field IPM and IRS do not use
-scout reuse.
+All fine cells selected by either endpoint are retained throughout the
+interval. This coverage safeguard is always active. A refresh value of one
+recomputes the scout at every frame and disables temporal scout reuse.
+Full-field IPM and IRS do not use scout reuse.
 
 The far-field approximation constructs the local-star packs and complete coefficient
 tables independently at every map epoch. Multiple epochs can share a batched
@@ -123,7 +121,7 @@ the minimum spatial chunk still does not fit, the temporal batch is split and
 retried. This second backoff is also lossless.
 
 `temporal_batch_size` defines the fused map shape and source-evaluation batch.
-When it is omitted, CUDA uses the validated paper batch of 40 while portable
+When it is omitted, CUDA uses the validated paper batch of 49 while portable
 devices stream one frame at a time. Enable `AutoTuningConfig` explicitly to
 benchmark alternative temporal and spatial work sizes. See
 [`tuning.md`](tuning.md). A user-supplied value is honored when tuning is
@@ -132,6 +130,13 @@ disabled, unless lossless OOM backoff must split it.
 single map-sampling call. Compile, warmup, and steady-state timing remain
 separate. The current package only reports a fused operation when the
 underlying solver actually executes one.
+
+This shared-map source batching is distinct from independent-system
+concurrency. Use `batched_system_light_curves` when every curve has its own
+stellar realization, macro lens, source, and map sequence. Its explicit
+`curves_per_batch` value controls how many complete systems run concurrently
+on one CUDA device. Lossless OOM backoff halves that concurrency and retries.
+CPU and Apple MPS retain the same interface and execute systems sequentially.
 
 ## Paper production and conservative reference modes
 
@@ -144,7 +149,7 @@ schedule = mc.production_dynamic_config()
 ```
 
 This resolves to $N=10^7$, $k=2$, $r=2$, $v=4$, a 16-by-16 local-membership
-partition with 8-by-8 Taylor nodes per cell, temporal batch 40, and refresh-10
+partition with 8-by-8 Taylor nodes per cell, temporal batch 49, and refresh-10
 endpoint-union scouting. It uses no source-pixel halo
 (`scout_halo_pixels=0`) and retains one lens-plane scout-cell support ring
 (`scout_dilation_cells=1`). The dual-scout option performs the frame-zero `k=1`

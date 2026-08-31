@@ -15,7 +15,7 @@ tuning = mc.AutoTuningConfig(
     enabled=True,
     temporal_candidates=(8, 16, 24, 32, 40, 49),
     spatial_candidates=(131_072, 262_144, 524_288, 1_048_576),
-    memory_fraction=0.85,
+    memory_fraction=0.95,
 )
 
 schedule = mc.DynamicConfig(tuning=tuning)
@@ -98,3 +98,30 @@ For explicit experiments, `mc.autotune_dynamic_maps`,
 `mc.autotune_caustics` return a `TuningResult` containing every `TuningTrial`.
 Leaving `AutoTuningConfig.enabled=False` uses the supplied work sizes exactly
 and incurs no tuning overhead.
+
+## Independent-system concurrency
+
+`AutoTuningConfig` optimizes work inside one light curve. Independent systems
+have a separate opt-in tuner because their best concurrency depends strongly
+on stellar count, source geometry, labels, and available GPU memory.
+
+```python
+tuned = mc.tune_system_light_curve_batch(
+    representative_systems,
+    map_times_days,
+    flux_times_days,
+    candidates=(1, 2, 3, 4),
+    include_labels=True,
+)
+batch = mc.batched_system_light_curves(
+    systems,
+    map_times_days,
+    flux_times_days,
+    curves_per_batch=tuned.curves_per_batch,
+    include_labels=True,
+)
+```
+
+The tuner verifies fluxes and labels against sequential execution and rejects
+CUDA OOM candidates. Use systems representative of the intended dataset. The
+selected value is not treated as universal and is never applied implicitly.

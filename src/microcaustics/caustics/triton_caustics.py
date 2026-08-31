@@ -272,8 +272,10 @@ if triton is not None:
         negative_b_ptr,
         segments_ptr,
         boundaries_ptr,
+        segment_frames_ptr,
         n_cells,
         cells_per_frame,
+        STORE_FRAMES: tl.constexpr,
         EPS: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
@@ -329,6 +331,12 @@ if triton is not None:
                 tl.where(use_negative, tl.load(negative_b_ptr + pair), edge_b),
             )
             output = output_start + pair
+            if STORE_FRAMES:
+                tl.store(
+                    segment_frames_ptr + output,
+                    cell // cells_per_frame,
+                    mask=valid_pair,
+                )
             for endpoint in tl.static_range(2):
                 edge = tl.where(endpoint == 0, edge_a, edge_b)
                 af = tl.where(
@@ -611,10 +619,12 @@ def sparse_marching_squares_zero_triton(
         negative_b,
         segments,
         boundaries,
+        counts,
         cells,
         cells,
         EPS=1.0e-12,
         BLOCK=block,
+        STORE_FRAMES=False,
         num_warps=8,
     )
     return segments, boundaries
@@ -630,7 +640,9 @@ def batched_sparse_marching_squares_zero_triton(
     y0: torch.Tensor,
     y1: torch.Tensor,
     edge_boundary: torch.Tensor,
-) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+    *,
+    return_flat: bool = False,
+):
     """Compact a temporal batch sharing one selected-cell geometry."""
 
     if not triton_caustics_available() or f0.device.type != "cuda":
@@ -656,6 +668,7 @@ def batched_sparse_marching_squares_zero_triton(
     total = int(sum(totals_cpu))
     segments = torch.empty((total, 2, 2), device=f0.device, dtype=f0.dtype)
     boundaries = torch.empty((total, 2), device=f0.device, dtype=torch.bool)
+    frame_indices = torch.empty(total, device=f0.device, dtype=torch.int32)
     if total:
         tables = _marching_tables(f0.device)
         pair_a, pair_b = tables[:2]
@@ -677,10 +690,12 @@ def batched_sparse_marching_squares_zero_triton(
             negative_b,
             segments,
             boundaries,
+            frame_indices,
             total_cells,
             cells_per_frame,
             EPS=1.0e-12,
             BLOCK=block,
+            STORE_FRAMES=bool(return_flat),
             num_warps=8,
         )
     segment_frames = []
@@ -691,4 +706,7 @@ def batched_sparse_marching_squares_zero_triton(
         segment_frames.append(segments[start:stop])
         boundary_frames.append(boundaries[start:stop])
         start = stop
-    return tuple(segment_frames), tuple(boundary_frames)
+    rows = (tuple(segment_frames), tuple(boundary_frames))
+    if return_flat:
+        return (*rows, segments, boundaries, frame_indices, tuple(map(int, totals_cpu)))
+    return rows

@@ -894,6 +894,71 @@ class BatchedTaylorFarFieldApproximation:
             tuple(value[1] for value in mapped),
         )
 
+    def raytrace_indexed_flat(
+        self,
+        x_uas: torch.Tensor,
+        y_uas: torch.Tensor,
+        frame_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Trace a compact queue carrying one temporal frame index per point.
+
+        The production caustic pipeline uses this handoff directly after
+        sparse marching. It avoids reconstructing and concatenating ragged
+        per-frame endpoint buffers before evaluating the far field.
+        """
+
+        runtime = self.simulation.runtime
+        x = torch.as_tensor(
+            x_uas,
+            device=runtime.device,
+            dtype=runtime.dtype,
+        ).reshape(-1)
+        y = torch.as_tensor(
+            y_uas,
+            device=runtime.device,
+            dtype=runtime.dtype,
+        ).reshape(-1)
+        frames = torch.as_tensor(
+            frame_index,
+            device=runtime.device,
+            dtype=torch.int32,
+        ).reshape(-1)
+        if x.shape != y.shape or x.shape != frames.shape:
+            raise ValueError("flat x, y, and frame-index queues must match")
+        if x.numel() == 0:
+            return x.clone(), y.clone()
+        self._validate_points(x, y)
+        if bool(torch.any((frames < 0) | (frames >= self.frame_count))):
+            raise ValueError("flat queue frame indices are out of range")
+        if self._use_triton():
+            from .triton_taylor import evaluate_far_field_p4_indexed_triton
+
+            try:
+                return evaluate_far_field_p4_indexed_triton(
+                    self,
+                    x,
+                    y,
+                    frames,
+                )
+            except Exception as error:
+                if runtime.strict_backend:
+                    raise
+                warn_backend_fallback(
+                    "indexed Triton far-field approximation ray tracing",
+                    error,
+                )
+
+        mapped_x = torch.empty_like(x)
+        mapped_y = torch.empty_like(y)
+        for frame, far_field in enumerate(self.far_fields):
+            selected = frames == frame
+            if not bool(torch.any(selected)):
+                continue
+            frame_x, frame_y = far_field.raytrace(x[selected], y[selected])
+            mapped_x[selected] = frame_x
+            mapped_y[selected] = frame_y
+        return mapped_x, mapped_y
+
     def jacobian_determinant(self, x_uas, y_uas) -> torch.Tensor:
         """Evaluate analytic Jacobian determinants for every temporal frame."""
 

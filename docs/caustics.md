@@ -30,8 +30,9 @@ construction:
   adjacent epochs.
 
 Before extraction, the default local 3×3 sign-island cleanup removes only
-unresolved one/few-pixel detA speckles (`minimum_sign_component_pixels=4`).
-Set `determinant_cleanup="none"` for a literal determinant contour audit.
+unresolved one- or few-pixel detA speckles. The setting
+`minimum_determinant_sign_pixels=4` controls this threshold. Set it to zero
+for a literal determinant contour audit.
 
 The zero/one naming is conventional. A transition in `center_label`, reported
 as `center_crossing`, is the physical crossing observable. `center_vote_count`
@@ -41,17 +42,18 @@ decision.
 Nine anchors and nine gauges are validated paper defaults, not hard-coded
 limits. `anchor_count` and `gauge_count` are independent positive integers.
 increasing them adds redundant paths and decreasing them reduces label work.
-The configured `minimum_safe_gauges` must not exceed `gauge_count`.
+The configured `minimum_alignment_gauges` must not exceed `gauge_count`.
 
 High-level `MicrolensingSystem` calls do not require a `CausticConfig`. When it
-is omitted, labels inherit the map method's far-field approximation and the
-dynamic schedule's temporal batch size. Construct this configuration only to
-change label-specific controls or when using the low-level simulation API.
+is omitted, labels inherit both the map method's far-field approximation and
+the light-curve temporal batch. Construct this configuration only to change
+label-specific controls, to override the label batch, or when using the
+low-level simulation API.
 
 ```python
 caustic_config = mc.CausticConfig(
     far_field_approx=ipm.far_field_approx,
-    temporal_batch_size=40,
+    temporal_batch_size=32,  # optional label-specific override
 )
 
 frames = simulation.dynamic_labeled_caustics(
@@ -84,7 +86,7 @@ result = simulation.light_curve_with_labels(
     source,
     distances,
     method=ipm,
-    map_schedule=mc.DynamicConfig(temporal_batch_size=40),
+    map_schedule=mc.DynamicConfig(temporal_batch_size=30),
     caustic_config=caustic_config,
 )
 
@@ -120,10 +122,9 @@ Pass `diagnostic_grid=` to materialize the full anchor/gauge majority map and
 These options are intended for validation and animations, not center-only
 production labels.
 
-`CausticConfig(float64_label_fallback=True)` replays the small label-query set
-in float64 after float32 caustic extraction. It is off by default. Canonical
-shared vertices, half-open predicates, and invalid-component vote masks are the
-production fix, while float64 replay remains an explicit audit option.
+Canonical shared vertices, half-open predicates, and invalid-component vote
+masks make the label query stable in the solver dtype. A second float64 label
+replay is therefore not part of the production or public configuration.
 
 Signed winding numbers require consistently oriented closed segments. Parity
 labels do not require orientation, but both quantities require a complete

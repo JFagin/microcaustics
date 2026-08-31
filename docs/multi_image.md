@@ -13,7 +13,7 @@ images = {
     "D": mc.MacroLens(convergence=0.64, shear=0.62, shear_angle_deg=80.21),
 }
 
-system = mc.MultiImageSystem.from_redshifts(
+system = mc.MultiImageSystem(
     lens_redshift=0.0395,
     source_redshift=1.695,
     H0=70.0,

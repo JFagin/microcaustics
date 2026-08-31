@@ -110,7 +110,6 @@ class SolverDTypeAndReproducibilityTests(unittest.TestCase):
         schedule = mc.DynamicConfig(
             temporal_batch_size=2,
             scout_refresh_frames=1,
-            reuse_static_maps=False,
         )
         first = tuple(
             frame.values.clone()
@@ -160,7 +159,7 @@ class LongCudaStabilityTests(unittest.TestCase):
             ),
         )
         schedule = mc.DynamicConfig(
-            temporal_batch_size=4, scout_refresh_frames=2, endpoint_union=True
+            temporal_batch_size=4, scout_refresh_frames=2
         )
 
         def run_once() -> None:

@@ -18,7 +18,7 @@ python examples/static_ipm_map.py
 - `dynamic_finite_source.py` combines moving maps with a finite source.
 - `dynamic_labels.py` adds source-center caustic labels to a dynamic sequence.
 - `automatic_tuning.py` selects safe temporal and spatial batch sizes.
-- `batched_light_curves.py` batches independent light curves.
+- `batched_light_curves.py` batches several sources through one shared map sequence.
 
 The static scripts expose grids and lens regions directly because they also
 serve as compact examples of the lower-level API. The first getting-started
@@ -47,6 +47,9 @@ lens geometry.
 
 Both dataset commands accept one or more CUDA device indices. Each worker stays
 alive across several realizations so compatible compiled kernels are reused.
+`--curves-per-batch` additionally runs that many complete independent systems
+concurrently on each GPU. It is separate from shared-map source batching and
+automatically backs off after a CUDA OOM.
 Run either command with `--help` to see its output, batching, seed, and device
 options.
 

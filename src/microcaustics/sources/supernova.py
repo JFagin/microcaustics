@@ -226,11 +226,11 @@ class ExpandingPhotosphereSource:
         *,
         redshift: float,
         wavelengths_angstrom: Sequence[float] | None = None,
-        bands: Mapping[str, float] | None = None,
+        bands_angstrom: Mapping[str, float] | None = None,
         maximum_observer_time_days: float,
         evolution: PhotosphereEvolution,
         band_names: Sequence[str] | None = None,
-        resolution: int = 256,
+        source_grid_shape: int = 256,
         explosion_time_days: float = 0.0,
         source_fov_margin: float = 1.05,
         appearance: PhotosphereAppearance | None = None,
@@ -260,9 +260,9 @@ class ExpandingPhotosphereSource:
         self.appearance = appearance or PhotosphereAppearance()
         self.spatial_profile = spatial_profile
         self.spectral_modifier = spectral_modifier
-        if not isinstance(resolution, int) or resolution < 2:
-            raise ValueError("resolution must be an integer of at least two")
-        self.resolution = resolution
+        if not isinstance(source_grid_shape, int) or source_grid_shape < 2:
+            raise ValueError("source_grid_shape must be an integer of at least two")
+        self.source_grid_shape = source_grid_shape
         self.source_fov_margin = self._positive(
             source_fov_margin,
             "source_fov_margin",
@@ -273,13 +273,15 @@ class ExpandingPhotosphereSource:
         if not self.name:
             raise ValueError("name must be non-empty")
 
-        if bands is not None:
+        if bands_angstrom is not None:
             if wavelengths_angstrom is not None or band_names is not None:
                 raise ValueError(
-                    "supply bands or wavelengths_angstrom/band_names, not both"
+                    "supply bands_angstrom or wavelengths_angstrom/band_names, not both"
                 )
-            band_names = tuple(str(name) for name in bands)
-            wavelengths_angstrom = tuple(float(value) for value in bands.values())
+            band_names = tuple(str(name) for name in bands_angstrom)
+            wavelengths_angstrom = tuple(
+                float(value) for value in bands_angstrom.values()
+            )
         if wavelengths_angstrom is None:
             raise ValueError("bands must be supplied")
         wavelengths = tuple(float(value) for value in wavelengths_angstrom)
@@ -323,9 +325,14 @@ class ExpandingPhotosphereSource:
             )
             self.maximum_radius_source = "user"
         self.maximum_photosphere_radius_m = maximum_radius
-        pixel_scale = 2.0 * maximum_radius * self.source_fov_margin / resolution
+        pixel_scale = (
+            2.0
+            * maximum_radius
+            * self.source_fov_margin
+            / self.source_grid_shape
+        )
         self.geometry = SourceGeometry(
-            shape=(resolution, resolution),
+            shape=(self.source_grid_shape, self.source_grid_shape),
             pixel_scale_m=(pixel_scale, pixel_scale),
             wavelengths_angstrom=wavelengths,
             band_names=bands,
@@ -551,8 +558,8 @@ class ExpandingPhotosphereSource:
             )
         expected = (
             len(rest_times),
-            self.resolution,
-            self.resolution,
+            self.source_grid_shape,
+            self.source_grid_shape,
             len(self.wavelengths_angstrom),
         )
         try:
@@ -631,7 +638,7 @@ class ExpandingPhotosphereSource:
             "maximum_photosphere_radius_m": self.maximum_photosphere_radius_m,
             "maximum_radius_source": self.maximum_radius_source,
             "source_fov_margin": self.source_fov_margin,
-            "resolution": self.resolution,
+            "source_grid_shape": self.source_grid_shape,
             "luminosity_distance_m": self.luminosity_distance_m,
             "distance_source": self.distance_source,
             "custom_spatial_profile": self.spatial_profile is not None,
@@ -647,7 +654,7 @@ def paper_type_ia_supernova_source(
     wavelengths_angstrom: Sequence[float],
     maximum_observer_time_days: float,
     band_names: Sequence[str] | None = None,
-    resolution: int = 256,
+    source_grid_shape: int = 256,
     explosion_time_days: float = 0.0,
     luminosity_distance_m: float | None = None,
 ) -> ExpandingPhotosphereSource:
@@ -686,7 +693,7 @@ def paper_type_ia_supernova_source(
         maximum_observer_time_days=maximum_observer_time_days,
         evolution=evolution,
         band_names=band_names,
-        resolution=resolution,
+        source_grid_shape=source_grid_shape,
         explosion_time_days=explosion_time_days,
         source_fov_margin=1.05,
         appearance=appearance,

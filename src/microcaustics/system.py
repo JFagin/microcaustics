@@ -34,8 +34,8 @@ from .lens.stellar import (
     StellarPopulation,
     circular_stellar_aperture,
 )
-from .runtime import ResolvedRuntime, resolve_runtime
 from .random import derive_seed
+from .runtime import ResolvedRuntime, resolve_runtime
 from .simulation import MicrolensingSimulation
 from .sources import PhysicalSourceModel
 
@@ -313,7 +313,14 @@ def _production_dynamic_settings(
 ) -> tuple[DynamicConfig, CausticConfig | None]:
     """Resolve coherent high-level dynamic and optional caustic settings."""
 
-    resolved_schedule = production_dynamic_config() if schedule is None else schedule
+    # The fused 8192-square determinant and label workload reaches its best
+    # steady-state throughput with thirty frames per shared map/label batch.
+    # Light-curve-only calls retain the forty-nine-frame production preset.
+    resolved_schedule = (
+        production_dynamic_config(temporal_batch_size=30)
+        if schedule is None
+        else schedule
+    )
     if caustics is None:
         inherited_far_field = (
             method.far_field_approx if isinstance(method, IPMConfig) else None
@@ -327,7 +334,14 @@ def _production_dynamic_settings(
             temporal_batch_size=resolved_schedule.temporal_batch_size,
         )
     else:
-        resolved_caustics = caustics
+        resolved_caustics = (
+            replace(
+                caustics,
+                temporal_batch_size=resolved_schedule.temporal_batch_size,
+            )
+            if caustics.temporal_batch_size is None
+            else caustics
+        )
     return resolved_schedule, resolved_caustics
 
 
@@ -887,7 +901,9 @@ class MicrolensingRealization:
 class MicrolensingSystem:
     """A physical microlensing system with automatic numerical geometry.
 
-    Supply either a :class:`StellarPopulation` or a directly constructed
+    Supply ``lens_redshift`` and ``source_redshift`` for the standard flat
+    cosmology, or provide :class:`LensingDistances` directly. Supply either a
+    :class:`StellarPopulation` or a directly constructed
     :class:`PointMassField`. A source model automatically defines the angular
     source grid. If a trajectory and duration are supplied, the map field is
     enlarged automatically to contain that source throughout the sequence.
@@ -905,7 +921,13 @@ class MicrolensingSystem:
     """
 
     macro: MacroLens
-    distances: LensingDistances
+    distances: LensingDistances | None = None
+    lens_redshift: float | None = None
+    source_redshift: float | None = None
+    H0: float = 67.66
+    Om0: float = 0.30966
+    distance_dtype: torch.dtype = torch.float32
+    distance_device: torch.device | str | None = "auto"
     source: PixelatedSource | PhysicalSourceModel | None = None
     source_grid: PlaneGrid | None = None
     stellar_population: StellarPopulation | None = None
@@ -930,43 +952,28 @@ class MicrolensingSystem:
         compare=False,
     )
 
-    @classmethod
-    def from_redshifts(
-        cls,
-        *,
-        lens_redshift: float,
-        source_redshift: float,
-        H0: float = 67.66,
-        Om0: float = 0.30966,
-        cosmology=None,
-        distance_dtype: torch.dtype = torch.float32,
-        distance_device: torch.device | str | None = "auto",
-        **kwargs,
-    ) -> MicrolensingSystem:
-        """Construct a system while deriving cosmological distances.
-
-        This is the recommended observational interface. The default flat
-        cosmology is evaluated by PyTorch with ``distance_dtype=float32``.
-        Supply ``cosmology`` to use an external Astropy-compatible model, or
-        construct :class:`LensingDistances` directly for full control.
-        """
-
-        if "distances" in kwargs:
-            raise TypeError(
-                "from_redshifts derives distances; do not also supply distances"
-            )
-        distances = LensingDistances.from_redshifts(
-            lens_redshift,
-            source_redshift,
-            cosmology=cosmology,
-            H0=H0,
-            Om0=Om0,
-            dtype=distance_dtype,
-            device=distance_device,
-        )
-        return cls(distances=distances, **kwargs)
-
     def __post_init__(self) -> None:
+        if self.distances is None:
+            if self.lens_redshift is None or self.source_redshift is None:
+                raise ValueError(
+                    "supply lens_redshift and source_redshift, or distances"
+                )
+            distances = LensingDistances.from_redshifts(
+                self.lens_redshift,
+                self.source_redshift,
+                H0=self.H0,
+                Om0=self.Om0,
+                dtype=self.distance_dtype,
+                device=self.distance_device,
+            )
+            object.__setattr__(self, "distances", distances)
+            object.__setattr__(self, "lens_redshift", None)
+            object.__setattr__(self, "source_redshift", None)
+        elif self.lens_redshift is not None or self.source_redshift is not None:
+            raise ValueError(
+                "supply redshifts or distances, not both"
+            )
+        assert self.distances is not None
         if (self.stellar_population is None) == (self.stars is None):
             raise ValueError("supply exactly one of stellar_population or stars")
         if self.source is None and self.source_grid is None:
@@ -1502,6 +1509,44 @@ class MicrolensingSystem:
         if labels:
             return self.light_curve_with_labels(times_days, **kwargs)
         return self.light_curve(times_days, **kwargs)
+
+    def warmup_light_curve(
+        self,
+        *,
+        labels: bool = False,
+        map_cadence_days: float = 25.0,
+        method: IRSConfig | IPMConfig | None = None,
+        schedule: DynamicConfig | None = None,
+        **kwargs,
+    ):
+        """Warm one representative temporal batch without building a time axis.
+
+        The batch length comes from the selected dynamic schedule. This helper
+        is optional. A normal light-curve call performs the same one-time
+        compilation when a compatible kernel is not already cached.
+        """
+
+        resolved_schedule = (
+            production_dynamic_config() if schedule is None else schedule
+        )
+        batch = int(resolved_schedule.temporal_batch_size or 1)
+        times = torch.arange(batch, dtype=torch.float32) * float(map_cadence_days)
+        call_kwargs = {
+            "schedule": resolved_schedule,
+            **({} if method is None else {"method": method}),
+            **kwargs,
+        }
+        if labels:
+            return self.light_curve_with_labels(times, **call_kwargs)
+        return self.light_curve(times, **call_kwargs)
+
+    def with_source(
+        self,
+        source: PixelatedSource | PhysicalSourceModel,
+    ) -> MicrolensingSystem:
+        """Return the same physical system with a replacement source model."""
+
+        return replace(self, source=source, source_grid=None)
 
     def _realize_for_times(self, times_days) -> MicrolensingRealization:
         """Return a realization whose stellar aperture covers ``times_days``."""

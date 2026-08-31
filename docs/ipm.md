@@ -37,7 +37,9 @@ The scout safety controls act in different coordinate spaces:
   scout test. The production default is one cell, retaining a support ring
   around the selected region.
 - `scout_trace_centers` supplements mapped scout-corner tests with cell-center
-  queries. It is enabled by default.
+  queries. The fast dynamic preset disables it after validation found a
+  sub-mmag effect with a measurable runtime cost. Set it to `True` for an
+  explicitly conservative center-assisted scout.
 
 These controls are independent of `scout_ratio` (`k`) and remain configurable.
 Increasing either halo is more conservative but retains more cells. Setting
@@ -71,8 +73,10 @@ boundaries smoother, but cannot recover information absent from the true
 - **Independent static map.** The high-level static operation selects
   `N=10_000_000, k=1, r=2, v=4` by default.
 - **Dynamic production sequence.** The high-level dynamic operation selects
-  `N=10_000_000, k=2, r=2, v=4` and computes the one-time `k=1` to `k=2`
-  normalization repair.
+  `N=10_000_000, k=2, r=2, v=4`, uses a corner-only scout with a one-cell
+  support ring, and computes the one-time `k=1` to `k=2` normalization repair.
+- **Center-assisted validation.** Start from `production_ipm_config` and pass
+  `scout_trace_centers=True`.
 - **Fast exploratory map.** Reduce `N`, keep `r=2, v=4`, and validate the chosen
   scout ratio against `k=1` for the intended lens population.
 - **Conservative tiled validation.** Use `k=1` and/or a larger scout dilation.
