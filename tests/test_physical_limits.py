@@ -19,9 +19,7 @@ class VariabilityLimitTests(unittest.TestCase):
         )
         frequency = torch.logspace(-6.0, 2.0, 4097, dtype=torch.float64)
         break_frequency = 1.0 / 100.0
-        expected = frequency.pow(-0.5) / (
-            1.0 + (frequency / break_frequency).pow(2.0)
-        )
+        expected = frequency.pow(-0.5) / (1.0 + (frequency / break_frequency).pow(2.0))
         torch.testing.assert_close(psd(frequency), expected, rtol=2.0e-15, atol=0.0)
 
         log_frequency = torch.log(frequency)
@@ -84,16 +82,13 @@ class VariabilityLimitTests(unittest.TestCase):
             )
             log_flux = torch.log(signal.values[:, 0])
             ensemble += torch.stack(
-                [
-                    (log_flux[lag:] - log_flux[:-lag]).square().mean()
-                    for lag in lags
-                ]
+                [(log_flux[lag:] - log_flux[:-lag]).square().mean() for lag in lags]
             )
         ensemble /= 8.0
 
         for lag, measured in zip(lags, ensemble, strict=True):
-            expected = 2.0 * asymptotic_log_std**2 * (
-                1.0 - math.exp(-lag / damping_time)
+            expected = (
+                2.0 * asymptotic_log_std**2 * (1.0 - math.exp(-lag / damping_time))
             )
             self.assertAlmostEqual(
                 float(measured / expected),
@@ -327,8 +322,8 @@ class GeneralRelativityLimitTests(unittest.TestCase):
 
         screen_radius = torch.sqrt(screen.x_rg.square() + screen.y_rg.square())
         fractional_radius_error = (
-            (transfer.radius_rg - screen_radius).abs() / screen_radius.clamp_min(1.0)
-        )
+            transfer.radius_rg - screen_radius
+        ).abs() / screen_radius.clamp_min(1.0)
         self.assertLess(float(fractional_radius_error[distant].max()), 0.004)
 
     def test_gr_lamppost_approaches_euclidean_delay_and_illumination(self) -> None:
@@ -351,24 +346,16 @@ class GeneralRelativityLimitTests(unittest.TestCase):
         self.assertGreater(int(weak_field.sum()), 100)
 
         relative_delay_error = (
-            (profile.lamp_delay_rg - euclidean_delay).abs()
-            / euclidean_delay.clamp_min(1.0)
-        )
+            profile.lamp_delay_rg - euclidean_delay
+        ).abs() / euclidean_delay.clamp_min(1.0)
         self.assertLess(float(relative_delay_error[weak_field].max()), 0.005)
         illumination_ratio = (
-            profile.illumination[weak_field]
-            / euclidean_illumination[weak_field]
+            profile.illumination[weak_field] / euclidean_illumination[weak_field]
         )
         normalized_illumination_ratio = illumination_ratio / illumination_ratio.median()
+        self.assertLess(float((normalized_illumination_ratio - 1.0).abs().max()), 0.004)
         self.assertLess(
-            float((normalized_illumination_ratio - 1.0).abs().max()), 0.004
-        )
-        self.assertLess(
-            float(
-                (profile.gfactor_lamp_to_disk[weak_field] - 1.0)
-                .abs()
-                .max()
-            ),
+            float((profile.gfactor_lamp_to_disk[weak_field] - 1.0).abs().max()),
             0.001,
         )
 

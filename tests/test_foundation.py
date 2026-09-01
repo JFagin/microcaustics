@@ -129,12 +129,12 @@ class FoundationTests(unittest.TestCase):
         )
 
     def test_moving_point_mass_field(self) -> None:
-        field = PointMassField(
+        field = PointMassField._from_einstein_radii(
             torch.tensor([1.0]),
             torch.tensor([2.0]),
-            torch.tensor([0.5]),
-            torch.tensor([0.1]),
-            torch.tensor([-0.2]),
+            velocity_x_uas_per_day=torch.tensor([0.1]),
+            velocity_y_uas_per_day=torch.tensor([-0.2]),
+            einstein_radius_uas=torch.tensor([0.5]),
         )
         moved = field.at_time(10.0)
         self.assertAlmostEqual(float(moved.x_uas[0]), 2.0)
@@ -195,10 +195,10 @@ class FoundationTests(unittest.TestCase):
         self.assertIn("portable Torch", str(caught[0].message))
 
     def test_simulation_moves_lens_arrays_to_runtime(self) -> None:
-        field = PointMassField(
+        field = PointMassField._from_einstein_radii(
             torch.tensor([0.0], dtype=torch.float64),
             torch.tensor([0.0], dtype=torch.float64),
-            torch.tensor([1.0], dtype=torch.float64),
+            einstein_radius_uas=torch.tensor([1.0], dtype=torch.float64),
         )
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.4, shear=0.2),
@@ -213,10 +213,10 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(simulation.runtime.device.type, "cpu")
 
     def test_direct_raytrace_matches_manual_lens_equation(self) -> None:
-        field = PointMassField(
+        field = PointMassField._from_einstein_radii(
             torch.tensor([0.0], dtype=torch.float64),
             torch.tensor([0.0], dtype=torch.float64),
-            torch.tensor([0.5], dtype=torch.float64),
+            einstein_radius_uas=torch.tensor([0.5], dtype=torch.float64),
         )
         macro = MacroLens(
             convergence=0.2,
@@ -294,12 +294,8 @@ class FoundationTests(unittest.TestCase):
         torch.testing.assert_close(first.mass_solar, second.mass_solar)
         self.assertTrue(first.has_motion)
         xmin, xmax, ymin, ymax = region.bounds_uas
-        self.assertTrue(
-            bool(torch.all((first.x_uas >= xmin) & (first.x_uas < xmax)))
-        )
-        self.assertTrue(
-            bool(torch.all((first.y_uas >= ymin) & (first.y_uas < ymax)))
-        )
+        self.assertTrue(bool(torch.all((first.x_uas >= xmin) & (first.x_uas < xmax))))
+        self.assertTrue(bool(torch.all((first.y_uas >= ymin) & (first.y_uas < ymax))))
         self.assertGreater(compact_convergence(first, region), 0.0)
 
     def test_gaussian_source_flux_and_hole(self) -> None:
@@ -472,12 +468,15 @@ class FoundationTests(unittest.TestCase):
             dtype=torch.float64,
         )
         clear_compiled_primary_cache()
-        with mock.patch(
-            "microcaustics.relativity.primary._torch_compile_supported",
-            return_value=True,
-        ), mock.patch.object(
-            torch, "compile", side_effect=lambda function, **_: function
-        ) as compile_mock:
+        with (
+            mock.patch(
+                "microcaustics.relativity.primary._torch_compile_supported",
+                return_value=True,
+            ),
+            mock.patch.object(
+                torch, "compile", side_effect=lambda function, **_: function
+            ) as compile_mock,
+        ):
             first = trace_primary_equatorial(
                 screen,
                 spin=0.2,
@@ -628,17 +627,13 @@ class FoundationTests(unittest.TestCase):
         self.assertTrue(
             torch.all(
                 torch.isfinite(
-                    coordinates.transfer.relative_delay_days[
-                        coordinates.transfer.hit
-                    ]
+                    coordinates.transfer.relative_delay_days[coordinates.transfer.hit]
                 )
             )
         )
         self.assertLess(
             float(
-                coordinates.transfer.relative_delay_days[
-                    coordinates.transfer.hit
-                ].max()
+                coordinates.transfer.relative_delay_days[coordinates.transfer.hit].max()
             ),
             20.0,
         )
@@ -717,9 +712,9 @@ class FoundationTests(unittest.TestCase):
         ) / epsilon
         analytic = source.linear_response_weights(dtype=torch.float64)
         hit = coordinates.transfer.hit[..., None].expand_as(analytic)
-        relative = (numerical[hit] - analytic[hit]).abs() / analytic[
-            hit
-        ].clamp_min(1.0e-30)
+        relative = (numerical[hit] - analytic[hit]).abs() / analytic[hit].clamp_min(
+            1.0e-30
+        )
         self.assertLess(float(relative.max()), 2.0e-4)
         transfer_function = source.transfer_function(
             torch.linspace(0.0, 5.0, 17, dtype=torch.float64)
@@ -755,11 +750,7 @@ class FoundationTests(unittest.TestCase):
             "axis_kerr_lamppost",
         )
         self.assertTrue(
-            torch.all(
-                torch.isfinite(
-                    lamp_source.brightness(0.0, dtype=torch.float64)
-                )
-            )
+            torch.all(torch.isfinite(lamp_source.brightness(0.0, dtype=torch.float64)))
         )
 
     def test_axis_lamppost_matches_frozen_transfer_fixture(self) -> None:
@@ -805,12 +796,15 @@ class FoundationTests(unittest.TestCase):
         )
 
         clear_compiled_lamppost_cache()
-        with mock.patch(
-            "microcaustics.relativity.lamppost._torch_compile_supported",
-            return_value=True,
-        ), mock.patch.object(
-            torch, "compile", side_effect=lambda function, **_: function
-        ) as compile_mock:
+        with (
+            mock.patch(
+                "microcaustics.relativity.lamppost._torch_compile_supported",
+                return_value=True,
+            ),
+            mock.patch.object(
+                torch, "compile", side_effect=lambda function, **_: function
+            ) as compile_mock,
+        ):
             first = trace_axis_lamppost(
                 spin=0.2,
                 source_height_rg=10.0,
@@ -915,9 +909,9 @@ class FoundationTests(unittest.TestCase):
         x = (torch.arange(nx, dtype=torch.float64) + 0.5 - nx / 2) * dx
         y = (torch.arange(ny, dtype=torch.float64) + 0.5 - ny / 2) * dy
         yy, xx = torch.meshgrid(y, x, indexing="ij")
-        gravitational_radius = 6.67430e-11 * 1.988409870698051e30 / (
-            299_792_458.0**2
-        ) * mass
+        gravitational_radius = (
+            6.67430e-11 * 1.988409870698051e30 / (299_792_458.0**2) * mass
+        )
         radius_rg = torch.sqrt(xx.square() + yy.square()) / gravitational_radius
         outer_radius = 0.5 * min(ny * dy, nx * dx) / gravitational_radius
         hit = (radius_rg > kerr_isco_radius(torch.tensor(spin))) & (
@@ -1053,9 +1047,9 @@ class FoundationTests(unittest.TestCase):
         )
         source = ModulatedSource(base, signal)
         brightness = source.brightness([0.0, 5.0, 10.0])
-        expected = torch.tensor(
-            [[1.0, 2.0], [2.0, 3.0], [3.0, 4.0]]
-        )[:, None, None, :].expand(-1, 2, 3, -1)
+        expected = torch.tensor([[1.0, 2.0], [2.0, 3.0], [3.0, 4.0]])[
+            :, None, None, :
+        ].expand(-1, 2, 3, -1)
         torch.testing.assert_close(brightness, expected)
         self.assertFalse(source.is_time_static)
 
@@ -1096,10 +1090,8 @@ class FoundationTests(unittest.TestCase):
     def test_uniform_irs_returns_absolute_unit_magnification(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(
-                torch.empty(0),
-                torch.empty(0),
-                torch.empty(0),
+            PointMassField._from_einstein_radii(
+                torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
             ),
             runtime=RuntimeConfig(
                 device="cpu",
@@ -1127,7 +1119,9 @@ class FoundationTests(unittest.TestCase):
     def test_uniform_irs_accepts_eager_taylor_far_field(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(torch.empty(0), torch.empty(0), torch.empty(0)),
+            PointMassField._from_einstein_radii(
+                torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
+            ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
         result = simulation.magnification_map(
@@ -1150,7 +1144,9 @@ class FoundationTests(unittest.TestCase):
 
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(torch.empty(0), torch.empty(0), torch.empty(0)),
+            PointMassField._from_einstein_radii(
+                torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
+            ),
             runtime=RuntimeConfig(
                 device="cpu",
                 backend=Backend.TORCH_EAGER,
@@ -1251,7 +1247,9 @@ class FoundationTests(unittest.TestCase):
     def test_full_field_ipm_accepts_general_r_and_v(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(torch.empty(0), torch.empty(0), torch.empty(0)),
+            PointMassField._from_einstein_radii(
+                torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
+            ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
         for refinement, virtual in ((1, 1), (3, 5)):
@@ -1278,7 +1276,9 @@ class FoundationTests(unittest.TestCase):
     def test_tiled_ipm_accepts_general_scout_ratio(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(torch.empty(0), torch.empty(0), torch.empty(0)),
+            PointMassField._from_einstein_radii(
+                torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
+            ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
         for scout_ratio in (1, 2, 3):
@@ -1311,10 +1311,10 @@ class FoundationTests(unittest.TestCase):
 
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.17, shear=0.06),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([-0.45, 0.35], dtype=torch.float64),
                 torch.tensor([0.25, -0.15], dtype=torch.float64),
-                torch.tensor([0.18, 0.12], dtype=torch.float64),
+                einstein_radius_uas=torch.tensor([0.18, 0.12], dtype=torch.float64),
             ),
             runtime=RuntimeConfig(
                 device="cpu",
@@ -1357,12 +1357,12 @@ class FoundationTests(unittest.TestCase):
 
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.12, shear=0.04),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([-0.4, 0.3]),
                 torch.tensor([0.2, -0.1]),
-                torch.tensor([0.16, 0.11]),
-                torch.tensor([0.002, -0.001]),
-                torch.tensor([-0.001, 0.0015]),
+                velocity_x_uas_per_day=torch.tensor([0.002, -0.001]),
+                velocity_y_uas_per_day=torch.tensor([-0.001, 0.0015]),
+                einstein_radius_uas=torch.tensor([0.16, 0.11]),
             ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
@@ -1412,7 +1412,9 @@ class FoundationTests(unittest.TestCase):
     def test_tiled_scout_matches_full_field_for_linear_mapping(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.2, shear=0.1, shear_angle_rad=0.3),
-            PointMassField(torch.empty(0), torch.empty(0), torch.empty(0)),
+            PointMassField._from_einstein_radii(
+                torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
+            ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
         lens_region = PlaneRegion((6.0, 6.0))
@@ -1460,12 +1462,14 @@ class FoundationTests(unittest.TestCase):
             dtype=torch.float64,
         )
         self.assertAlmostEqual(float(radii[1] / radii[0]), 2.0, places=14)
-        field = PointMassField.from_masses(
-            [0.0, 1.0],
-            [0.0, 1.0],
-            [1.0, 4.0],
-            distances,
-            dtype=torch.float64,
+        field = (
+            PointMassField(
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [1.0, 4.0],
+            )
+            .to(dtype=torch.float64)
+            .resolve(distances)
         )
         torch.testing.assert_close(field.einstein_radius_uas, radii)
         self.assertIsNotNone(field.mass_solar)
@@ -1478,10 +1482,10 @@ class FoundationTests(unittest.TestCase):
                 shear_angle_rad=0.23,
                 smooth_matter_fraction=0.4,
             ),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([-0.4, 0.7], dtype=torch.float64),
                 torch.tensor([0.2, -0.5], dtype=torch.float64),
-                torch.tensor([0.15, 0.2], dtype=torch.float64),
+                einstein_radius_uas=torch.tensor([0.15, 0.2], dtype=torch.float64),
             ),
             runtime=RuntimeConfig(
                 device="cpu",
@@ -1512,10 +1516,10 @@ class FoundationTests(unittest.TestCase):
     def test_single_point_lens_critical_curve_and_caustic(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([0.0], dtype=torch.float64),
                 torch.tensor([0.0], dtype=torch.float64),
-                torch.tensor([1.0], dtype=torch.float64),
+                einstein_radius_uas=torch.tensor([1.0], dtype=torch.float64),
             ),
             runtime=RuntimeConfig(
                 device="cpu",
@@ -1559,10 +1563,10 @@ class FoundationTests(unittest.TestCase):
 
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([0.0]),
                 torch.tensor([0.0]),
-                torch.tensor([1.0]),
+                einstein_radius_uas=torch.tensor([1.0]),
             ),
             runtime=RuntimeConfig(
                 device="cpu",
@@ -1798,7 +1802,9 @@ class FoundationTests(unittest.TestCase):
         self.assertLess(labels.center_valid_count, 9)
         self.assertEqual(labels.center_vote_count, labels.center_valid_count)
 
-    def test_boundary_connected_critical_components_are_invalid_for_labels(self) -> None:
+    def test_boundary_connected_critical_components_are_invalid_for_labels(
+        self,
+    ) -> None:
         from microcaustics.caustics.production import _boundary_component_mask
 
         critical = torch.tensor(
@@ -1839,10 +1845,10 @@ class FoundationTests(unittest.TestCase):
 
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([0.0], dtype=torch.float64),
                 torch.tensor([0.0], dtype=torch.float64),
-                torch.tensor([1.0], dtype=torch.float64),
+                einstein_radius_uas=torch.tensor([1.0], dtype=torch.float64),
             ),
             runtime=RuntimeConfig(
                 device="cpu",
@@ -1880,12 +1886,12 @@ class FoundationTests(unittest.TestCase):
         )
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([0.0]),
                 torch.tensor([0.0]),
-                torch.tensor([0.4]),
-                torch.tensor([1.0e-3]),
-                torch.tensor([-2.0e-3]),
+                velocity_x_uas_per_day=torch.tensor([1.0e-3]),
+                velocity_y_uas_per_day=torch.tensor([-2.0e-3]),
+                einstein_radius_uas=torch.tensor([0.4]),
             ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
@@ -1921,7 +1927,10 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(tuple(result.light_curve.flux.shape), (2, 1))
         self.assertEqual(tuple(result.crossing_labels.shape), (2,))
         self.assertTrue(
-            all(frame.caustics.metadata["shared_far_fields"] for frame in result.caustics)
+            all(
+                frame.caustics.metadata["shared_far_fields"]
+                for frame in result.caustics
+            )
         )
         self.assertTrue(
             all(
@@ -1963,15 +1972,16 @@ class FoundationTests(unittest.TestCase):
                 temporal_batch_size=2,
                 jacobian_chunk_size=257,
             ),
-            map_observer=lambda index, frame: observed.append(
-                (index, frame.time_days)
-            ),
+            map_observer=lambda index, frame: observed.append((index, frame.time_days)),
         )
         self.assertEqual(tuple(multirate.light_curve.flux.shape), (3, 1))
         self.assertEqual(multirate.map_times_days.tolist(), [0.0, 1.0])
         self.assertEqual(observed, [(0, 0.0), (1, 1.0)])
         self.assertTrue(
-            all(frame.caustics.metadata["shared_far_fields"] for frame in multirate.caustics)
+            all(
+                frame.caustics.metadata["shared_far_fields"]
+                for frame in multirate.caustics
+            )
         )
 
     def test_signed_winding_number_respects_orientation(self) -> None:
@@ -1996,6 +2006,42 @@ class FoundationTests(unittest.TestCase):
         negative = winding_number(counterclockwise.flip(dims=(1,)), points)
         self.assertEqual(positive.tolist(), [1, 0, 1])
         self.assertEqual(negative.tolist(), [-1, 0, -1])
+
+    def test_regular_grid_winding_and_parity_match_point_queries(self) -> None:
+        """The scanline diagnostic maps preserve the pointwise predicates."""
+
+        from microcaustics.results import CausticField
+
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                generator = torch.Generator().manual_seed(1729)
+                segments = 4.0 * torch.rand(
+                    (257, 2, 2), generator=generator, dtype=dtype
+                ) - 2.0
+                grid = PlaneGrid((31, 29), (4.5, 4.25), (0.13, -0.17))
+                field = CausticField(segments, segments, grid)
+                x, y = grid.mesh(dtype=dtype)
+                points = torch.stack((x.reshape(-1), y.reshape(-1)), dim=-1)
+                expected_winding = field.winding_number(
+                    points,
+                    point_chunk_size=37,
+                    segment_chunk_size=41,
+                ).reshape(grid.shape)
+                expected_parity = field.crossing_parity(
+                    points,
+                    point_chunk_size=37,
+                    segment_chunk_size=41,
+                ).reshape(grid.shape)
+                actual_winding = field.winding_map(
+                    grid,
+                    segment_chunk_size=43,
+                ).values
+                actual_parity = field.label_map(
+                    grid,
+                    segment_chunk_size=43,
+                ).values
+                torch.testing.assert_close(actual_winding, expected_winding)
+                torch.testing.assert_close(actual_parity, expected_parity)
 
     def test_unordered_closed_segments_are_registered_in_core(self) -> None:
         from microcaustics.caustics import orient_mapped_closed_segments
@@ -2046,12 +2092,12 @@ class FoundationTests(unittest.TestCase):
     def test_dynamic_irs_streams_moving_lens_frames(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([0.0]),
                 torch.tensor([0.0]),
-                torch.tensor([0.2]),
-                torch.tensor([0.1]),
-                torch.tensor([0.0]),
+                velocity_x_uas_per_day=torch.tensor([0.1]),
+                velocity_y_uas_per_day=torch.tensor([0.0]),
+                einstein_radius_uas=torch.tensor([0.2]),
             ),
             runtime=RuntimeConfig(
                 device="cpu",
@@ -2077,7 +2123,9 @@ class FoundationTests(unittest.TestCase):
     def test_dynamic_static_lens_reuses_one_exact_map(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(torch.empty(0), torch.empty(0), torch.empty(0)),
+            PointMassField._from_einstein_radii(
+                torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
+            ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
         maps = list(
@@ -2102,12 +2150,12 @@ class FoundationTests(unittest.TestCase):
     def test_dynamic_tiled_ipm_records_endpoint_union(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([0.0]),
                 torch.tensor([0.0]),
-                torch.tensor([0.2]),
-                torch.tensor([0.01]),
-                torch.tensor([0.0]),
+                velocity_x_uas_per_day=torch.tensor([0.01]),
+                velocity_y_uas_per_day=torch.tensor([0.0]),
+                einstein_radius_uas=torch.tensor([0.2]),
             ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
@@ -2145,12 +2193,12 @@ class FoundationTests(unittest.TestCase):
 
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.15, shear=0.08),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([-0.5, 0.4]),
                 torch.tensor([0.3, -0.2]),
-                torch.tensor([0.25, 0.18]),
-                torch.tensor([0.002, -0.001]),
-                torch.tensor([-0.001, 0.0015]),
+                velocity_x_uas_per_day=torch.tensor([0.002, -0.001]),
+                velocity_y_uas_per_day=torch.tensor([-0.001, 0.0015]),
+                einstein_radius_uas=torch.tensor([0.25, 0.18]),
             ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
@@ -2200,7 +2248,10 @@ class FoundationTests(unittest.TestCase):
                 rtol=tolerance,
                 atol=tolerance,
             )
-            self.assertEqual(actual.metadata["temporal_batch_real_frames"], 2 if actual.time_days < 2 else 1)
+            self.assertEqual(
+                actual.metadata["temporal_batch_real_frames"],
+                2 if actual.time_days < 2 else 1,
+            )
             self.assertFalse(actual.metadata["dynamic_temporal_solver_fused"])
 
     def test_fused_scout_intervals_remain_global_across_batch_boundaries(self) -> None:
@@ -2208,12 +2259,12 @@ class FoundationTests(unittest.TestCase):
 
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([0.0]),
                 torch.tensor([0.0]),
-                torch.tensor([0.2]),
-                torch.tensor([0.01]),
-                torch.tensor([0.0]),
+                velocity_x_uas_per_day=torch.tensor([0.01]),
+                velocity_y_uas_per_day=torch.tensor([0.0]),
+                einstein_radius_uas=torch.tensor([0.2]),
             ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
@@ -2237,8 +2288,12 @@ class FoundationTests(unittest.TestCase):
                 ),
             )
         )
-        self.assertEqual(maps[0].metadata["dynamic_scout_interval_pairs"], [(0, 2), (3, 5)])
-        self.assertEqual(maps[4].metadata["dynamic_scout_interval_pairs"], [(3, 5), (6, 6)])
+        self.assertEqual(
+            maps[0].metadata["dynamic_scout_interval_pairs"], [(0, 2), (3, 5)]
+        )
+        self.assertEqual(
+            maps[4].metadata["dynamic_scout_interval_pairs"], [(3, 5), (6, 6)]
+        )
         self.assertEqual(maps[4].metadata["dynamic_scout_anchor_frames"], [3, 5, 6])
 
     def test_fused_tiled_refresh_one_uses_exact_per_frame_scouts(self) -> None:
@@ -2246,12 +2301,12 @@ class FoundationTests(unittest.TestCase):
 
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([0.0]),
                 torch.tensor([0.0]),
-                torch.tensor([0.2]),
-                torch.tensor([0.01]),
-                torch.tensor([0.0]),
+                velocity_x_uas_per_day=torch.tensor([0.01]),
+                velocity_y_uas_per_day=torch.tensor([0.0]),
+                einstein_radius_uas=torch.tensor([0.2]),
             ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
@@ -2275,7 +2330,9 @@ class FoundationTests(unittest.TestCase):
                 ),
             )
         )
-        self.assertTrue(all(not item.metadata["dynamic_scout_reuse_approximate"] for item in maps))
+        self.assertTrue(
+            all(not item.metadata["dynamic_scout_reuse_approximate"] for item in maps)
+        )
         self.assertEqual(maps[0].metadata["dynamic_scout_anchor_frames"], [0, 1, 2])
 
     def test_fused_full_field_temporal_ipm_matches_scalar_maps(self) -> None:
@@ -2283,12 +2340,12 @@ class FoundationTests(unittest.TestCase):
 
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([0.2]),
                 torch.tensor([-0.1]),
-                torch.tensor([0.12]),
-                torch.tensor([0.01]),
-                torch.tensor([0.0]),
+                velocity_x_uas_per_day=torch.tensor([0.01]),
+                velocity_y_uas_per_day=torch.tensor([0.0]),
+                einstein_radius_uas=torch.tensor([0.12]),
             ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
@@ -2330,10 +2387,10 @@ class FoundationTests(unittest.TestCase):
     def test_dual_scout_correction_is_a_constant_map_offset(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.35, shear=0.25),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([-0.7, 0.2, 0.9]),
                 torch.tensor([0.3, -0.2, 0.6]),
-                torch.tensor([0.45, 0.32, 0.38]),
+                einstein_radius_uas=torch.tensor([0.45, 0.32, 0.38]),
             ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
@@ -2411,7 +2468,9 @@ class FoundationTests(unittest.TestCase):
     def test_streaming_light_curve_matches_precomputed_maps(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(torch.empty(0), torch.empty(0), torch.empty(0)),
+            PointMassField._from_einstein_radii(
+                torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
+            ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
         distances = LensingDistances(1.0e25, 2.0e25, 1.0e25)
@@ -2465,7 +2524,9 @@ class FoundationTests(unittest.TestCase):
     def test_streaming_light_curve_batch_matches_independent_requests(self) -> None:
         simulation = MicrolensingSimulation.create(
             MacroLens(convergence=0.0, shear=0.0),
-            PointMassField(torch.empty(0), torch.empty(0), torch.empty(0)),
+            PointMassField._from_einstein_radii(
+                torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
+            ),
             runtime=RuntimeConfig(device="cpu", backend=Backend.TORCH_EAGER),
         )
         distances = LensingDistances(1.0e25, 2.0e25, 1.0e25)
@@ -2655,12 +2716,18 @@ class FoundationTests(unittest.TestCase):
 
         simulation = MicrolensingSimulation.create(
             MacroLens(0.2, 0.1),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 torch.tensor([-1.1, -0.2, 0.8, 1.3], dtype=torch.float64),
                 torch.tensor([0.6, -0.9, 0.4, -0.3], dtype=torch.float64),
-                torch.tensor([0.12, 0.09, 0.11, 0.08], dtype=torch.float64),
-                torch.tensor([0.004, -0.003, 0.002, -0.001], dtype=torch.float64),
-                torch.tensor([-0.002, 0.001, -0.003, 0.002], dtype=torch.float64),
+                velocity_x_uas_per_day=torch.tensor(
+                    [0.004, -0.003, 0.002, -0.001], dtype=torch.float64
+                ),
+                velocity_y_uas_per_day=torch.tensor(
+                    [-0.002, 0.001, -0.003, 0.002], dtype=torch.float64
+                ),
+                einstein_radius_uas=torch.tensor(
+                    [0.12, 0.09, 0.11, 0.08], dtype=torch.float64
+                ),
             ),
             runtime=RuntimeConfig(
                 device="cpu",
@@ -2693,7 +2760,9 @@ class FoundationTests(unittest.TestCase):
             )
             torch.testing.assert_close(sequence[index].local_x, independent.local_x)
             torch.testing.assert_close(sequence[index].local_y, independent.local_y)
-            torch.testing.assert_close(sequence[index].local_mass, independent.local_mass)
+            torch.testing.assert_close(
+                sequence[index].local_mass, independent.local_mass
+            )
             torch.testing.assert_close(
                 sequence[index].coefficient_real,
                 independent.coefficient_real,
@@ -2713,10 +2782,10 @@ class FoundationTests(unittest.TestCase):
                 shear_angle_rad=0.3,
                 smooth_matter_fraction=0.5,
             ),
-            PointMassField(
+            PointMassField._from_einstein_radii(
                 stars_x,
                 stars_y,
-                torch.full((30,), 0.08, dtype=torch.float64),
+                einstein_radius_uas=torch.full((30,), 0.08, dtype=torch.float64),
             ),
             runtime=RuntimeConfig(
                 device="cpu",

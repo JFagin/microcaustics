@@ -36,10 +36,13 @@ class ResponseSource:
     ):
         del edges
         scale = 1.0 if magnification is None else float(magnification.mean())
-        values = torch.tensor(
-            [[scale, 1.0], [3.0, scale]],
-            dtype=torch.float64,
-        ) * driver_amplitude
+        values = (
+            torch.tensor(
+                [[scale, 1.0], [3.0, scale]],
+                dtype=torch.float64,
+            )
+            * driver_amplitude
+        )
         if normalize:
             values = values / values.sum(dim=0, keepdim=True)
         return values
@@ -48,7 +51,9 @@ class ResponseSource:
 def simulation() -> mc.MicrolensingSimulation:
     return mc.MicrolensingSimulation.create(
         mc.MacroLens(0.0, 0.0),
-        mc.PointMassField(torch.empty(0), torch.empty(0), torch.empty(0)),
+        mc.PointMassField._from_einstein_radii(
+            torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
+        ),
         runtime=mc.RuntimeConfig(
             device="cpu",
             dtype="float64",

@@ -18,12 +18,12 @@ def _moving_simulation(*, device: str = "cpu", backend: str = "torch-eager"):
             shear_angle_rad=0.17,
             smooth_matter_fraction=0.2,
         ),
-        mc.PointMassField(
+        mc.PointMassField._from_einstein_radii(
             torch.tensor([-0.55, 0.4, 1.1]),
             torch.tensor([0.35, -0.45, 0.65]),
-            torch.tensor([0.22, 0.17, 0.13]),
-            torch.tensor([0.003, -0.002, 0.001]),
-            torch.tensor([-0.001, 0.002, -0.002]),
+            velocity_x_uas_per_day=torch.tensor([0.003, -0.002, 0.001]),
+            velocity_y_uas_per_day=torch.tensor([-0.001, 0.002, -0.002]),
+            einstein_radius_uas=torch.tensor([0.22, 0.17, 0.13]),
         ),
         runtime=mc.RuntimeConfig(device=device, backend=backend),
     )
@@ -125,10 +125,10 @@ class PublicWorkflowTests(unittest.TestCase):
         simulations = tuple(
             mc.MicrolensingSimulation.create(
                 macro,
-                mc.PointMassField(
+                mc.PointMassField._from_einstein_radii(
                     torch.tensor([-0.55 + shift, 0.4, 1.1]),
                     torch.tensor([0.35, -0.45 + shift, 0.65]),
-                    torch.tensor([0.22, 0.17, 0.13]),
+                    einstein_radius_uas=torch.tensor([0.22, 0.17, 0.13]),
                 ),
                 runtime=runtime,
             )
@@ -169,9 +169,7 @@ class PublicWorkflowTests(unittest.TestCase):
             for simulation in simulations
         )
         self.assertEqual(len(batched), len(separate))
-        for index, (actual, expected) in enumerate(
-            zip(batched, separate, strict=True)
-        ):
+        for index, (actual, expected) in enumerate(zip(batched, separate, strict=True)):
             torch.testing.assert_close(actual.values, expected.values)
             self.assertTrue(actual.metadata["independent_map_batch"])
             self.assertEqual(actual.metadata["independent_map_batch_index"], index)
@@ -428,8 +426,7 @@ class PublicWorkflowTests(unittest.TestCase):
         explicit_maps = tuple(
             mc.MagnificationMap(
                 endpoints[0].values
-                + (float(time) / 6.0)
-                * (endpoints[1].values - endpoints[0].values),
+                + (float(time) / 6.0) * (endpoints[1].values - endpoints[0].values),
                 endpoints[0].grid,
                 time_days=float(time),
                 method="explicit test interpolation",
@@ -451,7 +448,9 @@ class PublicWorkflowTests(unittest.TestCase):
         empty = torch.empty(0)
         simulation = mc.MicrolensingSimulation.create(
             mc.MacroLens(0.0, 0.0),
-            mc.PointMassField(empty, empty, empty),
+            mc.PointMassField._from_einstein_radii(
+                empty, empty, einstein_radius_uas=empty
+            ),
             runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
         )
         methods = (

@@ -144,10 +144,10 @@ class PlottingTests(unittest.TestCase):
     def test_method_diagrams_execute_the_real_tree_and_scout(self) -> None:
         simulation = mc.MicrolensingSimulation.create(
             mc.MacroLens(0.05, 0.02),
-            mc.PointMassField(
+            mc.PointMassField._from_einstein_radii(
                 torch.tensor([-0.5, 0.6]),
                 torch.tensor([0.4, -0.3]),
-                torch.tensor([0.08, 0.06]),
+                einstein_radius_uas=torch.tensor([0.08, 0.06]),
             ),
             runtime=mc.RuntimeConfig(
                 device="cpu",
@@ -201,9 +201,7 @@ class PlottingTests(unittest.TestCase):
         """Keep the tutorial schematic tied to the manuscript Figure 3 code."""
 
         package_root = Path(__file__).resolve().parents[1]
-        fixture_root = (
-            package_root / "examples" / "data" / "q2237b_method_figures"
-        )
+        fixture_root = package_root / "examples" / "data" / "q2237b_method_figures"
         with tempfile.TemporaryDirectory() as temporary:
             paths = mcp.render_paper_ipm_schematic(
                 fixture_root / "paper_tile_upsampling_schematic_data.npz",
@@ -230,10 +228,10 @@ class PlottingTests(unittest.TestCase):
 
         simulation = mc.MicrolensingSimulation.create(
             mc.MacroLens(0.05, 0.02),
-            mc.PointMassField(
+            mc.PointMassField._from_einstein_radii(
                 torch.tensor([-0.5, 0.6]),
                 torch.tensor([0.4, -0.3]),
-                torch.tensor([0.08, 0.06]),
+                einstein_radius_uas=torch.tensor([0.08, 0.06]),
             ),
             runtime=mc.RuntimeConfig(
                 device="cpu",
@@ -259,7 +257,9 @@ class PlottingTests(unittest.TestCase):
                 output_prefix="live_ipm",
             )
             self.assertTrue(all(path.is_file() for path in paths))
-            self.assertTrue((Path(temporary) / "live_ipm_live_diagnostics.npz").is_file())
+            self.assertTrue(
+                (Path(temporary) / "live_ipm_live_diagnostics.npz").is_file()
+            )
 
     def test_caustic_label_distance_and_anchor_plots(self) -> None:
         field = self.caustics()
@@ -328,9 +328,7 @@ class PlottingTests(unittest.TestCase):
                 zero_point_flux=100.0,
             )
 
-        geometry = mc.SourceGeometry(
-            (4, 5), (2.0, 3.0), (4800.0, 6200.0), ("g", "r")
-        )
+        geometry = mc.SourceGeometry((4, 5), (2.0, 3.0), (4800.0, 6200.0), ("g", "r"))
         source = mc.StaticSource(torch.ones(4, 5, 2), geometry)
         _, ax = mcp.plot_source_brightness(source, band="r")
         self.assertEqual(tuple(ax.images[0].get_array().shape), (4, 5))
@@ -349,7 +347,9 @@ class PlottingTests(unittest.TestCase):
         )
         self.assertEqual(tuple(centers.shape), (3,))
         np.testing.assert_allclose(
-            np.sum(density * np.diff(transfer.delay_edges_days.numpy())[:, None], axis=0),
+            np.sum(
+                density * np.diff(transfer.delay_edges_days.numpy())[:, None], axis=0
+            ),
             transfer.values.numpy().sum(axis=0),
             rtol=1.0e-7,
             atol=1.0e-7,
@@ -409,9 +409,7 @@ class PlottingTests(unittest.TestCase):
         series = mc.TransferFunctionSeries(
             times_days=torch.tensor([0.0, 2.0]),
             delay_edges_days=torch.tensor([0.0, 1.0, 2.0]),
-            values=torch.tensor(
-                [[[0.4, 0.6], [0.6, 0.4]], [[0.5, 0.3], [0.5, 0.7]]]
-            ),
+            values=torch.tensor([[[0.4, 0.6], [0.6, 0.4]], [[0.5, 0.3], [0.5, 0.7]]]),
             mean_delays_days=torch.tensor([[1.1, 0.9], [1.0, 1.2]]),
             band_names=("g", "r"),
         )

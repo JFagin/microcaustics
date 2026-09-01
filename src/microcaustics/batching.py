@@ -240,14 +240,18 @@ def batched_magnification_maps(
 def batched_system_maps(
     systems: Sequence[MicrolensingSystem | MicrolensingRealization],
     *,
+    map_width_uas: float | None = None,
+    map_pixels: int | None = None,
     method: IPMConfig | None = None,
     batch_size: int | None = None,
     time_days: float = 0.0,
 ) -> tuple[MagnificationMap, ...]:
     """Generate compatible independent maps from high-level systems.
 
-    Every system retains an independent stellar realization. This helper only
-    groups compatible numerical work and applies no temporal or shared-field
+    Every system retains an independent stellar realization. Centered square
+    source-independent systems may share ``map_width_uas`` and ``map_pixels``
+    instead of carrying explicit ``PlaneGrid`` objects. This helper only groups
+    compatible numerical work and applies no temporal or shared-field
     approximation. Automatic OOM recovery is inherited from
     :func:`batched_magnification_maps`.
     """
@@ -255,10 +259,22 @@ def batched_system_maps(
     from .config import _production_static_ipm_config
     from .system import MicrolensingRealization
 
-    resolved = tuple(
-        item if isinstance(item, MicrolensingRealization) else item.realize()
-        for item in systems
-    )
+    resolved = []
+    for item in systems:
+        if isinstance(item, MicrolensingRealization):
+            if map_width_uas is not None or map_pixels is not None:
+                raise ValueError(
+                    "map_width_uas and map_pixels cannot override a realized system"
+                )
+            resolved.append(item)
+        else:
+            resolved.append(
+                item._with_square_map_grid(
+                    map_width_uas=map_width_uas,
+                    map_pixels=map_pixels,
+                ).realize()
+            )
+    resolved = tuple(resolved)
     if not resolved:
         raise ValueError("at least one microlensing system is required")
     requested_method = (

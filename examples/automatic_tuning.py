@@ -12,11 +12,10 @@ system = mc.MicrolensingSystem(
     stars=mc.PointMassField(
         x_uas=torch.tensor([-0.6, 0.2, 0.8]),
         y_uas=torch.tensor([0.3, -0.4, 0.1]),
-        einstein_radius_uas=torch.tensor([0.2, 0.16, 0.18]),
+        mass_solar=torch.tensor([0.002264, 0.001449, 0.001834]),
         velocity_x_uas_per_day=torch.tensor([0.001, -0.0015, 0.0007]),
         velocity_y_uas_per_day=torch.tensor([-0.0005, 0.0008, -0.001]),
     ),
-    source_grid=mc.PlaneGrid((128, 128), (2.0, 2.0)),
 )
 
 method = mc.IPMConfig(
@@ -36,6 +35,8 @@ schedule = mc.DynamicConfig(
 
 maps = system.dynamic_maps(
     torch.arange(8, dtype=torch.float64).tolist(),
+    map_width_uas=2.0,
+    map_pixels=128,
     method=method,
     schedule=schedule,
 )

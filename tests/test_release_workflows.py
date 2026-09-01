@@ -21,7 +21,14 @@ NOTEBOOK_ROOT = PACKAGE_ROOT / "examples" / "notebooks"
 
 class MinimalInstallationTests(unittest.TestCase):
     def test_core_import_does_not_require_optional_packages(self) -> None:
-        blocked = ("astropy", "caustics", "jupyter", "lenstronomy", "matplotlib", "scipy")
+        blocked = (
+            "astropy",
+            "caustics",
+            "jupyter",
+            "lenstronomy",
+            "matplotlib",
+            "scipy",
+        )
         script = f"""
 import importlib.abc
 import sys
@@ -54,27 +61,31 @@ class SolverDTypeAndReproducibilityTests(unittest.TestCase):
         velocity_y = [-0.4e-4, 0.6e-4, -0.3e-4] if moving else None
         return mc.MicrolensingSimulation.create(
             mc.MacroLens(convergence=0.12, shear=0.05),
-            mc.PointMassField(
+            mc.PointMassField._from_einstein_radii(
                 x_uas=torch.tensor([-0.7, 0.1, 0.75], dtype=dtype),
                 y_uas=torch.tensor([0.35, -0.5, 0.15], dtype=dtype),
                 einstein_radius_uas=torch.tensor([0.16, 0.13, 0.15], dtype=dtype),
                 velocity_x_uas_per_day=(
-                    None if velocity_x is None else torch.tensor(velocity_x, dtype=dtype)
+                    None
+                    if velocity_x is None
+                    else torch.tensor(velocity_x, dtype=dtype)
                 ),
                 velocity_y_uas_per_day=(
-                    None if velocity_y is None else torch.tensor(velocity_y, dtype=dtype)
+                    None
+                    if velocity_y is None
+                    else torch.tensor(velocity_y, dtype=dtype)
                 ),
             ),
-            runtime=mc.RuntimeConfig(
-                device="cpu", backend="torch-eager", dtype=dtype
-            ),
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager", dtype=dtype),
         )
 
     def test_portable_irs_and_ipm_float32_match_float64(self) -> None:
         region = mc.PlaneRegion((4.0, 4.0))
         grid = mc.PlaneGrid((32, 32), (1.8, 1.8))
         methods = (
-            mc.IRSConfig(rays=16_384, far_field_approx=mc.FarFieldApproxConfig(enabled=False)),
+            mc.IRSConfig(
+                rays=16_384, far_field_approx=mc.FarFieldApproxConfig(enabled=False)
+            ),
             mc.IPMConfig(
                 rays=16_384,
                 scout_ratio=1,
@@ -87,12 +98,16 @@ class SolverDTypeAndReproducibilityTests(unittest.TestCase):
         for method in methods:
             with self.subTest(method=type(method).__name__):
                 maps = [
-                    self._simulation(dtype).magnification_map(region, grid, method=method)
+                    self._simulation(dtype).magnification_map(
+                        region, grid, method=method
+                    )
                     for dtype in (torch.float32, torch.float64)
                 ]
                 torch.testing.assert_close(
-                    maps[0].values.double(), maps[1].values.double(),
-                    rtol=2.0e-4, atol=2.0e-4,
+                    maps[0].values.double(),
+                    maps[1].values.double(),
+                    rtol=2.0e-4,
+                    atol=2.0e-4,
                 )
 
     def test_repeated_dynamic_sequence_is_deterministic(self) -> None:
@@ -114,15 +129,21 @@ class SolverDTypeAndReproducibilityTests(unittest.TestCase):
         first = tuple(
             frame.values.clone()
             for frame in simulation.dynamic_maps(
-                region, grid, (0.0, 5.0, 10.0, 15.0),
-                method=method, schedule=schedule,
+                region,
+                grid,
+                (0.0, 5.0, 10.0, 15.0),
+                method=method,
+                schedule=schedule,
             )
         )
         second = tuple(
             frame.values.clone()
             for frame in simulation.dynamic_maps(
-                region, grid, (0.0, 5.0, 10.0, 15.0),
-                method=method, schedule=schedule,
+                region,
+                grid,
+                (0.0, 5.0, 10.0, 15.0),
+                method=method,
+                schedule=schedule,
             )
         )
         self.assertEqual(len(first), len(second))
@@ -158,14 +179,15 @@ class LongCudaStabilityTests(unittest.TestCase):
                 cells_per_axis=4, nodes_per_cell_axis=4
             ),
         )
-        schedule = mc.DynamicConfig(
-            temporal_batch_size=4, scout_refresh_frames=2
-        )
+        schedule = mc.DynamicConfig(temporal_batch_size=4, scout_refresh_frames=2)
 
         def run_once() -> None:
             for frame in simulation.dynamic_maps(
-                region, grid, tuple(float(value) for value in range(12)),
-                method=method, schedule=schedule,
+                region,
+                grid,
+                tuple(float(value) for value in range(12)),
+                method=method,
+                schedule=schedule,
             ):
                 _ = float(frame.values.mean().detach().cpu())
 
@@ -189,9 +211,10 @@ class NotebookExecutionTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        if importlib.util.find_spec("nbclient") is None or importlib.util.find_spec(
-            "nbformat"
-        ) is None:
+        if (
+            importlib.util.find_spec("nbclient") is None
+            or importlib.util.find_spec("nbformat") is None
+        ):
             raise unittest.SkipTest("install microcaustics[notebooks]")
         import nbformat
         from nbclient import NotebookClient

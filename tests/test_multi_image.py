@@ -15,7 +15,9 @@ from microcaustics.multi_image import MacroImageConfig, MultiImageSimulation
 def _simulation() -> mc.MicrolensingSimulation:
     return mc.MicrolensingSimulation.create(
         mc.MacroLens(convergence=0.0, shear=0.0),
-        mc.PointMassField(torch.empty(0), torch.empty(0), torch.empty(0)),
+        mc.PointMassField._from_einstein_radii(
+            torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
+        ),
         runtime=mc.RuntimeConfig(
             device="cpu",
             backend=mc.Backend.TORCH_EAGER,
@@ -73,9 +75,7 @@ class MultiImageTests(unittest.TestCase):
         )
 
     def test_known_or_solved_delay_mapping_can_override_configurations(self) -> None:
-        initial = MultiImageSimulation.create(
-            [_image("A", 0.0), _image("B", 2.0)]
-        )
+        initial = MultiImageSimulation.create([_image("A", 0.0), _image("B", 2.0)])
         updated = initial.with_arrival_time_delays({"B": 7.5})
         self.assertEqual(initial.image("B").arrival_time_delay_days, 2.0)
         self.assertEqual(updated.image("A").arrival_time_delay_days, 0.0)
@@ -130,9 +130,7 @@ class MultiImageTests(unittest.TestCase):
         self.assertAlmostEqual(solutions[0].shear, 0.0)
 
     def test_resolved_light_curves_share_source_and_apply_distinct_delays(self) -> None:
-        system = MultiImageSimulation.create(
-            [_image("A", 0.0), _image("B", 2.0)]
-        )
+        system = MultiImageSimulation.create([_image("A", 0.0), _image("B", 2.0)])
         callbacks = {"A": [], "B": []}
         result = system.light_curves(
             [5.0, 7.0],
@@ -166,9 +164,7 @@ class MultiImageTests(unittest.TestCase):
         )
 
     def test_per_image_cadences_are_supported_but_not_stackable(self) -> None:
-        system = MultiImageSimulation.create(
-            [_image("A", 0.0), _image("B", 1.0)]
-        )
+        system = MultiImageSimulation.create([_image("A", 0.0), _image("B", 1.0)])
         result = system.light_curves(
             {"A": [1.0, 2.0], "B": [1.0, 2.0, 3.0]},
             _variable_source(),
@@ -182,9 +178,7 @@ class MultiImageTests(unittest.TestCase):
     def test_multirate_curves_keep_explicit_delays_and_generate_sparse_maps(
         self,
     ) -> None:
-        system = MultiImageSimulation.create(
-            [_image("A", 0.0), _image("B", 2.0)]
-        )
+        system = MultiImageSimulation.create([_image("A", 0.0), _image("B", 2.0)])
         callbacks = {"A": [], "B": []}
         result = system.multirate_light_curves(
             [0.0, 2.0],

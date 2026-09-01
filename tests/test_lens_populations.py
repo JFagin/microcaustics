@@ -185,8 +185,10 @@ class LensPopulationTests(unittest.TestCase):
         source_half_x = 0.5 * source.field_of_view_uas[1] + margin
         corners = torch.tensor(
             [
-                [source.center_uas[1] + sx * source_half_x,
-                 source.center_uas[0] + sy * source_half_y]
+                [
+                    source.center_uas[1] + sx * source_half_x,
+                    source.center_uas[0] + sy * source_half_y,
+                ]
                 for sx in (-1.0, 1.0)
                 for sy in (-1.0, 1.0)
             ],

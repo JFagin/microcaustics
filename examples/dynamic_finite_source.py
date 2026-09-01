@@ -12,7 +12,7 @@ distances = mc.LensingDistances(
 field = mc.PointMassField(
     x_uas=torch.tensor([-0.4, 0.5]),
     y_uas=torch.tensor([0.2, -0.3]),
-    einstein_radius_uas=torch.tensor([0.18, 0.22]),
+    mass_solar=torch.tensor([0.001834, 0.002739]),
     velocity_x_uas_per_day=torch.tensor([2.0e-4, -1.0e-4]),
     velocity_y_uas_per_day=torch.tensor([1.0e-4, 1.5e-4]),
 )

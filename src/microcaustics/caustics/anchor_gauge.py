@@ -606,6 +606,73 @@ def anchor_gauge_label_map(
         device=segments.device,
         dtype=torch.bool,
     )
+    if segments.device.type == "cuda" and segments.dtype == torch.float32:
+        try:
+            from .triton_caustics import (
+                batched_caustic_crossings_distances_triton,
+                triton_caustics_available,
+            )
+
+            if triton_caustics_available():
+                invalid = field.invalid_segment_mask
+                invalid = (
+                    None
+                    if invalid is None or not bool(invalid.any().detach().cpu())
+                    else invalid.to(device=segments.device, dtype=torch.bool)[None]
+                )
+                values = torch.empty(
+                    points.shape[0],
+                    device=segments.device,
+                    dtype=torch.int8,
+                )
+                offsets_device = offsets.to(
+                    device=segments.device,
+                    dtype=torch.int64,
+                )
+                empty = points[:0]
+                cuda_point_chunk = max(int(config.point_chunk_size), 65_536)
+                for start in range(0, points.shape[0], cuda_point_chunk):
+                    stop = min(points.shape[0], start + cuda_point_chunk)
+                    query = points[start:stop]
+                    counts, _ = batched_caustic_crossings_distances_triton(
+                        segments,
+                        valid,
+                        anchors,
+                        query,
+                        empty,
+                        block_segments=config.triton_segment_block,
+                    )
+                    parity = (counts[0].to(torch.int64) & 1) ^ offsets_device
+                    if invalid is None:
+                        mask = torch.ones_like(parity, dtype=torch.bool)
+                    else:
+                        invalid_counts, _ = (
+                            batched_caustic_crossings_distances_triton(
+                                segments,
+                                invalid,
+                                anchors,
+                                query,
+                                empty,
+                                block_segments=config.triton_segment_block,
+                            )
+                        )
+                        mask = invalid_counts[0] == 0
+                    ones = (parity * mask.to(parity.dtype)).sum(dim=-1)
+                    valid_votes = mask.sum(dim=-1)
+                    values[start:stop] = (ones > (valid_votes - ones)).to(torch.int8)
+                values = (values ^ int(frame_xor)).reshape(grid.shape)
+                return LabelMap(
+                    values,
+                    grid,
+                    metadata={
+                        "method": "anchor_gauge_binary_majority",
+                        "anchor_count": int(anchors.shape[0]),
+                        "frame_xor": int(frame_xor),
+                        "triton_grid_query": True,
+                    },
+                )
+        except Exception as error:
+            warn_backend_fallback("Triton diagnostic label map", error)
     counts, _ = _crossing_counts_and_distances_portable(
         segments,
         valid,

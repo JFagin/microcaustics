@@ -10,11 +10,39 @@ import torch
 from ..config import FarFieldApproxConfig
 from ..geometry import PlaneGrid
 from ..results import CausticField, TimingBreakdown
+from ..runtime import warn_backend_fallback
 from ..solvers import jacobian_determinant_direct, raytrace_direct
 from .marching import marching_squares_zero
 
 if TYPE_CHECKING:
     from ..simulation import MicrolensingSimulation
+
+
+def _extract_zero_segments(
+    determinant: torch.Tensor,
+    lens_grid: PlaneGrid,
+) -> tuple[torch.Tensor, str]:
+    """Use compact CUDA marching squares with an exact portable fallback."""
+
+    if determinant.device.type == "cuda" and determinant.dtype == torch.float32:
+        try:
+            from .triton_caustics import (
+                marching_squares_zero_triton,
+                triton_caustics_available,
+            )
+
+            if triton_caustics_available():
+                return (
+                    marching_squares_zero_triton(determinant, lens_grid),
+                    "triton_compact",
+                )
+        except Exception as error:
+            warn_backend_fallback("Triton complete-field marching squares", error)
+    x_grid, y_grid = lens_grid.mesh(
+        device=determinant.device,
+        dtype=determinant.dtype,
+    )
+    return marching_squares_zero(determinant, x_grid, y_grid), "torch_portable"
 
 
 @torch.no_grad()
@@ -48,7 +76,7 @@ def direct_caustic_field(
         ray_chunk_size=ray_chunk_size,
     )
     determinant_finished = perf_counter()
-    critical = marching_squares_zero(determinant, x_grid, y_grid)
+    critical, rasterizer = _extract_zero_segments(determinant, lens_grid)
     marching_finished = perf_counter()
     if critical.numel():
         source_x, source_y, _ = raytrace_direct(
@@ -87,6 +115,7 @@ def direct_caustic_field(
             "method": "direct_point_mass",
             "determinant_grid_shape": list(lens_grid.shape),
             "determinant_ray_chunks": determinant_diagnostics.ray_chunks,
+            "marching_squares": rasterizer,
             "segment_representation": "independent_linear_segments",
         },
         timing=timing,
@@ -101,6 +130,7 @@ def far_field_caustic_field(
     *,
     time_days: float = 0.0,
     star_chunk_size: int = 4096,
+    ray_chunk_size: int | None = None,
 ) -> CausticField:
     """Calculate critical curves and caustics with analytic Taylor far-field approximation."""
 
@@ -117,10 +147,67 @@ def far_field_caustic_field(
         star_chunk_size=star_chunk_size,
     )
     built = perf_counter()
-    x_grid, y_grid = lens_grid.mesh(device=runtime.device, dtype=runtime.dtype)
-    determinant = approximation.jacobian_determinant(x_grid, y_grid)
+    point_count = lens_grid.shape[0] * lens_grid.shape[1]
+    chunk_size = (
+        int(ray_chunk_size)
+        if ray_chunk_size is not None
+        else min(point_count, 1_048_576)
+    )
+    if chunk_size < 1:
+        raise ValueError("ray_chunk_size must be positive")
+    determinant = torch.empty(
+        point_count,
+        device=runtime.device,
+        dtype=runtime.dtype,
+    )
+    ny, nx = lens_grid.shape
+    dy, dx = lens_grid.pixel_scale_uas
+    xmin, _, ymin, _ = lens_grid.bounds_uas
+    regular_grid_triton = False
+    regular_grid_query = None
+    if runtime.device.type == "cuda" and runtime.dtype == torch.float32:
+        try:
+            from ..solvers.triton_taylor import (
+                evaluate_far_field_p4_regular_grid_jacobian_triton,
+                triton_taylor_available,
+            )
+
+            if triton_taylor_available() and config.taylor_order == 4:
+                regular_grid_query = (
+                    evaluate_far_field_p4_regular_grid_jacobian_triton
+                )
+                regular_grid_triton = True
+        except Exception as error:
+            warn_backend_fallback("Triton regular-grid determinant", error)
+    if regular_grid_query is not None and ray_chunk_size is None:
+        # Grid coordinates are loaded from two short axes inside the kernel,
+        # so one full launch requires no point-sized coordinate workspace.
+        chunk_size = point_count
+    for start in range(0, point_count, chunk_size):
+        stop = min(point_count, start + chunk_size)
+        if regular_grid_query is not None:
+            try:
+                regular_grid_query(
+                    approximation,
+                    lens_grid,
+                    determinant,
+                    start=start,
+                    stop=stop,
+                )
+                continue
+            except Exception as error:
+                warn_backend_fallback("Triton regular-grid determinant", error)
+                regular_grid_query = None
+                regular_grid_triton = False
+        linear = torch.arange(start, stop, device=runtime.device, dtype=torch.int64)
+        row = torch.div(linear, nx, rounding_mode="floor")
+        column = linear - row * nx
+        x = xmin + (column.to(runtime.dtype) + 0.5) * dx
+        y = ymin + (row.to(runtime.dtype) + 0.5) * dy
+        determinant[start:stop] = approximation.jacobian_determinant(x, y)
+    determinant = determinant.reshape(ny, nx)
     determinant_finished = perf_counter()
-    critical = marching_squares_zero(determinant, x_grid, y_grid)
+    critical, rasterizer = _extract_zero_segments(determinant, lens_grid)
     marching_finished = perf_counter()
     if critical.numel():
         source_x, source_y = approximation.raytrace(
@@ -141,6 +228,11 @@ def far_field_caustic_field(
             "method": "local_exact_complex_taylor_far_field",
             "determinant_grid_shape": list(lens_grid.shape),
             "segment_representation": "independent_linear_segments",
+            "marching_squares": rasterizer,
+            "determinant_ray_chunks": (point_count + chunk_size - 1) // chunk_size,
+            "regular_grid_determinant": (
+                "triton_indexed" if regular_grid_triton else "coordinate_tensors"
+            ),
             "far_field_cells": list(approximation.diagnostics.cells),
             "far_field_nodes_per_cell": list(
                 approximation.diagnostics.nodes_per_cell

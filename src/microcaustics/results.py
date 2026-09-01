@@ -392,16 +392,18 @@ class CausticField:
         if orientation not in {"signed", "positive"}:
             raise ValueError("orientation must be 'signed' or 'positive'")
 
-        x, y = grid.mesh(
+        y, x = grid.axes(
             device=self.caustic_segments_uas.device,
             dtype=self.caustic_segments_uas.dtype,
         )
-        points = torch.stack((x.reshape(-1), y.reshape(-1)), dim=-1)
-        values = self.winding_number(
-            points,
-            point_chunk_size=point_chunk_size,
+        from .caustics import regular_grid_winding_number
+
+        values = regular_grid_winding_number(
+            self.caustic_segments_uas,
+            y,
+            x,
             segment_chunk_size=segment_chunk_size,
-        ).reshape(grid.shape)
+        )
         sign_flipped = False
         if orientation == "positive":
             nonzero = values[values != 0]
@@ -429,16 +431,19 @@ class CausticField:
     ) -> LabelMap:
         """Evaluate binary crossing parity at every cell center of ``grid``."""
 
-        x, y = grid.mesh(
+        y, x = grid.axes(
             device=self.caustic_segments_uas.device,
             dtype=self.caustic_segments_uas.dtype,
         )
-        points = torch.stack((x.reshape(-1), y.reshape(-1)), dim=-1)
-        labels = self.crossing_parity(
-            points,
-            point_chunk_size=point_chunk_size,
+        from .caustics import regular_grid_winding_number
+
+        winding = regular_grid_winding_number(
+            self.caustic_segments_uas,
+            y,
+            x,
             segment_chunk_size=segment_chunk_size,
-        ).reshape(grid.shape)
+        )
+        labels = torch.remainder(winding, 2).to(torch.int8)
         return LabelMap(
             labels,
             grid,

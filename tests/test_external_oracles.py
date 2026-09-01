@@ -42,7 +42,9 @@ RUN_LENSTRONOMY = os.environ.get("MICROCAUSTICS_RUN_LENSTRONOMY", "").lower() in
 
 def _empty_field(dtype=torch.float64) -> mc.PointMassField:
     empty = torch.empty(0, dtype=dtype)
-    return mc.PointMassField(empty, empty, empty)
+    return mc.PointMassField._from_einstein_radii(
+        empty, empty, einstein_radius_uas=empty
+    )
 
 
 class NumPyOracleTests(unittest.TestCase):
@@ -74,10 +76,10 @@ class NumPyOracleTests(unittest.TestCase):
             shear_angle_rad=0.37,
             smooth_matter_fraction=0.35,
         )
-        stars = mc.PointMassField(
+        stars = mc.PointMassField._from_einstein_radii(
             torch.tensor([-0.8, 0.35, 1.1], dtype=dtype),
             torch.tensor([0.25, -0.55, 0.9], dtype=dtype),
-            torch.tensor([0.13, 0.22, 0.17], dtype=dtype),
+            einstein_radius_uas=torch.tensor([0.13, 0.22, 0.17], dtype=dtype),
         )
         simulation = mc.MicrolensingSimulation.create(
             macro,
@@ -144,7 +146,9 @@ class SciPyOracleTests(unittest.TestCase):
         np.testing.assert_allclose(
             carlson_rf(x, y, z), special.elliprf(xn, yn, zn), rtol=2e-14
         )
-        np.testing.assert_allclose(carlson_rc(x, y), special.elliprc(xn, yn), rtol=2e-14)
+        np.testing.assert_allclose(
+            carlson_rc(x, y), special.elliprc(xn, yn), rtol=2e-14
+        )
         np.testing.assert_allclose(
             carlson_rd(x, y, z), special.elliprd(xn, yn, zn), rtol=2e-14
         )
@@ -215,9 +219,7 @@ class SciPyOracleTests(unittest.TestCase):
             oversample_factor=oversample,
             dtype=torch.float64,
         ).numpy()
-        sigma_pixels = (
-            fwhm_arcsec / (pixel_scale_arcsec / oversample) / 2.354820045
-        )
+        sigma_pixels = fwhm_arcsec / (pixel_scale_arcsec / oversample) / 2.354820045
         axis = gaussian(size, sigma_pixels)
         expected = np.outer(axis, axis)
         expected /= expected.sum()
@@ -359,9 +361,7 @@ class LenstronomyOracleTests(unittest.TestCase):
             torch.as_tensor(x),
             torch.as_tensor(y),
         )
-        expected_determinant = (
-            (1.0 - f_xx) * (1.0 - f_yy) - (-f_xy) * (-f_yx)
-        )
+        expected_determinant = (1.0 - f_xx) * (1.0 - f_yy) - (-f_xy) * (-f_yx)
         np.testing.assert_allclose(
             determinant,
             expected_determinant,
@@ -391,8 +391,7 @@ class LenstronomyOracleTests(unittest.TestCase):
         y = np.asarray([0.9, -1.2, 0.1, -0.45])
 
         model = LensModel(
-            lens_model_list=["CONVERGENCE", "SHEAR"]
-            + ["POINT_MASS"] * len(star_x)
+            lens_model_list=["CONVERGENCE", "SHEAR"] + ["POINT_MASS"] * len(star_x)
         )
         kwargs = [
             {"kappa": convergence, "ra_0": 0.0, "dec_0": 0.0},
@@ -418,10 +417,10 @@ class LenstronomyOracleTests(unittest.TestCase):
                 shear_angle_rad=angle,
                 smooth_matter_fraction=1.0,
             ),
-            mc.PointMassField(
+            mc.PointMassField._from_einstein_radii(
                 torch.as_tensor(star_x),
                 torch.as_tensor(star_y),
-                torch.as_tensor(theta_e),
+                einstein_radius_uas=torch.as_tensor(theta_e),
             ),
             runtime=mc.RuntimeConfig(
                 device="cpu",
@@ -431,9 +430,7 @@ class LenstronomyOracleTests(unittest.TestCase):
         )
         source_x, source_y, _ = simulation.raytrace_direct(x, y)
         determinant, _ = simulation.jacobian_determinant_direct(x, y)
-        expected_determinant = (
-            (1.0 - f_xx) * (1.0 - f_yy) - (-f_xy) * (-f_yx)
-        )
+        expected_determinant = (1.0 - f_xx) * (1.0 - f_yy) - (-f_xy) * (-f_yx)
         np.testing.assert_allclose(source_x, x - alpha_x, rtol=0.0, atol=3e-14)
         np.testing.assert_allclose(source_y, y - alpha_y, rtol=0.0, atol=3e-14)
         np.testing.assert_allclose(
@@ -470,10 +467,9 @@ class LenstronomyOracleTests(unittest.TestCase):
 
         def delay(x, y):
             radius = torch.hypot(x, y).clamp_min(1.0e-30)
-            return (
-                0.5 * ((x - beta_x).square() + (y - beta_y).square())
-                - theta_e**2 * torch.log(radius)
-            )
+            return 0.5 * (
+                (x - beta_x).square() + (y - beta_y).square()
+            ) - theta_e**2 * torch.log(radius)
 
         model = mc.CallableMacroModel(raytrace, jacobian, delay, name="point_mass")
         solutions = mc.solve_macroimages(
@@ -500,7 +496,9 @@ class LenstronomyOracleTests(unittest.TestCase):
             [[solution.x_arcsec, solution.y_arcsec] for solution in solutions]
         )
         for expected in expected_positions:
-            self.assertLess(np.min(np.linalg.norm(actual_positions - expected, axis=1)), 2e-9)
+            self.assertLess(
+                np.min(np.linalg.norm(actual_positions - expected, axis=1)), 2e-9
+            )
 
         lens = LensModel(lens_model_list=["POINT_MASS"])
         kwargs = [{"theta_E": theta_e, "center_x": 0.0, "center_y": 0.0}]

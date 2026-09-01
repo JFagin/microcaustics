@@ -50,10 +50,10 @@ def _simulation(backend: str, *, strict: bool) -> mc.MicrolensingSimulation:
             shear_angle_rad=0.17,
             smooth_matter_fraction=0.3,
         ),
-        mc.PointMassField(
+        mc.PointMassField._from_einstein_radii(
             torch.tensor([-0.8, -0.1, 0.65, 1.2], device=device),
             torch.tensor([0.5, -0.7, 0.25, -0.4], device=device),
-            torch.tensor([0.12, 0.09, 0.11, 0.08], device=device),
+            einstein_radius_uas=torch.tensor([0.12, 0.09, 0.11, 0.08], device=device),
         ),
         runtime=mc.RuntimeConfig(
             device=device,
@@ -65,9 +65,7 @@ def _simulation(backend: str, *, strict: bool) -> mc.MicrolensingSimulation:
 
 @unittest.skipUnless(
     torch.cuda.is_available()
-    and _torch_compile_supported(
-        torch.device("cuda"), RuntimeCapabilities.detect()
-    ),
+    and _torch_compile_supported(torch.device("cuda"), RuntimeCapabilities.detect()),
     "CUDA torch.compile or its native compiler toolchain is unavailable",
 )
 class CompiledBackendCudaTests(unittest.TestCase):

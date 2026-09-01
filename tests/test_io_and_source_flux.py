@@ -13,9 +13,7 @@ import microcaustics as mc
 
 class ResultIOAndSourceFluxTests(unittest.TestCase):
     def test_source_light_curve_integrates_physical_pixels_in_batches(self):
-        geometry = mc.SourceGeometry(
-            (2, 3), (4.0, 5.0), (5000.0, 7000.0), ("a", "b")
-        )
+        geometry = mc.SourceGeometry((2, 3), (4.0, 5.0), (5000.0, 7000.0), ("a", "b"))
         image = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2) + 1.0
         source = mc.StaticSource(image, geometry)
         curve = mc.source_light_curve(source, [0.0, 1.0, 2.0], batch_size=2)

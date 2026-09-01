@@ -10,6 +10,7 @@ from .labels import (
     crossing_parity,
     distance_to_segments,
     orient_mapped_closed_segments,
+    regular_grid_winding_number,
     winding_number,
 )
 from .marching import marching_squares_zero
@@ -30,6 +31,7 @@ __all__ = [
     "distance_to_segments",
     "marching_squares_zero",
     "orient_mapped_closed_segments",
+    "regular_grid_winding_number",
     "winding_number",
     "dynamic_labeled_caustics",
     "dynamic_labeled_maps",

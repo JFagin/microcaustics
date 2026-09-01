@@ -20,10 +20,10 @@ python examples/static_ipm_map.py
 - `automatic_tuning.py` selects safe temporal and spatial batch sizes.
 - `batched_light_curves.py` batches several sources through one shared map sequence.
 
-The static scripts expose grids and lens regions directly because they also
-serve as compact examples of the lower-level API. The first getting-started
-notebook shows the shorter physical-system interface with automatic source and
-lens geometry.
+The static scripts use `map_width_uas` and `map_pixels`, so a centered square
+map does not require a geometry object. Advanced validation examples retain an
+explicit `PlaneGrid` when they need rectangular, off-center, or exactly
+registered grids.
 
 ## Sources and relativistic calculations
 

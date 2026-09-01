@@ -59,9 +59,21 @@ which lens-plane cells or rays are evaluated.
 The lower-level builders below remain useful when a study needs an explicit
 region or directly controlled star arrays.
 
-Users may provide point lenses directly with `PointMassField`, construct them
-from physical masses with `PointMassField.from_masses`, or draw a reproducible
-uniform population:
+Users may provide physical masses and positions directly with
+`PointMassField`, or draw a reproducible uniform population:
+
+```python
+catalog = mc.PointMassField(
+    x_uas=[-2.0, 0.5, 1.7],
+    y_uas=[0.2, -1.1, 1.4],
+    mass_solar=[0.3, 1e-3, 30.0],
+)
+```
+
+The containing `MicrolensingSystem` derives each angular Einstein radius from
+its lens and source distances. Use `einstein_units_to_uas` and
+`uas_to_einstein_units` when an external catalog or simulation is expressed
+in units of the Einstein radius of a selected mean microlens mass.
 
 ```python
 macro = mc.MacroLens(

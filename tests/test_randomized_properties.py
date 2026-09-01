@@ -31,7 +31,9 @@ class RandomizedNumericalProperties(unittest.TestCase):
             )
             simulation = mc.MicrolensingSimulation.create(
                 macro,
-                mc.PointMassField(star_x, star_y, radii),
+                mc.PointMassField._from_einstein_radii(
+                    star_x, star_y, einstein_radius_uas=radii
+                ),
                 runtime=mc.RuntimeConfig(
                     device="cpu",
                     backend="torch-eager",
@@ -64,7 +66,9 @@ class RandomizedNumericalProperties(unittest.TestCase):
             torch.testing.assert_close(actual_x, x - alpha_x, rtol=2e-14, atol=2e-14)
             torch.testing.assert_close(actual_y, y - alpha_y, rtol=2e-14, atol=2e-14)
 
-    def test_direct_lens_equation_is_translation_covariant_without_macro_terms(self) -> None:
+    def test_direct_lens_equation_is_translation_covariant_without_macro_terms(
+        self,
+    ) -> None:
         generator = torch.Generator().manual_seed(74021)
         star_x = torch.rand(9, generator=generator, dtype=torch.float64) * 3.0 - 1.5
         star_y = torch.rand(9, generator=generator, dtype=torch.float64) * 3.0 - 1.5
@@ -76,7 +80,9 @@ class RandomizedNumericalProperties(unittest.TestCase):
         def trace(offset_x: float, offset_y: float):
             simulation = mc.MicrolensingSimulation.create(
                 mc.MacroLens(0.0, 0.0),
-                mc.PointMassField(star_x + offset_x, star_y + offset_y, radii),
+                mc.PointMassField._from_einstein_radii(
+                    star_x + offset_x, star_y + offset_y, einstein_radius_uas=radii
+                ),
                 runtime=mc.RuntimeConfig(
                     device="cpu",
                     backend="torch-eager",
@@ -95,7 +101,9 @@ class RandomizedNumericalProperties(unittest.TestCase):
         empty = torch.empty(0, dtype=torch.float64)
         simulation = mc.MicrolensingSimulation.create(
             mc.MacroLens(0.0, 0.0),
-            mc.PointMassField(empty, empty, empty),
+            mc.PointMassField._from_einstein_radii(
+                empty, empty, einstein_radius_uas=empty
+            ),
             runtime=mc.RuntimeConfig(
                 device="cpu",
                 backend="torch-eager",

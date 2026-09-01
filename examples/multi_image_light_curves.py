@@ -34,7 +34,7 @@ def stars(offset: float) -> mc.PointMassField:
     return mc.PointMassField(
         x_uas=torch.tensor([-0.5 + offset, 0.45 + offset]),
         y_uas=torch.tensor([0.3, -0.25]),
-        einstein_radius_uas=torch.tensor([0.18, 0.16]),
+        mass_solar=torch.tensor([0.002579, 0.002037]),
         velocity_x_uas_per_day=torch.tensor([0.001, -0.0007]),
         velocity_y_uas_per_day=torch.tensor([-0.0004, 0.0008]),
     )

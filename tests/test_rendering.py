@@ -190,7 +190,9 @@ class CausticsRenderingTests(unittest.TestCase):
         )
         self.assertEqual(result.metadata["observation"]["name"], "test detector")
 
-    def test_static_caustics_macro_model_does_not_misroute_empty_parameters(self) -> None:
+    def test_static_caustics_macro_model_does_not_misroute_empty_parameters(
+        self,
+    ) -> None:
         model = mc.CausticsMacroModel(self.lens(), parameters=torch.empty(0))
         x = torch.tensor([0.8], dtype=torch.float64)
         y = torch.tensor([0.1], dtype=torch.float64)

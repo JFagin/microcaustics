@@ -16,12 +16,12 @@ from microcaustics.solvers import (
 def _moving_simulation(dtype: str = "float32") -> mc.MicrolensingSimulation:
     return mc.MicrolensingSimulation.create(
         mc.MacroLens(convergence=0.12, shear=0.06),
-        mc.PointMassField(
+        mc.PointMassField._from_einstein_radii(
             torch.tensor([-0.45, 0.35]),
             torch.tensor([0.25, -0.3]),
-            torch.tensor([0.22, 0.17]),
-            torch.tensor([0.002, -0.001]),
-            torch.tensor([-0.001, 0.0015]),
+            velocity_x_uas_per_day=torch.tensor([0.002, -0.001]),
+            velocity_y_uas_per_day=torch.tensor([-0.001, 0.0015]),
+            einstein_radius_uas=torch.tensor([0.22, 0.17]),
         ),
         runtime=mc.RuntimeConfig(
             device="cpu",
@@ -68,8 +68,12 @@ class AutoTuningTests(unittest.TestCase):
         )
         windowed = (*first, *second)
         for actual, expected in zip(windowed, complete, strict=True):
-            torch.testing.assert_close(actual.coefficient_real, expected.coefficient_real)
-            torch.testing.assert_close(actual.coefficient_imag, expected.coefficient_imag)
+            torch.testing.assert_close(
+                actual.coefficient_real, expected.coefficient_real
+            )
+            torch.testing.assert_close(
+                actual.coefficient_imag, expected.coefficient_imag
+            )
             torch.testing.assert_close(actual.local_x, expected.local_x)
             torch.testing.assert_close(actual.local_y, expected.local_y)
         self.assertEqual(first_metadata["far_field_requested_frames"], [0, 1, 2])
@@ -229,12 +233,12 @@ class AutoTuningTests(unittest.TestCase):
     def test_cuda_tuning_records_peak_memory_below_budget(self) -> None:
         simulation = mc.MicrolensingSimulation.create(
             mc.MacroLens(convergence=0.0, shear=0.0),
-            mc.PointMassField(
+            mc.PointMassField._from_einstein_radii(
                 torch.tensor([0.0]),
                 torch.tensor([0.0]),
-                torch.tensor([0.2]),
-                torch.tensor([0.001]),
-                torch.tensor([0.0]),
+                velocity_x_uas_per_day=torch.tensor([0.001]),
+                velocity_y_uas_per_day=torch.tensor([0.0]),
+                einstein_radius_uas=torch.tensor([0.2]),
             ),
             runtime=mc.RuntimeConfig(
                 device="cuda",

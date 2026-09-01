@@ -122,6 +122,29 @@ Pass `diagnostic_grid=` to materialize the full anchor/gauge majority map and
 These options are intended for validation and animations, not center-only
 production labels.
 
+Regular-grid parity and winding maps use an exact scanline accumulation. A
+segment crossing updates one contiguous row prefix, followed by an integer
+cumulative sum. CUDA float32 performs the half-open crossing tests, binary
+searches the actual sampled x axis, and accumulates the integer prefix updates
+in one Triton kernel. This preserves the grid coordinates and crossing rule
+without point-by-segment output tensors. CUDA float32 anchor/gauge maps use the
+same finite-path voting rule as the production labels through chunked Triton
+queries. CUDA float32 distance maps use the exact point-to-segment Triton
+reduction. CPU, Apple, float64, and non-Triton execution retain the portable
+chunked Torch calculation. These implementations differ only in execution
+strategy.
+
+Winding maps still require a complete, consistently oriented caustic field.
+Extracting that complete field can dominate runtime because the determinant
+must cover the requested lens plane. Once those segments exist, the winding
+map itself uses the scanline path above.
+
+For CUDA float32 order-four far fields, complete-field determinant evaluation
+loads the two regular-grid coordinate axes directly inside the Triton query.
+It therefore uses one launch without materializing full coordinate meshes.
+Compact Triton marching squares then extracts only the zero-crossing segments.
+Other dtypes and backends evaluate the same grid in bounded coordinate chunks.
+
 Canonical shared vertices, half-open predicates, and invalid-component vote
 masks make the label query stable in the solver dtype. A second float64 label
 replay is therefore not part of the production or public configuration.

@@ -13,6 +13,137 @@ import microcaustics as mc
 
 
 class MicrolensingSystemTests(unittest.TestCase):
+    def test_direct_physical_masses_resolve_from_system_distances(self) -> None:
+        stars = mc.PointMassField(
+            x_uas=[-0.5, 0.75],
+            y_uas=[0.2, -0.4],
+            mass_solar=[0.3, 1.2],
+        )
+        with self.assertRaisesRegex(RuntimeError, "have not been resolved"):
+            _ = stars.einstein_radius_uas
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            stars=stars,
+            source_grid=self.source_grid,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        resolved = system.realized_stars
+        torch.testing.assert_close(
+            resolved.einstein_radius_uas,
+            self.distances.einstein_radius_uas(
+                torch.tensor([0.3, 1.2]), dtype=torch.float32
+            ),
+        )
+        torch.testing.assert_close(resolved.mass_solar, torch.tensor([0.3, 1.2]))
+
+    def test_einstein_coordinate_helpers_round_trip(self) -> None:
+        values = torch.tensor([-2.0, 0.0, 3.5])
+        angular = mc.einstein_units_to_uas(
+            values,
+            mean_mass_solar=0.3,
+            distances=self.distances,
+        )
+        recovered = mc.uas_to_einstein_units(
+            angular,
+            mean_mass_solar=0.3,
+            distances=self.distances,
+        )
+        torch.testing.assert_close(recovered, values)
+        self.assertGreater(
+            float(mc.einstein_radius_uas(0.3, distances=self.distances)), 0.0
+        )
+
+    def test_lens_plane_size_accepts_auto_square_and_rectangle(self) -> None:
+        stars = mc.PointMassField([0.0], [0.0], [0.3])
+        common = dict(
+            macro=self.macro,
+            distances=self.distances,
+            stars=stars,
+            source_grid=self.source_grid,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        automatic = mc.MicrolensingSystem(**common).resolved_lens_region
+        square = mc.MicrolensingSystem(
+            **common, lens_plane_uas=7.0
+        ).resolved_lens_region
+        rectangle = mc.MicrolensingSystem(
+            **common, lens_plane_uas=(6.0, 8.0)
+        ).resolved_lens_region
+        self.assertGreater(automatic.field_of_view_uas[0], 0.0)
+        self.assertEqual(square.field_of_view_uas, (7.0, 7.0))
+        self.assertEqual(rectangle.field_of_view_uas, (6.0, 8.0))
+        with self.assertRaisesRegex(ValueError, "not both"):
+            mc.MicrolensingSystem(
+                **common,
+                lens_plane_uas=7.0,
+                lens_region=self.lens_region,
+            )
+
+    def test_source_independent_square_map_needs_no_plane_grid(self) -> None:
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            stars=self._stars(),
+            lens_region=self.lens_region,
+            integration_domain="full",
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        method = mc.IPMConfig(
+            rays=64,
+            refinement=1,
+            virtual_refinement=1,
+            tiled=False,
+            far_field_approx=mc.FarFieldApproxConfig(enabled=False),
+        )
+
+        generated = system.magnification_map(
+            map_width_uas=2.0,
+            map_pixels=8,
+            method=method,
+        )
+        explicit = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            source_grid=mc.PlaneGrid((8, 8), (2.0, 2.0)),
+            stars=self._stars(),
+            lens_region=self.lens_region,
+            integration_domain="full",
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        ).magnification_map(method=method)
+
+        self.assertEqual(generated.grid.shape, (8, 8))
+        self.assertEqual(generated.grid.field_of_view_uas, (2.0, 2.0))
+        torch.testing.assert_close(generated.values, explicit.values)
+        self.assertIs(
+            system._with_square_map_grid(map_width_uas=2.0, map_pixels=8),
+            system._with_square_map_grid(map_width_uas=2.0, map_pixels=8),
+        )
+        dynamic = tuple(
+            system.dynamic_maps(
+                (0.0, 1.0),
+                map_width_uas=2.0,
+                map_pixels=8,
+                method=method,
+                schedule=mc.DynamicConfig(temporal_batch_size=2),
+            )
+        )
+        self.assertEqual(len(dynamic), 2)
+        self.assertEqual(dynamic[0].grid, generated.grid)
+
+    def test_source_independent_map_geometry_validation(self) -> None:
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            stars=self._stars(),
+            lens_region=self.lens_region,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        with self.assertRaisesRegex(ValueError, "map_width_uas and map_pixels"):
+            system.magnification_map(map_width_uas=2.0)
+        with self.assertRaisesRegex(ValueError, "map_width_uas and map_pixels"):
+            system.magnification_map()
+
     def test_plain_band_mapping_and_sampling_keywords(self) -> None:
         model = mc.ThinDiskModel(
             black_hole_mass_solar=1.0e8,
@@ -149,10 +280,10 @@ class MicrolensingSystemTests(unittest.TestCase):
 
     @staticmethod
     def _stars() -> mc.PointMassField:
-        return mc.PointMassField(
+        return mc.PointMassField._from_einstein_radii(
             torch.tensor([-0.4, 0.5, 1.0]),
             torch.tensor([0.3, -0.5, 0.6]),
-            torch.tensor([0.2, 0.16, 0.12]),
+            einstein_radius_uas=torch.tensor([0.2, 0.16, 0.12]),
         )
 
     def test_salpeter_constructor_matches_requested_mean_and_ratio(self) -> None:
@@ -210,8 +341,12 @@ class MicrolensingSystemTests(unittest.TestCase):
             math.radians(23.0 - angle_deg),
         )
         angle = math.radians(angle_deg)
-        expected_x = math.cos(angle) * full.stars.x_uas + math.sin(angle) * full.stars.y_uas
-        expected_y = -math.sin(angle) * full.stars.x_uas + math.cos(angle) * full.stars.y_uas
+        expected_x = (
+            math.cos(angle) * full.stars.x_uas + math.sin(angle) * full.stars.y_uas
+        )
+        expected_y = (
+            -math.sin(angle) * full.stars.x_uas + math.cos(angle) * full.stars.y_uas
+        )
         torch.testing.assert_close(rectangle.stars.x_uas, expected_x)
         torch.testing.assert_close(rectangle.stars.y_uas, expected_y)
 
@@ -250,9 +385,7 @@ class MicrolensingSystemTests(unittest.TestCase):
             runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
         ).realize()
         original = trajectory.position_uas((0.0, 10.0), dtype=torch.float64)
-        rotated = realization.trajectory.position_uas(
-            (0.0, 10.0), dtype=torch.float64
-        )
+        rotated = realization.trajectory.position_uas((0.0, 10.0), dtype=torch.float64)
         angle = math.radians(angle_deg)
         expected = torch.stack(
             (
@@ -305,7 +438,9 @@ class MicrolensingSystemTests(unittest.TestCase):
         self.assertEqual(system.distances.source_redshift, 1.2)
         self.assertGreater(system.distances.lens_to_source_m, 0.0)
 
-    def test_redshift_system_can_replace_source_without_rebuilding_geometry(self) -> None:
+    def test_redshift_system_can_replace_source_without_rebuilding_geometry(
+        self,
+    ) -> None:
         original = mc.GaussianSource(
             mc.SourceGeometry(
                 shape=self.source_grid.shape,
@@ -818,10 +953,10 @@ class MicrolensingSystemTests(unittest.TestCase):
         angle = math.radians(angle_deg)
         macro = mc.MacroLens(0.31, 0.22, shear_angle_deg=angle_deg)
         stars = self._stars().to(dtype=torch.float64)
-        local_stars = mc.PointMassField(
+        local_stars = mc.PointMassField._from_einstein_radii(
             math.cos(angle) * stars.x_uas + math.sin(angle) * stars.y_uas,
             -math.sin(angle) * stars.x_uas + math.cos(angle) * stars.y_uas,
-            stars.einstein_radius_uas,
+            einstein_radius_uas=stars.einstein_radius_uas,
         )
         runtime = mc.RuntimeConfig(
             device="cpu", dtype=torch.float64, backend="torch-eager"
@@ -852,10 +987,10 @@ class MicrolensingSystemTests(unittest.TestCase):
         macro_sky = mc.MacroLens(0.31, 0.22, shear_angle_deg=angle_deg)
         macro_local = mc.MacroLens(0.31, 0.22, shear_angle_deg=0.0)
         stars_sky = self._stars().to(dtype=torch.float64)
-        stars_local = mc.PointMassField(
+        stars_local = mc.PointMassField._from_einstein_radii(
             stars_sky.y_uas,
             -stars_sky.x_uas,
-            stars_sky.einstein_radius_uas,
+            einstein_radius_uas=stars_sky.einstein_radius_uas,
         )
         population = mc.StellarPopulation.salpeter(
             mean_mass_solar=0.3,
@@ -927,9 +1062,7 @@ class MicrolensingSystemTests(unittest.TestCase):
             field_of_view_uas=source_grid.field_of_view_uas,
             bands={"optical": 6_000.0},
         )
-        sigma_m = float(
-            self.distances.uas_to_source_length(0.25, dtype=torch.float64)
-        )
+        sigma_m = float(self.distances.uas_to_source_length(0.25, dtype=torch.float64))
         sky_source = mc.GaussianSource(
             geometry,
             sigma_m=sigma_m,
@@ -1096,11 +1229,10 @@ class MicrolensingSystemTests(unittest.TestCase):
             mc.MicrolensingSystem(
                 macro=self.macro,
                 distances=self.distances,
-                source_grid=self.source_grid,
-                stars=mc.PointMassField(
+                stars=mc.PointMassField._from_einstein_radii(
                     self._stars().x_uas + shift,
                     self._stars().y_uas,
-                    self._stars().einstein_radius_uas,
+                    einstein_radius_uas=self._stars().einstein_radius_uas,
                 ),
                 integration_domain="full",
                 lens_region=self.lens_region,
@@ -1123,8 +1255,21 @@ class MicrolensingSystemTests(unittest.TestCase):
                 center_translation_order=4,
             ),
         )
-        batched = mc.batched_system_maps(systems, method=method, batch_size=2)
-        separate = tuple(system.magnification_map(method=method) for system in systems)
+        batched = mc.batched_system_maps(
+            systems,
+            map_width_uas=self.source_grid.field_of_view_uas[0],
+            map_pixels=self.source_grid.shape[0],
+            method=method,
+            batch_size=2,
+        )
+        separate = tuple(
+            system.magnification_map(
+                map_width_uas=self.source_grid.field_of_view_uas[0],
+                map_pixels=self.source_grid.shape[0],
+                method=method,
+            )
+            for system in systems
+        )
         self.assertEqual(len(batched), 2)
         for actual, expected in zip(batched, separate, strict=True):
             torch.testing.assert_close(actual.values, expected.values)
@@ -1251,10 +1396,10 @@ class MicrolensingSystemTests(unittest.TestCase):
                 distances=self.distances,
                 source=source,
                 source_grid=self.source_grid,
-                stars=mc.PointMassField(
+                stars=mc.PointMassField._from_einstein_radii(
                     self._stars().x_uas + shift,
                     self._stars().y_uas,
-                    self._stars().einstein_radius_uas,
+                    einstein_radius_uas=self._stars().einstein_radius_uas,
                 ),
                 integration_domain="full",
                 lens_region=self.lens_region,

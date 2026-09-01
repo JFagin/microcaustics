@@ -15,7 +15,7 @@ def _simulation() -> mc.MicrolensingSimulation:
     empty = torch.empty(0)
     return mc.MicrolensingSimulation.create(
         mc.MacroLens(0.0, 0.0),
-        mc.PointMassField(empty, empty, empty),
+        mc.PointMassField._from_einstein_radii(empty, empty, einstein_radius_uas=empty),
         runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
     )
 
@@ -132,11 +132,12 @@ class MemoryRecoveryTests(unittest.TestCase):
             ),
             mc.DynamicConfig(minimum_cell_chunk_size=8),
         )
-        with patch(
-            "microcaustics.solvers.ipm.full_field_ipm",
-            side_effect=ValueError("invalid scientific configuration"),
-        ) as calculation, self.assertRaisesRegex(
-            ValueError, "invalid scientific configuration"
+        with (
+            patch(
+                "microcaustics.solvers.ipm.full_field_ipm",
+                side_effect=ValueError("invalid scientific configuration"),
+            ) as calculation,
+            self.assertRaisesRegex(ValueError, "invalid scientific configuration"),
         ):
             scheduler._calculate_with_backoff(scheduler.method, time_days=0.0)
         calculation.assert_called_once()

@@ -12,11 +12,11 @@ def stars(offset: float) -> mc.PointMassField:
     """Return a small moving field for one illustrative macroimage."""
 
     return mc.PointMassField(
-            torch.tensor([-0.4 + offset, 0.45 + offset]),
-            torch.tensor([0.3, -0.2]),
-            torch.tensor([0.15, 0.18]),
-            velocity_x_uas_per_day=torch.tensor([0.001, -0.0008]),
-            velocity_y_uas_per_day=torch.tensor([-0.0004, 0.0006]),
+        torch.tensor([-0.4 + offset, 0.45 + offset]),
+        torch.tensor([0.3, -0.2]),
+        mass_solar=torch.tensor([0.001791, 0.002579]),
+        velocity_x_uas_per_day=torch.tensor([0.001, -0.0008]),
+        velocity_y_uas_per_day=torch.tensor([-0.0004, 0.0006]),
     )
 
 

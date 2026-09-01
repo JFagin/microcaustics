@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -85,8 +85,7 @@ class LensingDistances:
                 if torch.cuda.is_available():
                     resolved_device = torch.device("cuda")
                 elif (
-                    hasattr(torch.backends, "mps")
-                    and torch.backends.mps.is_available()
+                    hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
                 ):
                     resolved_device = torch.device("mps")
                 else:
@@ -104,14 +103,15 @@ class LensingDistances:
                 float(Om0) * (1.0 + redshifts).pow(3) + (1.0 - float(Om0))
             )
             dz = float(source_redshift) / int(integration_steps)
-            increments = 0.5 * dz * (
-                inverse_expansion[:-1] + inverse_expansion[1:]
-            )
+            increments = 0.5 * dz * (inverse_expansion[:-1] + inverse_expansion[1:])
             cumulative = torch.cat(
-                (torch.zeros(1, device=resolved_device, dtype=dtype), increments.cumsum(0))
+                (
+                    torch.zeros(1, device=resolved_device, dtype=dtype),
+                    increments.cumsum(0),
+                )
             )
-            lens_position = float(lens_redshift) / float(source_redshift) * int(
-                integration_steps
+            lens_position = (
+                float(lens_redshift) / float(source_redshift) * int(integration_steps)
             )
             lower = min(int(math.floor(lens_position)), int(integration_steps) - 1)
             fraction = lens_position - lower
@@ -119,9 +119,7 @@ class LensingDistances:
                 cumulative[lower + 1] - cumulative[lower]
             )
             source_integral = cumulative[-1]
-            hubble_distance_m = (
-                _SPEED_OF_LIGHT_KM_S / float(H0) * _MEGAPARSEC_M
-            )
+            hubble_distance_m = _SPEED_OF_LIGHT_KM_S / float(H0) * _MEGAPARSEC_M
             lens_comoving_m = float(lens_integral) * hubble_distance_m
             source_comoving_m = float(source_integral) * hubble_distance_m
             return cls(
@@ -153,8 +151,12 @@ class LensingDistances:
                 source_redshift,
             )
         return cls(
-            lens_m=float(cosmology.angular_diameter_distance(lens_redshift).to_value(units.m)),
-            source_m=float(cosmology.angular_diameter_distance(source_redshift).to_value(units.m)),
+            lens_m=float(
+                cosmology.angular_diameter_distance(lens_redshift).to_value(units.m)
+            ),
+            source_m=float(
+                cosmology.angular_diameter_distance(source_redshift).to_value(units.m)
+            ),
             lens_to_source_m=float(lens_to_source.to_value(units.m)),
             lens_redshift=float(lens_redshift),
             source_redshift=float(source_redshift),
@@ -203,6 +205,121 @@ class LensingDistances:
 
         angle = torch.as_tensor(angle_uas, device=device, dtype=dtype)
         return angle * float(_MICROARCSECONDS_TO_RADIANS) * self.source_m
+
+
+def _distances_from_arguments(
+    *,
+    lens_redshift: float | None,
+    source_redshift: float | None,
+    distances: LensingDistances | None,
+    H0: float,
+    Om0: float,
+    device: torch.device | str | None,
+    dtype: torch.dtype,
+) -> LensingDistances:
+    if distances is not None:
+        if lens_redshift is not None or source_redshift is not None:
+            raise ValueError("supply redshifts or distances, not both")
+        return distances
+    if lens_redshift is None or source_redshift is None:
+        raise ValueError("lens_redshift and source_redshift are required")
+    return LensingDistances.from_redshifts(
+        lens_redshift,
+        source_redshift,
+        H0=H0,
+        Om0=Om0,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def einstein_radius_uas(
+    mean_mass_solar,
+    *,
+    lens_redshift: float | None = None,
+    source_redshift: float | None = None,
+    distances: LensingDistances | None = None,
+    H0: float = 67.66,
+    Om0: float = 0.30966,
+    device: torch.device | str | None = "auto",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Return the angular Einstein radius for masses in solar units.
+
+    Redshifts use the same default flat cosmology as
+    :class:`LensingDistances`. Advanced callers may instead pass an existing
+    distance object.
+    """
+
+    resolved = _distances_from_arguments(
+        lens_redshift=lens_redshift,
+        source_redshift=source_redshift,
+        distances=distances,
+        H0=H0,
+        Om0=Om0,
+        device=device,
+        dtype=dtype,
+    )
+    resolved_device = None if device is None or str(device) == "auto" else device
+    return resolved.einstein_radius_uas(
+        mean_mass_solar,
+        device=resolved_device,
+        dtype=dtype,
+    )
+
+
+def einstein_units_to_uas(
+    values,
+    *,
+    mean_mass_solar,
+    lens_redshift: float | None = None,
+    source_redshift: float | None = None,
+    distances: LensingDistances | None = None,
+    H0: float = 67.66,
+    Om0: float = 0.30966,
+    device: torch.device | str | None = "auto",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Convert coordinates in mean-microlens Einstein units to microarcseconds."""
+
+    radius = einstein_radius_uas(
+        mean_mass_solar,
+        lens_redshift=lens_redshift,
+        source_redshift=source_redshift,
+        distances=distances,
+        H0=H0,
+        Om0=Om0,
+        device=device,
+        dtype=dtype,
+    )
+    return torch.as_tensor(values, device=radius.device, dtype=radius.dtype) * radius
+
+
+def uas_to_einstein_units(
+    values,
+    *,
+    mean_mass_solar,
+    lens_redshift: float | None = None,
+    source_redshift: float | None = None,
+    distances: LensingDistances | None = None,
+    H0: float = 67.66,
+    Om0: float = 0.30966,
+    device: torch.device | str | None = "auto",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Convert angular coordinates to mean-microlens Einstein units."""
+
+    radius = einstein_radius_uas(
+        mean_mass_solar,
+        lens_redshift=lens_redshift,
+        source_redshift=source_redshift,
+        distances=distances,
+        H0=H0,
+        Om0=Om0,
+        device=device,
+        dtype=dtype,
+    )
+    return torch.as_tensor(values, device=radius.device, dtype=radius.dtype) / radius
 
 
 @dataclass(frozen=True, init=False)
@@ -276,37 +393,87 @@ class MacroLens:
         return self.convergence - self.smooth_convergence
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class PointMassField:
-    """Point lenses and optional linear velocities in angular coordinates.
+    """Point lenses specified by physical masses and angular positions.
 
-    Arrays are stored as PyTorch tensors with shape ``[n_lenses]``. Einstein
-    radii and positions are in microarcseconds. Velocities are in
-    microarcseconds per day. Direct array construction is supported so users
-    can bypass built-in mass functions and spatial samplers entirely.
+    Public construction uses ``mass_solar``. Positions are in microarcseconds
+    and optional velocities are in microarcseconds per day. A
+    :class:`~microcaustics.MicrolensingSystem` converts the masses to angular
+    Einstein radii from its cosmological distances before ray tracing.
+
+    Package internals keep the resolved angular strengths separate from this
+    physical constructor.
     """
 
     x_uas: torch.Tensor
     y_uas: torch.Tensor
-    einstein_radius_uas: torch.Tensor
+    mass_solar: torch.Tensor | None
     velocity_x_uas_per_day: torch.Tensor | None = None
     velocity_y_uas_per_day: torch.Tensor | None = None
-    mass_solar: torch.Tensor | None = None
+    _einstein_radius_uas: torch.Tensor | None = field(default=None, repr=False)
+
+    def __init__(
+        self,
+        x_uas,
+        y_uas,
+        mass_solar,
+        *,
+        velocity_x_uas_per_day=None,
+        velocity_y_uas_per_day=None,
+    ) -> None:
+        object.__setattr__(self, "x_uas", x_uas)
+        object.__setattr__(self, "y_uas", y_uas)
+        object.__setattr__(self, "mass_solar", mass_solar)
+        object.__setattr__(self, "velocity_x_uas_per_day", velocity_x_uas_per_day)
+        object.__setattr__(self, "velocity_y_uas_per_day", velocity_y_uas_per_day)
+        object.__setattr__(self, "_einstein_radius_uas", None)
+        self.__post_init__()
+
+    @classmethod
+    def _from_einstein_radii(
+        cls,
+        x_uas,
+        y_uas,
+        einstein_radius_uas,
+        *,
+        mass_solar=None,
+        velocity_x_uas_per_day=None,
+        velocity_y_uas_per_day=None,
+    ) -> PointMassField:
+        """Construct an already resolved field for package internals."""
+
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "x_uas", x_uas)
+        object.__setattr__(instance, "y_uas", y_uas)
+        object.__setattr__(instance, "mass_solar", mass_solar)
+        object.__setattr__(instance, "velocity_x_uas_per_day", velocity_x_uas_per_day)
+        object.__setattr__(instance, "velocity_y_uas_per_day", velocity_y_uas_per_day)
+        object.__setattr__(instance, "_einstein_radius_uas", einstein_radius_uas)
+        instance.__post_init__()
+        return instance
 
     def __post_init__(self) -> None:
         x = torch.as_tensor(self.x_uas)
-        y = torch.as_tensor(self.y_uas, device=x.device, dtype=x.dtype)
-        radius = torch.as_tensor(
-            self.einstein_radius_uas,
-            device=x.device,
-            dtype=x.dtype,
-        )
-        if x.ndim != 1 or y.shape != x.shape or radius.shape != x.shape:
-            raise ValueError("positions and Einstein radii must be 1D arrays of equal length")
         if not x.is_floating_point():
-            raise TypeError("point-mass arrays must use a floating dtype")
-        if bool(torch.any(radius <= 0)):
-            raise ValueError("Einstein radii must be positive")
+            x = x.to(torch.float32)
+        y = torch.as_tensor(self.y_uas, device=x.device, dtype=x.dtype)
+        if x.ndim != 1 or y.shape != x.shape:
+            raise ValueError("point-lens positions must be 1D arrays of equal length")
+        mass = self.mass_solar
+        if mass is not None:
+            mass = torch.as_tensor(mass, device=x.device, dtype=x.dtype)
+            if mass.shape != x.shape or bool(torch.any(mass <= 0)):
+                raise ValueError("mass_solar must be positive and match the positions")
+        radius = self._einstein_radius_uas
+        if radius is not None:
+            radius = torch.as_tensor(radius, device=x.device, dtype=x.dtype)
+            if radius.shape != x.shape or bool(torch.any(radius <= 0)):
+                raise ValueError(
+                    "resolved Einstein radii must be positive and match the positions"
+                )
+        if mass is None and radius is None and x.numel() != 0:
+            raise ValueError("mass_solar is required for a non-empty point-mass field")
         vx, vy = self.velocity_x_uas_per_day, self.velocity_y_uas_per_day
         if (vx is None) != (vy is None):
             raise ValueError("both velocity components must be supplied together")
@@ -315,20 +482,51 @@ class PointMassField:
             vy = torch.as_tensor(vy, device=x.device, dtype=x.dtype)
             if vx.shape != x.shape or vy.shape != x.shape:
                 raise ValueError("velocity arrays must match the position shape")
-        mass = self.mass_solar
-        if mass is not None:
-            mass = torch.as_tensor(mass, device=x.device, dtype=x.dtype)
-            if mass.shape != x.shape or bool(torch.any(mass <= 0)):
-                raise ValueError("mass_solar must be positive and match the positions")
         object.__setattr__(self, "x_uas", x)
         object.__setattr__(self, "y_uas", y)
-        object.__setattr__(self, "einstein_radius_uas", radius)
+        object.__setattr__(self, "_einstein_radius_uas", radius)
         object.__setattr__(self, "velocity_x_uas_per_day", vx)
         object.__setattr__(self, "velocity_y_uas_per_day", vy)
         object.__setattr__(self, "mass_solar", mass)
 
+    @property
+    def einstein_radius_uas(self) -> torch.Tensor:
+        """Return resolved angular Einstein radii.
+
+        Directly constructed physical fields are resolved automatically by a
+        high-level system. Access before that resolution is an error because
+        the answer depends on lens and source distances.
+        """
+
+        if self._einstein_radius_uas is None:
+            raise RuntimeError(
+                "Einstein radii have not been resolved. Add this field to a "
+                "MicrolensingSystem with lens and source redshifts first"
+            )
+        return self._einstein_radius_uas
+
+    def resolve(self, distances: LensingDistances) -> PointMassField:
+        """Return a numerical field with Einstein radii for ``distances``."""
+
+        if self._einstein_radius_uas is not None:
+            return self
+        assert self.mass_solar is not None
+        radius = distances.einstein_radius_uas(
+            self.mass_solar,
+            device=self.x_uas.device,
+            dtype=self.x_uas.dtype,
+        )
+        return PointMassField._from_einstein_radii(
+            self.x_uas,
+            self.y_uas,
+            radius,
+            mass_solar=self.mass_solar,
+            velocity_x_uas_per_day=self.velocity_x_uas_per_day,
+            velocity_y_uas_per_day=self.velocity_y_uas_per_day,
+        )
+
     @classmethod
-    def from_masses(
+    def _from_masses(
         cls,
         x_uas,
         y_uas,
@@ -340,17 +538,16 @@ class PointMassField:
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
     ) -> PointMassField:
-        """Construct point lenses from solar masses and lensing distances."""
+        """Build a resolved field for internal population samplers."""
 
         mass = torch.as_tensor(mass_solar, device=device, dtype=dtype)
-        radius = distances.einstein_radius_uas(mass, device=device, dtype=dtype)
-        return cls(
+        return cls._from_einstein_radii(
             torch.as_tensor(x_uas, device=device, dtype=dtype),
             torch.as_tensor(y_uas, device=device, dtype=dtype),
-            radius,
-            velocity_x_uas_per_day,
-            velocity_y_uas_per_day,
-            mass,
+            distances.einstein_radius_uas(mass, device=device, dtype=dtype),
+            mass_solar=mass,
+            velocity_x_uas_per_day=velocity_x_uas_per_day,
+            velocity_y_uas_per_day=velocity_y_uas_per_day,
         )
 
     @classmethod
@@ -366,8 +563,8 @@ class PointMassField:
 
         This convenience constructor delegates to
         :func:`microcaustics.lens.sample_uniform_point_masses`. Direct array
-        construction and :meth:`from_masses` remain available when locations
-        or masses are supplied by an external population model.
+        construction remains available when locations or masses are supplied
+        by an external population model.
         """
 
         from .populations import sample_uniform_point_masses
@@ -394,18 +591,30 @@ class PointMassField:
 
         if not self.has_motion:
             return self
-        time = torch.as_tensor(time_days, device=self.x_uas.device, dtype=self.x_uas.dtype)
+        time = torch.as_tensor(
+            time_days, device=self.x_uas.device, dtype=self.x_uas.dtype
+        )
         if time.numel() != 1:
             raise ValueError("at_time expects one scalar time")
         assert self.velocity_x_uas_per_day is not None
         assert self.velocity_y_uas_per_day is not None
-        return PointMassField(
-            self.x_uas + time * self.velocity_x_uas_per_day,
-            self.y_uas + time * self.velocity_y_uas_per_day,
-            self.einstein_radius_uas,
-            self.velocity_x_uas_per_day,
-            self.velocity_y_uas_per_day,
-            self.mass_solar,
+        moved_x = self.x_uas + time * self.velocity_x_uas_per_day
+        moved_y = self.y_uas + time * self.velocity_y_uas_per_day
+        if self._einstein_radius_uas is None:
+            return PointMassField(
+                moved_x,
+                moved_y,
+                self.mass_solar,
+                velocity_x_uas_per_day=self.velocity_x_uas_per_day,
+                velocity_y_uas_per_day=self.velocity_y_uas_per_day,
+            )
+        return PointMassField._from_einstein_radii(
+            moved_x,
+            moved_y,
+            self._einstein_radius_uas,
+            mass_solar=self.mass_solar,
+            velocity_x_uas_per_day=self.velocity_x_uas_per_day,
+            velocity_y_uas_per_day=self.velocity_y_uas_per_day,
         )
 
     def to(
@@ -418,11 +627,30 @@ class PointMassField:
 
         kwargs = {"device": device, "dtype": dtype}
         kwargs = {key: value for key, value in kwargs.items() if value is not None}
-        return PointMassField(
+        mass = None if self.mass_solar is None else self.mass_solar.to(**kwargs)
+        velocity_x = (
+            None
+            if self.velocity_x_uas_per_day is None
+            else self.velocity_x_uas_per_day.to(**kwargs)
+        )
+        velocity_y = (
+            None
+            if self.velocity_y_uas_per_day is None
+            else self.velocity_y_uas_per_day.to(**kwargs)
+        )
+        if self._einstein_radius_uas is None:
+            return PointMassField(
+                self.x_uas.to(**kwargs),
+                self.y_uas.to(**kwargs),
+                mass,
+                velocity_x_uas_per_day=velocity_x,
+                velocity_y_uas_per_day=velocity_y,
+            )
+        return PointMassField._from_einstein_radii(
             self.x_uas.to(**kwargs),
             self.y_uas.to(**kwargs),
-            self.einstein_radius_uas.to(**kwargs),
-            None if self.velocity_x_uas_per_day is None else self.velocity_x_uas_per_day.to(**kwargs),
-            None if self.velocity_y_uas_per_day is None else self.velocity_y_uas_per_day.to(**kwargs),
-            None if self.mass_solar is None else self.mass_solar.to(**kwargs),
+            self._einstein_radius_uas.to(**kwargs),
+            mass_solar=mass,
+            velocity_x_uas_per_day=velocity_x,
+            velocity_y_uas_per_day=velocity_y,
         )

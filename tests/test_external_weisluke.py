@@ -39,8 +39,12 @@ class WeisenbachExternalComparisonTests(unittest.TestCase):
 
     def test_adapter_contract_preserves_the_fixed_aperture_problem(self) -> None:
         self.assertGreaterEqual(int(self.data["external_benchmark_schema_version"]), 6)
-        self.assertEqual(str(self.data["luke_adapter_contract"]), "fixed_aperture_recenter_v1")
-        self.assertEqual(str(self.data["starfile_format"]), "luke_binary_fixed_aperture")
+        self.assertEqual(
+            str(self.data["luke_adapter_contract"]), "fixed_aperture_recenter_v1"
+        )
+        self.assertEqual(
+            str(self.data["starfile_format"]), "luke_binary_fixed_aperture"
+        )
         self.assertEqual(int(self.data["num_rays_y"]), 1)
         self.assertRegex(str(self.data["problem_json_sha256"]), r"^[0-9a-f]{64}$")
         self.assertRegex(str(self.data["star_field_sha256"]), r"^[0-9a-f]{64}$")
@@ -89,8 +93,7 @@ class WeisenbachExternalComparisonTests(unittest.TestCase):
     and REFERENCE_CAUSTICS
     and Path(CCF_FRAME).is_file()
     and Path(REFERENCE_CAUSTICS).is_file(),
-    "set MICROCAUSTICS_WEISENBACH_CCF_FRAME and "
-    "MICROCAUSTICS_REFERENCE_CAUSTIC_FRAME",
+    "set MICROCAUSTICS_WEISENBACH_CCF_FRAME and MICROCAUSTICS_REFERENCE_CAUSTIC_FRAME",
 )
 class WeisenbachWindingMapComparisonTests(unittest.TestCase):
     """Compare complete-field topology inferred from independent CCF curves.
@@ -195,10 +198,7 @@ class WeisenbachWindingMapComparisonTests(unittest.TestCase):
         luke_binary = torch.remainder(luke_winding, 2)
         reference_binary = torch.remainder(reference_winding, 2)
         binary_mismatch = float(
-            (luke_binary != reference_binary)
-            .to(torch.float64)
-            .mean()
-            .cpu()
+            (luke_binary != reference_binary).to(torch.float64).mean().cpu()
         )
         maximum_mismatch = float(
             os.environ.get(

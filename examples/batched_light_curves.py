@@ -6,9 +6,9 @@ import microcaustics as mc
 
 distances = mc.LensingDistances(8.0e24, 1.6e25, 9.0e24)
 stars = mc.PointMassField(
-        x_uas=torch.tensor([-0.5, 0.6]),
-        y_uas=torch.tensor([0.2, -0.3]),
-        einstein_radius_uas=torch.tensor([0.15, 0.2]),
+    x_uas=torch.tensor([-0.5, 0.6]),
+    y_uas=torch.tensor([0.2, -0.3]),
+    mass_solar=torch.tensor([0.001274, 0.002264]),
 )
 geometry = mc.SourceGeometry(
     shape=(24, 24),

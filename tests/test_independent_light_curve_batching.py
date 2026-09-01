@@ -42,7 +42,9 @@ class IndependentLightCurveBatchTests(unittest.TestCase):
             [float(curve.flux[0, 0]) for curve in result.light_curves],
             [1.0, 2.0, 3.0],
         )
-        self.assertTrue(all(curve.flux.shape == (3, 1) for curve in result.light_curves))
+        self.assertTrue(
+            all(curve.flux.shape == (3, 1) for curve in result.light_curves)
+        )
 
     def test_cuda_oom_backoff_retries_smaller_groups(self) -> None:
         systems = tuple(_FakeRealization(value) for value in (1.0, 2.0, 3.0))
@@ -52,7 +54,9 @@ class IndependentLightCurveBatchTests(unittest.TestCase):
                 raise torch.cuda.OutOfMemoryError("synthetic CUDA out of memory")
             return (group[0].light_curve((0.0,)),)
 
-        with patch("microcaustics.batching._run_independent_group", side_effect=execute):
+        with patch(
+            "microcaustics.batching._run_independent_group", side_effect=execute
+        ):
             result = mc.batched_system_light_curves(
                 systems,
                 (0.0,),

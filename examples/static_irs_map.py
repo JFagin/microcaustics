@@ -8,13 +8,12 @@ macro = mc.MacroLens(convergence=0.0, shear=0.0)
 point_masses = mc.PointMassField(
     x_uas=torch.tensor([0.0]),
     y_uas=torch.tensor([0.0]),
-    einstein_radius_uas=torch.tensor([0.3]),
+    mass_solar=torch.tensor([0.005094]),
 )
 system = mc.MicrolensingSystem(
     macro=macro,
     distances=mc.LensingDistances(8.0e24, 1.6e25, 9.0e24),
     stars=point_masses,
-    source_grid=mc.PlaneGrid(shape=(128, 128), field_of_view_uas=(2.0, 2.0)),
     runtime=mc.RuntimeConfig(
         device="cpu",
         backend="torch-eager",
@@ -23,6 +22,8 @@ system = mc.MicrolensingSystem(
 )
 
 magnification = system.magnification_map(
+    map_width_uas=2.0,
+    map_pixels=128,
     method=mc.IRSConfig(
         rays=1_000_000,
         far_field_approx=mc.FarFieldApproxConfig(enabled=False),

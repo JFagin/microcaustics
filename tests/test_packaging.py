@@ -81,7 +81,10 @@ class PackagingContractTests(unittest.TestCase):
         self.assertIn("cuda_available", payload)
         self.assertIn("torch_compile_available", payload)
         self.assertIn("automatic_selection", payload)
-        self.assertIn(payload["automatic_selection"]["device"].split(":")[0], {"cpu", "cuda", "mps"})
+        self.assertIn(
+            payload["automatic_selection"]["device"].split(":")[0],
+            {"cpu", "cuda", "mps"},
+        )
         self.assertIn(
             payload["automatic_selection"]["backend"],
             {"torch-eager", "torch-compile", "triton"},
@@ -119,7 +122,9 @@ class WheelInstallationTests(unittest.TestCase):
             self.assertEqual(len(wheels), 1)
 
             environment = root / "environment"
-            venv.EnvBuilder(with_pip=True, system_site_packages=True).create(environment)
+            venv.EnvBuilder(with_pip=True, system_site_packages=True).create(
+                environment
+            )
             executable = (
                 environment / "Scripts" / "python.exe"
                 if os.name == "nt"

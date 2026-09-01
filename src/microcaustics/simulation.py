@@ -194,6 +194,7 @@ class MicrolensingSimulation:
                 far_field_approx,
                 time_days=time_days,
                 star_chunk_size=star_chunk_size,
+                ray_chunk_size=ray_chunk_size,
             )
 
         return direct_caustic_field(

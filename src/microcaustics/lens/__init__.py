@@ -7,7 +7,14 @@ from .mass_functions import (
     kroupa_mass_function,
     salpeter_mass_function,
 )
-from .models import LensingDistances, MacroLens, PointMassField
+from .models import (
+    LensingDistances,
+    MacroLens,
+    PointMassField,
+    einstein_radius_uas,
+    einstein_units_to_uas,
+    uas_to_einstein_units,
+)
 from .populations import (
     compact_convergence,
     rectangular_lens_region,
@@ -30,6 +37,9 @@ __all__ = [
     "LensingDistances",
     "MassFunction",
     "PointMassField",
+    "einstein_radius_uas",
+    "einstein_units_to_uas",
+    "uas_to_einstein_units",
     "PowerLawMassFunction",
     "IsotropicKinematics",
     "SkyProjectedKinematics",

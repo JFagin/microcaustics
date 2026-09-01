@@ -21,14 +21,18 @@ class Sim5ExternalComparisonTests(unittest.TestCase):
         cls.payload = json.loads(Path(SUMMARY).read_text(encoding="utf-8"))
 
     def test_summary_has_matched_scope_and_multiple_physical_cases(self) -> None:
-        self.assertIn("matched primary Kerr transfer physics", self.payload["comparison_scope"])
+        self.assertIn(
+            "matched primary Kerr transfer physics", self.payload["comparison_scope"]
+        )
         cases = self.payload["cases"]
         self.assertGreaterEqual(len(cases), 3)
         self.assertEqual(len({case["case"] for case in cases}), len(cases))
         self.assertTrue(all(case["resolution"] >= 256 for case in cases))
 
     def test_sim5_agreement_stays_within_frozen_scientific_thresholds(self) -> None:
-        maximum_nmse = float(os.environ.get("MICROCAUSTICS_SIM5_MAX_IMAGE_NMSE", "1e-6"))
+        maximum_nmse = float(
+            os.environ.get("MICROCAUSTICS_SIM5_MAX_IMAGE_NMSE", "1e-6")
+        )
         maximum_flux_error = float(
             os.environ.get("MICROCAUSTICS_SIM5_MAX_FLUX_FRACTIONAL_ERROR", "1e-4")
         )

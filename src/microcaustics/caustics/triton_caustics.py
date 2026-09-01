@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 try:
@@ -13,6 +15,59 @@ except Exception:  # pragma: no cover - optional backend
 
 
 if triton is not None:
+
+    @triton.jit
+    def _regular_grid_winding_updates_kernel(
+        segments,
+        y_axis,
+        x_axis,
+        difference,
+        n_segments,
+        ny,
+        nx,
+        BLOCK: tl.constexpr,
+        SEARCH_STEPS: tl.constexpr,
+    ):
+        segment_block = tl.program_id(0)
+        row = tl.program_id(1)
+        segment = segment_block * BLOCK + tl.arange(0, BLOCK)
+        active = segment < n_segments
+        base = segment.to(tl.int64) * 4
+        x0 = tl.load(segments + base, mask=active, other=0.0)
+        y0 = tl.load(segments + base + 1, mask=active, other=0.0)
+        x1 = tl.load(segments + base + 2, mask=active, other=0.0)
+        y1 = tl.load(segments + base + 3, mask=active, other=0.0)
+        query_y = tl.load(y_axis + row, mask=row < ny, other=0.0)
+        upward = active & (y0 <= query_y) & (query_y < y1)
+        downward = active & (y1 <= query_y) & (query_y < y0)
+        crosses = upward | downward
+        denominator = tl.where(crosses, y1 - y0, 1.0)
+        intersection_x = x0 + (query_y - y0) * (x1 - x0) / denominator
+
+        # First sampled x coordinate greater than or equal to the crossing.
+        # Loading the actual axis preserves torch.linspace float32 rounding.
+        low = tl.zeros((BLOCK,), tl.int32)
+        high = tl.full((BLOCK,), nx, tl.int32)
+        for _ in tl.static_range(SEARCH_STEPS):
+            searching = crosses & (low < high)
+            middle = (low + high) // 2
+            sampled_x = tl.load(
+                x_axis + tl.minimum(middle, nx - 1),
+                mask=searching,
+                other=0.0,
+            )
+            move_right = searching & (sampled_x < intersection_x)
+            high = tl.where(searching & ~move_right, middle, high)
+            low = tl.where(move_right, middle + 1, low)
+
+        signed = upward.to(tl.int32) - downward.to(tl.int32)
+        row_base = row.to(tl.int64) * (nx + 1)
+        tl.atomic_add(difference + row_base, tl.sum(signed, axis=0))
+        tl.atomic_add(
+            difference + row_base + low,
+            -signed,
+            mask=crosses,
+        )
 
     @triton.jit
     def _crossing_kernel(
@@ -387,6 +442,49 @@ def triton_caustics_available() -> bool:
     return triton is not None and torch.cuda.is_available()
 
 
+def regular_grid_winding_number_triton(
+    segments,
+    y_axis,
+    x_axis,
+    *,
+    block_segments: int = 1024,
+    num_warps: int = 4,
+):
+    """Return exact signed winding numbers on a CUDA float32 regular grid."""
+
+    if not triton_caustics_available() or segments.device.type != "cuda":
+        raise RuntimeError("Triton winding maps are unavailable")
+    if segments.dtype != torch.float32:
+        raise ValueError("Triton winding maps require float32")
+    segments = segments.contiguous()
+    y_axis = y_axis.to(device=segments.device, dtype=segments.dtype).contiguous()
+    x_axis = x_axis.to(device=segments.device, dtype=segments.dtype).contiguous()
+    ny, nx = int(y_axis.numel()), int(x_axis.numel())
+    if nx > 65_536:
+        raise ValueError("Triton winding maps support at most 65536 columns")
+    difference = torch.zeros(
+        (ny, nx + 1),
+        device=segments.device,
+        dtype=torch.int32,
+    )
+    if segments.shape[0]:
+        blocks = triton.cdiv(int(segments.shape[0]), int(block_segments))
+        search_steps = max(1, math.ceil(math.log2(nx + 1)))
+        _regular_grid_winding_updates_kernel[(blocks, ny)](
+            segments,
+            y_axis,
+            x_axis,
+            difference,
+            int(segments.shape[0]),
+            ny,
+            nx,
+            BLOCK=int(block_segments),
+            SEARCH_STEPS=search_steps,
+            num_warps=int(num_warps),
+        )
+    return torch.cumsum(difference[:, :nx], dim=1, dtype=torch.int64)
+
+
 def batched_caustic_crossings_distances_triton(
     segments,
     valid,
@@ -426,32 +524,79 @@ def batched_caustic_crossings_distances_triton(
         return counts, torch.sqrt(distance2)
     blocks = triton.cdiv(segment_count, int(block_segments))
     programs = frames * point_count * anchor_count * blocks
-    _crossing_kernel[(programs,)](
+    if programs:
+        _crossing_kernel[(programs,)](
+            segments,
+            valid,
+            anchors,
+            crossing_points,
+            counts,
+            segment_count,
+            anchor_count,
+            point_count,
+            blocks,
+            BLOCK=int(block_segments),
+            num_warps=4,
+        )
+    distance_programs = frames * distance_count * blocks
+    if distance_programs:
+        _distance_kernel[(distance_programs,)](
+            segments,
+            valid,
+            distance_points,
+            distance2,
+            segment_count,
+            distance_count,
+            blocks,
+            BLOCK=int(block_segments),
+            num_warps=4,
+        )
+    return counts, torch.sqrt(distance2)
+
+
+def caustic_distances_triton(
+    segments,
+    points,
+    *,
+    block_segments: int = 256,
+):
+    """Return exact point-to-segment distances with the CUDA reduction kernel.
+
+    This is the unbatched diagnostic-map counterpart of
+    :func:`batched_caustic_crossings_distances_triton`.  It avoids allocating
+    dummy anchors and crossing outputs when only nearest-caustic distances are
+    requested.
+    """
+
+    if not triton_caustics_available() or segments.device.type != "cuda":
+        raise RuntimeError("Triton caustic distances are unavailable")
+    if segments.dtype != torch.float32:
+        raise ValueError("Triton caustic distances require float32")
+    segments = segments.contiguous()
+    points = points.to(device=segments.device, dtype=segments.dtype).contiguous()
+    segment_count = int(segments.shape[0])
+    point_count = int(points.shape[0])
+    distance2 = torch.full(
+        (point_count,),
+        float("inf"),
+        device=segments.device,
+        dtype=segments.dtype,
+    )
+    if segment_count == 0 or point_count == 0:
+        return torch.sqrt(distance2)
+    blocks = triton.cdiv(segment_count, int(block_segments))
+    _distance_kernel[(point_count * blocks,)](
         segments,
-        valid,
-        anchors,
-        crossing_points,
-        counts,
+        torch.ones(segment_count, device=segments.device, dtype=torch.bool),
+        points,
+        distance2,
         segment_count,
-        anchor_count,
         point_count,
         blocks,
         BLOCK=int(block_segments),
         num_warps=4,
     )
-    distance_programs = frames * distance_count * blocks
-    _distance_kernel[(distance_programs,)](
-        segments,
-        valid,
-        distance_points,
-        distance2,
-        segment_count,
-        distance_count,
-        blocks,
-        BLOCK=int(block_segments),
-        num_warps=4,
-    )
-    return counts, torch.sqrt(distance2)
+    return torch.sqrt(distance2)
 
 
 _PAIR_A = (

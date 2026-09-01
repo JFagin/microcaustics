@@ -31,10 +31,10 @@ def _far_field() -> TaylorFarFieldApproximation:
             shear_angle_rad=0.31,
             smooth_matter_fraction=0.4,
         ),
-        mc.PointMassField(
+        mc.PointMassField._from_einstein_radii(
             star_x,
             star_y,
-            torch.full((24,), 0.075, dtype=torch.float64),
+            einstein_radius_uas=torch.full((24,), 0.075, dtype=torch.float64),
         ),
         runtime=mc.RuntimeConfig(
             device="cpu",
@@ -59,13 +59,16 @@ class CausticsAdapterDependencyTests(unittest.TestCase):
     def test_missing_optional_dependency_has_actionable_message(self) -> None:
         tracer = mock.Mock()
         tracer.raytrace = mock.Mock(return_value=(torch.zeros(1), torch.zeros(1)))
-        with mock.patch.object(
-            adapter_module,
-            "_caustics_module",
-            side_effect=ImportError(
-                "as_caustics_thin_lens requires the optional 'macro' extra"
+        with (
+            mock.patch.object(
+                adapter_module,
+                "_caustics_module",
+                side_effect=ImportError(
+                    "as_caustics_thin_lens requires the optional 'macro' extra"
+                ),
             ),
-        ), self.assertRaisesRegex(ImportError, "optional 'macro' extra"):
+            self.assertRaisesRegex(ImportError, "optional 'macro' extra"),
+        ):
             mc.as_caustics_thin_lens(tracer)
 
     def test_invalid_geometry_is_rejected_before_optional_import(self) -> None:

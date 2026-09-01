@@ -52,11 +52,14 @@ from .lens import (
     StellarPopulation,
     circular_stellar_aperture,
     compact_convergence,
+    einstein_radius_uas,
+    einstein_units_to_uas,
     kroupa_mass_function,
     rectangular_lens_region,
     salpeter_mass_function,
     sample_uniform_circular_point_masses,
     sample_uniform_point_masses,
+    uas_to_einstein_units,
 )
 from .multi_system import MultiImageSystem
 from .observations import (
@@ -263,6 +266,9 @@ __all__ = [
     "ProfilingLevel",
     "PlaneRegion",
     "PointMassField",
+    "einstein_radius_uas",
+    "einstein_units_to_uas",
+    "uas_to_einstein_units",
     "PrimaryKerrTrace",
     "PowerLawMassFunction",
     "IsotropicKinematics",

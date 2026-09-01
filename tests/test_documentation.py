@@ -155,9 +155,7 @@ class DocumentationIntegrityTests(unittest.TestCase):
         self.assertEqual(missing, [], f"examples use unexported names: {missing}")
 
     def test_notebooks_are_valid_json_with_compilable_code_cells(self) -> None:
-        notebooks = tuple(
-            (PACKAGE_ROOT / "examples" / "notebooks").rglob("*.ipynb")
-        )
+        notebooks = tuple((PACKAGE_ROOT / "examples" / "notebooks").rglob("*.ipynb"))
         self.assertGreaterEqual(len(notebooks), 16)
         code_cells = 0
         for path in notebooks:
@@ -225,9 +223,7 @@ class DocumentationIntegrityTests(unittest.TestCase):
     def test_distributed_notebooks_contain_successful_saved_outputs(self) -> None:
         """Prevent a release from silently shipping cleared tutorial notebooks."""
 
-        notebooks = tuple(
-            (PACKAGE_ROOT / "examples" / "notebooks").rglob("*.ipynb")
-        )
+        notebooks = tuple((PACKAGE_ROOT / "examples" / "notebooks").rglob("*.ipynb"))
         self.assertGreaterEqual(len(notebooks), 16)
         for path in notebooks:
             with self.subTest(path=path.name):

@@ -23,6 +23,10 @@ arrays. The Weisenbach IPM and SIM5 notebooks are the two external validation
 exceptions because one side of each comparison comes from an independent
 solver.
 
+Centered square source-independent maps use `map_width_uas` and `map_pixels`.
+The few explicit `PlaneGrid` objects occur in advanced method or validation
+cells that require rectangular, off-center, or exactly registered geometry.
+
 The first notebook reports the operating system, PyTorch/CUDA versions, GPU
 model, first-call time, and warmed steady-state time. Its first-call number may
 reuse an on-disk compiler cache and is therefore not described as pure compile

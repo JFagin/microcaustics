@@ -101,8 +101,17 @@ The source grid policy controls resolution, enclosed-flux fraction, margin,
 and reference band. Custom sources may report their own support. A callable or
 pixelated source without finite support must provide an explicit source grid.
 
-A physical source is optional. A user may request a source-independent map by
-supplying only its source-plane size and resolution.
+A physical source is optional. A centered square source-independent map uses
+`map_width_uas` and `map_pixels` on the map method. `PlaneGrid` remains the
+advanced interface for rectangular or off-center fields.
+
+Direct point-lens catalogs use positions in microarcseconds and masses in
+solar masses. Their angular Einstein radii are derived from the system
+distances. The numerical lens plane is automatic by default. It encloses the
+macro preimage, all supplied lenses, and an Einstein-radius guard. Set
+`lens_plane_uas` to one size for a centered square or two sizes for a centered
+rectangle. An explicit `PlaneRegion` remains available for off-center
+validation geometry.
 
 Physical models also report their true circular major-axis support separately
 from the rectangular pixel grid. This avoids treating known zero-valued grid

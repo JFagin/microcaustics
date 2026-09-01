@@ -93,13 +93,13 @@ def _rotate_point_mass_field(
             stars.velocity_y_uas_per_day,
             angle_deg,
         )
-    return PointMassField(
+    return PointMassField._from_einstein_radii(
         x,
         y,
         stars.einstein_radius_uas,
-        velocity_x,
-        velocity_y,
-        stars.mass_solar,
+        mass_solar=stars.mass_solar,
+        velocity_x_uas_per_day=velocity_x,
+        velocity_y_uas_per_day=velocity_y,
     )
 
 
@@ -140,12 +140,12 @@ def _source_in_rotated_frame(source, angle_deg: float):
 
     updates: dict[str, object] = {}
     if hasattr(source, "position_angle_deg"):
-        updates["position_angle_deg"] = (
-            float(source.position_angle_deg) - float(angle_deg)
+        updates["position_angle_deg"] = float(source.position_angle_deg) - float(
+            angle_deg
         )
     elif hasattr(source, "position_angle_rad"):
-        updates["position_angle_rad"] = (
-            float(source.position_angle_rad) - math.radians(float(angle_deg))
+        updates["position_angle_rad"] = float(source.position_angle_rad) - math.radians(
+            float(angle_deg)
         )
     else:
         raise TypeError(
@@ -255,9 +255,7 @@ def _with_method_options(kwargs: dict, *, dynamic: bool) -> dict:
         "far_field",
     }
     options = {
-        name: resolved.pop(name)
-        for name in tuple(resolved)
-        if name in option_names
+        name: resolved.pop(name) for name in tuple(resolved) if name in option_names
     }
     method = resolved.get("method")
     if isinstance(method, str):
@@ -271,9 +269,7 @@ def _with_method_options(kwargs: dict, *, dynamic: bool) -> dict:
             )
         elif name == "irs":
             if options:
-                raise ValueError(
-                    "scout/refinement options apply only to method='ipm'"
-                )
+                raise ValueError("scout/refinement options apply only to method='ipm'")
             method = IRSConfig(rays=rays)
         else:
             raise ValueError("method must be 'ipm', 'irs', or a config object")
@@ -289,11 +285,7 @@ def _with_method_options(kwargs: dict, *, dynamic: bool) -> dict:
         return resolved
     method = resolved.get("method")
     if method is None:
-        method = (
-            production_ipm_config()
-            if dynamic
-            else _production_static_ipm_config()
-        )
+        method = production_ipm_config() if dynamic else _production_static_ipm_config()
     if not isinstance(method, IPMConfig):
         raise ValueError("IPM numerical options require an IPM method")
     far_field = options.pop("far_field", None)
@@ -400,11 +392,43 @@ def _direct_star_region(
         xmax = max(xmax, float(star_x.max()))
         ymin = min(ymin, float(star_y.min()))
         ymax = max(ymax, float(star_y.max()))
-    padding = 0.05 * max(xmax - xmin, ymax - ymin)
+    padding = (
+        2.0 * float(stars.einstein_radius_uas.detach().max().cpu())
+        if len(stars)
+        else 0.0
+    )
+    if xmax <= xmin:
+        xmin -= max(padding, 0.5)
+        xmax += max(padding, 0.5)
+    if ymax <= ymin:
+        ymin -= max(padding, 0.5)
+        ymax += max(padding, 0.5)
     return PlaneRegion(
         (ymax - ymin + 2.0 * padding, xmax - xmin + 2.0 * padding),
         (0.5 * (ymin + ymax), 0.5 * (xmin + xmax)),
     )
+
+
+def _lens_plane_region(
+    lens_plane_uas: str | float | tuple[float, float],
+) -> PlaneRegion | None:
+    """Resolve a centered public lens-plane size or the automatic sentinel."""
+
+    if isinstance(lens_plane_uas, str):
+        if lens_plane_uas != "auto":
+            raise ValueError("lens_plane_uas must be 'auto', a size, or two sizes")
+        return None
+    if isinstance(lens_plane_uas, (int, float)):
+        size = float(lens_plane_uas)
+        if not math.isfinite(size) or size <= 0.0:
+            raise ValueError("lens_plane_uas must be positive and finite")
+        return PlaneRegion((size, size))
+    if len(lens_plane_uas) != 2:
+        raise ValueError("lens_plane_uas must contain (height, width)")
+    sizes = tuple(float(value) for value in lens_plane_uas)
+    if any(not math.isfinite(value) or value <= 0.0 for value in sizes):
+        raise ValueError("lens_plane_uas values must be positive and finite")
+    return PlaneRegion(sizes)
 
 
 @dataclass(frozen=True)
@@ -454,9 +478,7 @@ class MicrolensingRealization:
             ),
             "source_support_radius_uas": self.source_support_radius_uas,
             "coordinate_frame": (
-                "input"
-                if self.sky_to_local_rotation_deg == 0.0
-                else "shear_aligned"
+                "input" if self.sky_to_local_rotation_deg == 0.0 else "shear_aligned"
             ),
             "sky_to_local_rotation_deg": float(self.sky_to_local_rotation_deg),
             "source_grid": {
@@ -907,9 +929,14 @@ class MicrolensingSystem:
     :class:`PointMassField`. A source model automatically defines the angular
     source grid. If a trajectory and duration are supplied, the map field is
     enlarged automatically to contain that source throughout the sequence.
-    Source-independent map calculations can instead provide only
-    ``source_grid``. The seeded realization is cached and reused across maps,
-    light curves, labels, and future transfer-function calculations.
+    Source-independent map calculations can provide ``map_width_uas`` and
+    ``map_pixels`` directly to a map method. An explicit ``source_grid`` is
+    retained for advanced rectangular or off-center fields. Direct point
+    lenses use solar masses and are converted with the system distances. The
+    lens plane is inferred automatically unless ``lens_plane_uas`` or an
+    advanced ``lens_region`` is supplied. The seeded realization is cached
+    and reused across maps, light curves, labels, and future transfer-function
+    calculations.
 
     The rectangular integration strategy uses the shear eigenframe
     internally when the source is a built-in physical model. Point-lens
@@ -943,9 +970,16 @@ class MicrolensingSystem:
     source_support_radius_uas: float | None = None
     seed: int | Mapping[str, int] | None = None
     runtime: RuntimeConfig | ResolvedRuntime | None = None
+    lens_plane_uas: str | float | tuple[float, float] = "auto"
     lens_region: PlaneRegion | None = None
     caustic_grid_shape: int | tuple[int, int] = 8192
     _duration_realizations: dict[float, MicrolensingRealization] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _map_grid_systems: dict[tuple[float, int], MicrolensingSystem] = field(
         default_factory=dict,
         init=False,
         repr=False,
@@ -970,14 +1004,13 @@ class MicrolensingSystem:
             object.__setattr__(self, "lens_redshift", None)
             object.__setattr__(self, "source_redshift", None)
         elif self.lens_redshift is not None or self.source_redshift is not None:
-            raise ValueError(
-                "supply redshifts or distances, not both"
-            )
+            raise ValueError("supply redshifts or distances, not both")
         assert self.distances is not None
         if (self.stellar_population is None) == (self.stars is None):
             raise ValueError("supply exactly one of stellar_population or stars")
-        if self.source is None and self.source_grid is None:
-            raise ValueError("supply a source model or source_grid")
+        explicit_lens_plane = _lens_plane_region(self.lens_plane_uas)
+        if explicit_lens_plane is not None and self.lens_region is not None:
+            raise ValueError("supply lens_plane_uas or lens_region, not both")
         if (
             self.source is not None
             and self.source_grid is not None
@@ -1047,6 +1080,12 @@ class MicrolensingSystem:
 
     @cached_property
     def _resolved(self) -> MicrolensingRealization:
+        if self.source is None and self.source_grid is None:
+            raise ValueError(
+                "this operation requires a source model or map geometry. "
+                "For a centered source-independent map, pass map_width_uas "
+                "and map_pixels to magnification_map or dynamic_maps"
+            )
         resolved_runtime = (
             self.runtime
             if isinstance(self.runtime, ResolvedRuntime)
@@ -1071,6 +1110,7 @@ class MicrolensingSystem:
             self.integration_domain is IntegrationDomain.RECTANGLE
             and self.stellar_population is not None
             and self.lens_region is None
+            and _lens_plane_region(self.lens_plane_uas) is None
             and explicit_grid_is_rotation_safe
             and (self.source is None or source_has_orientation)
             and not math.isclose(
@@ -1083,9 +1123,7 @@ class MicrolensingSystem:
             float(self.macro.shear_angle_deg) if align_rectangle else 0.0
         )
         numerical_macro = (
-            replace(self.macro, shear_angle_deg=0.0)
-            if align_rectangle
-            else self.macro
+            replace(self.macro, shear_angle_deg=0.0) if align_rectangle else self.macro
         )
         numerical_source_model = (
             _source_in_rotated_frame(self.source, frame_rotation_deg)
@@ -1200,8 +1238,13 @@ class MicrolensingSystem:
             )
             if align_rectangle:
                 stars = _rotate_point_mass_field(stars, frame_rotation_deg)
-            if self.lens_region is not None:
-                lens_region = self.lens_region
+            explicit_lens_region = (
+                self.lens_region
+                if self.lens_region is not None
+                else _lens_plane_region(self.lens_plane_uas)
+            )
+            if explicit_lens_region is not None:
+                lens_region = explicit_lens_region
             elif self.integration_domain is IntegrationDomain.RECTANGLE:
                 lens_region = rectangular_lens_region(
                     numerical_macro,
@@ -1218,11 +1261,19 @@ class MicrolensingSystem:
                 lens_region = aperture.bounding_region
         else:
             assert self.stars is not None
-            stars = self.stars
+            stars = self.stars.to(
+                device=resolved_runtime.device,
+                dtype=resolved_runtime.dtype,
+            ).resolve(self.distances)
+            explicit_lens_region = (
+                self.lens_region
+                if self.lens_region is not None
+                else _lens_plane_region(self.lens_plane_uas)
+            )
             lens_region = (
                 _direct_star_region(stars, numerical_macro, source_grid.region)
-                if self.lens_region is None
-                else self.lens_region
+                if explicit_lens_region is None
+                else explicit_lens_region
             )
 
         simulation = MicrolensingSimulation.create(
@@ -1548,6 +1599,52 @@ class MicrolensingSystem:
 
         return replace(self, source=source, source_grid=None)
 
+    def _with_square_map_grid(
+        self,
+        *,
+        map_width_uas: float | None,
+        map_pixels: int | None,
+    ) -> MicrolensingSystem:
+        """Return a system with a centered square source-independent grid.
+
+        The public map methods use these two scalar arguments for their common
+        source-independent case. ``PlaneGrid`` remains available when a caller
+        needs a rectangular field or a nonzero map center.
+        """
+
+        supplied = map_width_uas is not None or map_pixels is not None
+        if not supplied:
+            if self.source is None and self.source_grid is None:
+                raise ValueError(
+                    "source-independent maps require map_width_uas and map_pixels"
+                )
+            return self
+        if map_width_uas is None or map_pixels is None:
+            raise ValueError("supply map_width_uas and map_pixels together")
+        if self.source is not None or self.source_grid is not None:
+            raise ValueError(
+                "map_width_uas and map_pixels are only for systems without a "
+                "source or source_grid"
+            )
+        width = float(map_width_uas)
+        pixels = int(map_pixels)
+        if not math.isfinite(width) or width <= 0.0:
+            raise ValueError("map_width_uas must be finite and positive")
+        if pixels < 1 or pixels != map_pixels:
+            raise ValueError("map_pixels must be a positive integer")
+        key = (width, pixels)
+        cached = self._map_grid_systems.get(key)
+        if cached is None:
+            cached = replace(
+                self,
+                source_grid=PlaneGrid(
+                    shape=(pixels, pixels),
+                    field_of_view_uas=(width, width),
+                ),
+            )
+            self._map_grid_systems[key] = cached
+        return cached
+
     def _realize_for_times(self, times_days) -> MicrolensingRealization:
         """Return a realization whose stellar aperture covers ``times_days``."""
 
@@ -1562,25 +1659,67 @@ class MicrolensingSystem:
             self._duration_realizations[key] = cached
         return cached
 
-    def magnification_map(self, **kwargs) -> MagnificationMap:
-        """Generate one map through the cached realization."""
+    def magnification_map(
+        self,
+        *,
+        map_width_uas: float | None = None,
+        map_pixels: int | None = None,
+        **kwargs,
+    ) -> MagnificationMap:
+        """Generate one map through the cached realization.
 
-        return self.realize().magnification_map(
+        A physical source determines the map geometry automatically. For a
+        centered source-independent map, supply ``map_width_uas`` and
+        ``map_pixels``. Advanced rectangular or off-center maps may instead
+        use ``source_grid`` when constructing the system.
+        """
+
+        system = self._with_square_map_grid(
+            map_width_uas=map_width_uas,
+            map_pixels=map_pixels,
+        )
+        return system.realize().magnification_map(
             **_with_method_options(kwargs, dynamic=False)
         )
 
-    def dynamic_maps(self, times_days: Sequence[float], **kwargs):
-        """Stream maps through the cached realization."""
+    def dynamic_maps(
+        self,
+        times_days: Sequence[float],
+        *,
+        map_width_uas: float | None = None,
+        map_pixels: int | None = None,
+        **kwargs,
+    ):
+        """Stream maps through the cached realization.
 
-        return self._realize_for_times(times_days).dynamic_maps(
+        Source-independent sequences accept the same ``map_width_uas`` and
+        ``map_pixels`` convenience arguments as :meth:`magnification_map`.
+        """
+
+        system = self._with_square_map_grid(
+            map_width_uas=map_width_uas,
+            map_pixels=map_pixels,
+        )
+        return system._realize_for_times(times_days).dynamic_maps(
             times_days,
             **_with_method_options(kwargs, dynamic=True),
         )
 
-    def dynamic_labeled_maps(self, times_days: Sequence[float], **kwargs):
+    def dynamic_labeled_maps(
+        self,
+        times_days: Sequence[float],
+        *,
+        map_width_uas: float | None = None,
+        map_pixels: int | None = None,
+        **kwargs,
+    ):
         """Stream maps and aligned label products through the realization."""
 
-        return self._realize_for_times(times_days).dynamic_labeled_maps(
+        system = self._with_square_map_grid(
+            map_width_uas=map_width_uas,
+            map_pixels=map_pixels,
+        )
+        return system._realize_for_times(times_days).dynamic_labeled_maps(
             times_days,
             **_with_method_options(kwargs, dynamic=True),
         )

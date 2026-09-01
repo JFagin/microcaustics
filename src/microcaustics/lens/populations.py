@@ -246,7 +246,7 @@ def sample_uniform_point_masses(
         velocity_x.add_(mean_velocity[0])
         velocity_y.add_(mean_velocity[1])
 
-    return PointMassField.from_masses(
+    return PointMassField._from_masses(
         x,
         y,
         masses,
@@ -358,7 +358,7 @@ def sample_uniform_circular_point_masses(
         velocity_x.add_(mean_velocity[0])
         velocity_y.add_(mean_velocity[1])
 
-    return PointMassField.from_masses(
+    return PointMassField._from_masses(
         x,
         y,
         masses,

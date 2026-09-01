@@ -16,11 +16,12 @@ def main() -> None:
         stars=mc.PointMassField(
             x_uas=torch.tensor([-1.1, 0.3, 1.4]),
             y_uas=torch.tensor([0.7, -0.4, 0.1]),
-            einstein_radius_uas=torch.tensor([0.22, 0.17, 0.20]),
+            mass_solar=torch.tensor([0.002739, 0.001636, 0.002264]),
         ),
-        source_grid=mc.PlaneGrid((64, 64), (2.5, 2.5)),
     )
     result = system.magnification_map(
+        map_width_uas=2.5,
+        map_pixels=64,
         method=mc.IPMConfig(
             rays=4_096,
             scout_ratio=2,

@@ -99,10 +99,10 @@ class DTypeParityTests(unittest.TestCase):
                     shear_angle_rad=0.23,
                     smooth_matter_fraction=0.25,
                 ),
-                mc.PointMassField(
+                mc.PointMassField._from_einstein_radii(
                     torch.tensor(positions_x, dtype=dtype),
                     torch.tensor(positions_y, dtype=dtype),
-                    torch.tensor(radii, dtype=dtype),
+                    einstein_radius_uas=torch.tensor(radii, dtype=dtype),
                 ),
                 runtime=mc.RuntimeConfig(
                     device="cpu",
@@ -112,7 +112,11 @@ class DTypeParityTests(unittest.TestCase):
             )
             source_x, source_y, _ = simulation.raytrace_direct(query_x, query_y)
             determinant, _ = simulation.jacobian_determinant_direct(query_x, query_y)
-            outputs[dtype] = (source_x.double(), source_y.double(), determinant.double())
+            outputs[dtype] = (
+                source_x.double(),
+                source_y.double(),
+                determinant.double(),
+            )
 
         for actual, reference in zip(
             outputs[torch.float32], outputs[torch.float64], strict=True

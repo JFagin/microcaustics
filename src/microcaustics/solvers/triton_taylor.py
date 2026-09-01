@@ -97,6 +97,8 @@ if triton is not None:
     def _far_field_p4_query_kernel(
         x_ptr,
         y_ptr,
+        grid_nx,
+        grid_start,
         frame_index_ptr,
         local_x_ptr,
         local_y_ptr,
@@ -123,6 +125,7 @@ if triton is not None:
         STAR_BLOCK: tl.constexpr,
         DO_JACOBIAN: tl.constexpr,
         FRAME_INDEXED: tl.constexpr,
+        GRID_COORDS: tl.constexpr,
     ):
         ray = tl.program_id(0) * RAY_BLOCK + tl.arange(0, RAY_BLOCK)
         valid = ray < n_rays
@@ -132,8 +135,15 @@ if triton is not None:
         else:
             frame = ray // rays_per_frame
             local_ray = ray - frame * rays_per_frame
-        x = tl.load(x_ptr + local_ray, mask=valid, other=0.0)
-        y = tl.load(y_ptr + local_ray, mask=valid, other=0.0)
+        if GRID_COORDS:
+            grid_ray = local_ray + grid_start
+            grid_row = grid_ray // grid_nx
+            grid_column = grid_ray - grid_row * grid_nx
+            x = tl.load(x_ptr + grid_column, mask=valid, other=0.0)
+            y = tl.load(y_ptr + grid_row, mask=valid, other=0.0)
+        else:
+            x = tl.load(x_ptr + local_ray, mask=valid, other=0.0)
+            y = tl.load(y_ptr + local_ray, mask=valid, other=0.0)
         cell_x = tl.maximum(
             0,
             tl.minimum(NX - 1, tl.floor((x - xmin) / cell_dx)),
@@ -448,6 +458,8 @@ def evaluate_far_field_p4_triton(
     _far_field_p4_query_kernel[grid](
         x,
         y,
+        1,
+        0,
         x,
         far_field.local_x,
         far_field.local_y,
@@ -474,9 +486,92 @@ def evaluate_far_field_p4_triton(
         STAR_BLOCK=int(star_block),
         DO_JACOBIAN=bool(jacobian),
         FRAME_INDEXED=False,
+        GRID_COORDS=False,
         num_warps=4,
     )
     return output_x if jacobian else (output_x, output_y)
+
+
+def evaluate_far_field_p4_regular_grid_jacobian_triton(
+    far_field,
+    lens_grid,
+    output: torch.Tensor,
+    *,
+    start: int = 0,
+    stop: int | None = None,
+    ray_block: int = 64,
+    star_block: int = 32,
+) -> torch.Tensor:
+    """Write one regular-grid determinant interval without coordinate tensors.
+
+    Coordinates are derived from the flattened grid index inside the fused
+    Taylor kernel. ``output`` is a flat preallocated determinant buffer and is
+    returned for convenient chaining.
+    """
+
+    if not triton_taylor_available():
+        raise RuntimeError("Triton Taylor evaluation is unavailable")
+    if output.device.type != "cuda" or output.dtype != torch.float32:
+        raise ValueError("regular-grid Triton evaluation requires CUDA float32")
+    if far_field.config.taylor_order != 4:
+        raise ValueError("the fused Triton evaluator supports Taylor order four")
+    total = int(lens_grid.shape[0]) * int(lens_grid.shape[1])
+    start = int(start)
+    stop = total if stop is None else int(stop)
+    if start < 0 or stop < start or stop > total:
+        raise ValueError("start and stop must select a valid flattened grid interval")
+    flat_output = output.reshape(-1)
+    if flat_output.numel() < total:
+        raise ValueError("output is smaller than the regular grid")
+    count = stop - start
+    if count == 0:
+        return output
+
+    macro = far_field.simulation.macro_lens
+    angle = 2.0 * float(macro.shear_angle_rad)
+    gamma1 = float(macro.shear) * math.cos(angle)
+    gamma2 = float(macro.shear) * math.sin(angle)
+    beta_xx = 1.0 - macro.smooth_convergence - gamma1
+    beta_xy = -gamma2
+    beta_yy = 1.0 - macro.smooth_convergence + gamma1
+    y_axis, x_axis = lens_grid.axes(device=output.device, dtype=output.dtype)
+    target = flat_output[start:stop]
+    launch_grid = (triton.cdiv(count, int(ray_block)),)
+    _far_field_p4_query_kernel[launch_grid](
+        x_axis,
+        y_axis,
+        int(lens_grid.shape[1]),
+        start,
+        target,
+        far_field.local_x,
+        far_field.local_y,
+        far_field.local_mass,
+        far_field.coefficient_real,
+        far_field.coefficient_imag,
+        target,
+        target,
+        count,
+        count,
+        far_field.nx * far_field.ny,
+        far_field.local_x.shape[-1],
+        far_field.region.bounds_uas[0],
+        far_field.region.bounds_uas[2],
+        far_field.cell_dx,
+        far_field.cell_dy,
+        beta_xx,
+        beta_xy,
+        beta_yy,
+        NX=far_field.nx,
+        NY=far_field.ny,
+        NODES=far_field.config.nodes_per_cell_axis,
+        RAY_BLOCK=int(ray_block),
+        STAR_BLOCK=int(star_block),
+        DO_JACOBIAN=True,
+        FRAME_INDEXED=False,
+        GRID_COORDS=True,
+        num_warps=4,
+    )
+    return output
 
 
 def evaluate_far_field_p4_batch_triton(
@@ -519,6 +614,8 @@ def evaluate_far_field_p4_batch_triton(
     _far_field_p4_query_kernel[grid](
         flat_x,
         flat_y,
+        1,
+        0,
         flat_x,
         far_field_batch.local_x,
         far_field_batch.local_y,
@@ -545,6 +642,7 @@ def evaluate_far_field_p4_batch_triton(
         STAR_BLOCK=int(star_block),
         DO_JACOBIAN=bool(jacobian),
         FRAME_INDEXED=False,
+        GRID_COORDS=False,
         num_warps=4,
     )
     return (
@@ -598,6 +696,8 @@ def evaluate_far_field_p4_indexed_triton(
     _far_field_p4_query_kernel[grid](
         x,
         y,
+        1,
+        0,
         frame_index,
         far_field_batch.local_x,
         far_field_batch.local_y,
@@ -624,6 +724,7 @@ def evaluate_far_field_p4_indexed_triton(
         STAR_BLOCK=int(star_block),
         DO_JACOBIAN=False,
         FRAME_INDEXED=True,
+        GRID_COORDS=False,
         num_warps=4,
     )
     return output_x, output_y

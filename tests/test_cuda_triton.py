@@ -50,12 +50,12 @@ def _small_cuda_system(*, backend: str, offset: float = 0.0):
             band_names=("optical",),
         ),
     )
-    stars = mc.PointMassField(
+    stars = mc.PointMassField._from_einstein_radii(
         torch.tensor([-0.65 + offset, 0.35 + offset, 0.9 + offset]),
         torch.tensor([0.4, -0.5, 0.25]),
-        torch.tensor([0.18, 0.15, 0.12]),
-        torch.tensor([0.002, -0.001, 0.0015]),
-        torch.tensor([-0.001, 0.0015, -0.002]),
+        velocity_x_uas_per_day=torch.tensor([0.002, -0.001, 0.0015]),
+        velocity_y_uas_per_day=torch.tensor([-0.001, 0.0015, -0.002]),
+        einstein_radius_uas=torch.tensor([0.18, 0.15, 0.12]),
     )
     return mc.MicrolensingSystem(
         macro=mc.MacroLens(0.14, 0.07, shear_angle_deg=11.0),
@@ -217,12 +217,14 @@ class TritonTaylorTests(unittest.TestCase):
         )
 
         segments = torch.tensor(
-            [[
-                [[-1.0, -1.0], [1.0, -1.0]],
-                [[1.0, -1.0], [1.0, 1.0]],
-                [[1.0, 1.0], [-1.0, 1.0]],
-                [[-1.0, 1.0], [-1.0, -1.0]],
-            ]],
+            [
+                [
+                    [[-1.0, -1.0], [1.0, -1.0]],
+                    [[1.0, -1.0], [1.0, 1.0]],
+                    [[1.0, 1.0], [-1.0, 1.0]],
+                    [[-1.0, 1.0], [-1.0, -1.0]],
+                ]
+            ],
             device="cuda",
         )
         valid = torch.ones((1, 4), device="cuda", dtype=torch.bool)
@@ -231,29 +233,188 @@ class TritonTaylorTests(unittest.TestCase):
             [[0.0, 0.0], [2.0, 0.0], [0.0, 1.0]],
             device="cuda",
         )
-        fused_counts, fused_distances = (
-            batched_caustic_crossings_distances_triton(
-                segments,
-                valid,
-                anchors,
-                points,
-                points,
-                block_segments=64,
-            )
+        fused_counts, fused_distances = batched_caustic_crossings_distances_triton(
+            segments,
+            valid,
+            anchors,
+            points,
+            points,
+            block_segments=64,
         )
-        portable_counts, portable_distances = (
-            _crossing_counts_and_distances_portable(
-                segments,
-                valid,
-                anchors,
-                points,
-                points,
-                point_chunk_size=3,
-                segment_chunk_size=4,
-            )
+        portable_counts, portable_distances = _crossing_counts_and_distances_portable(
+            segments,
+            valid,
+            anchors,
+            points,
+            points,
+            point_chunk_size=3,
+            segment_chunk_size=4,
         )
         torch.testing.assert_close(fused_counts, portable_counts)
         torch.testing.assert_close(fused_distances, portable_distances)
+
+    def test_diagnostic_maps_match_portable_float32_results(self) -> None:
+        """Exercise full-grid winding, anchor/gauge, and distance products."""
+
+        from microcaustics.caustics import label_caustic_fields
+        from microcaustics.caustics.labels import distance_to_segments
+        from microcaustics.results import CausticField
+
+        generator = torch.Generator().manual_seed(314159)
+        cpu_segments = 4.0 * torch.rand(
+            (193, 2, 2), generator=generator, dtype=torch.float32
+        ) - 2.0
+        grid = mc.PlaneGrid((37, 41), (4.5, 4.25), (0.11, -0.19))
+        gpu_field = CausticField(
+            cpu_segments.cuda(),
+            cpu_segments.cuda(),
+            grid,
+        )
+        cpu_field = CausticField(cpu_segments, cpu_segments, grid)
+
+        x, y = grid.mesh(dtype=torch.float32)
+        cpu_points = torch.stack((x.reshape(-1), y.reshape(-1)), dim=-1)
+        expected_distance = distance_to_segments(
+            cpu_segments,
+            cpu_points,
+            point_chunk_size=113,
+            segment_chunk_size=47,
+        ).reshape(grid.shape)
+        actual_distance = gpu_field.distance_map(
+            grid,
+            point_chunk_size=113,
+            segment_chunk_size=47,
+        ).values_uas
+        torch.testing.assert_close(
+            actual_distance.cpu(),
+            expected_distance,
+            rtol=2.0e-6,
+            atol=2.0e-6,
+        )
+
+        expected_winding = cpu_field.winding_map(grid).values
+        actual_winding = gpu_field.winding_map(grid).values
+        torch.testing.assert_close(actual_winding.cpu(), expected_winding)
+        torch.testing.assert_close(
+            gpu_field.label_map(grid).values.cpu(),
+            cpu_field.label_map(grid).values,
+        )
+
+        config = mc.CausticConfig(
+            anchor_count=3,
+            gauge_count=3,
+            minimum_alignment_gauges=1,
+            point_chunk_size=127,
+            segment_chunk_size=47,
+            triton_segment_block=64,
+        )
+        cpu_labeled = label_caustic_fields(
+            (cpu_field,),
+            grid.region,
+            config,
+            diagnostic_grid=grid,
+            include_distance_map=True,
+        )[0][0]
+        gpu_labeled = label_caustic_fields(
+            (gpu_field,),
+            grid.region,
+            config,
+            diagnostic_grid=grid,
+            include_distance_map=True,
+        )[0][0]
+        self.assertTrue(gpu_labeled.label_map.metadata["triton_grid_query"])
+        torch.testing.assert_close(
+            gpu_labeled.label_map.values.cpu(),
+            cpu_labeled.label_map.values,
+        )
+        torch.testing.assert_close(
+            gpu_labeled.distance_map.values_uas.cpu(),
+            cpu_labeled.distance_map.values_uas,
+            rtol=2.0e-6,
+            atol=2.0e-6,
+        )
+
+    def test_complete_far_field_caustics_are_chunk_invariant(self) -> None:
+        """Complete winding fields retain their geometry across query chunks."""
+
+        system = _small_cuda_system(backend="triton")
+        simulation = system.realize().simulation
+        grid = mc.PlaneGrid((65, 67), (3.0, 3.0))
+        config = mc.FarFieldApproxConfig(
+            cells_per_axis=4,
+            nodes_per_cell_axis=8,
+            exact_radius_cells=1.0,
+        )
+        small_chunks = simulation.caustics(
+            grid,
+            far_field_approx=config,
+            ray_chunk_size=127,
+        )
+        one_chunk = simulation.caustics(
+            grid,
+            far_field_approx=config,
+            ray_chunk_size=grid.shape[0] * grid.shape[1],
+        )
+        automatic = simulation.caustics(grid, far_field_approx=config)
+        self.assertEqual(small_chunks.metadata["marching_squares"], "triton_compact")
+        self.assertEqual(automatic.metadata["regular_grid_determinant"], "triton_indexed")
+        self.assertEqual(automatic.metadata["determinant_ray_chunks"], 1)
+        self.assertEqual(small_chunks.segment_count, one_chunk.segment_count)
+        torch.testing.assert_close(
+            small_chunks.critical_segments_uas,
+            one_chunk.critical_segments_uas,
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            small_chunks.caustic_segments_uas,
+            one_chunk.caustic_segments_uas,
+            rtol=2.0e-6,
+            atol=2.0e-6,
+        )
+        torch.testing.assert_close(
+            automatic.caustic_segments_uas,
+            one_chunk.caustic_segments_uas,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_regular_grid_determinant_matches_coordinate_query(self) -> None:
+        """The coordinate-free full-grid kernel preserves float32 det A."""
+
+        from microcaustics.solvers.triton_taylor import (
+            evaluate_far_field_p4_regular_grid_jacobian_triton,
+        )
+
+        system = _small_cuda_system(backend="triton")
+        simulation = system.realize().simulation
+        grid = mc.PlaneGrid((71, 67), (3.1, 2.9), (0.13, -0.21))
+        approximation = TaylorFarFieldApproximation(
+            simulation,
+            grid.region,
+            mc.FarFieldApproxConfig(
+                cells_per_axis=4,
+                nodes_per_cell_axis=8,
+                exact_radius_cells=1.0,
+            ),
+        )
+        x, y = grid.mesh(device="cuda", dtype=torch.float32)
+        expected = approximation.jacobian_determinant(x, y)
+        actual = torch.empty_like(expected)
+        split = 1_337
+        evaluate_far_field_p4_regular_grid_jacobian_triton(
+            approximation,
+            grid,
+            actual,
+            stop=split,
+        )
+        evaluate_far_field_p4_regular_grid_jacobian_triton(
+            approximation,
+            grid,
+            actual,
+            start=split,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2.0e-6, atol=2.0e-6)
 
     def test_far_field_coefficients_rays_and_jacobian_match_eager(self) -> None:
         """Exercise local packs, far coefficients, ray tracing, and det A."""
@@ -266,7 +427,7 @@ class TritonTaylorTests(unittest.TestCase):
         x = torch.cat((far_x, local_x))
         y = torch.cat((far_y, local_y))
         radii = torch.rand(51, generator=generator, device="cuda") * 0.03 + 0.02
-        field = mc.PointMassField(x, y, radii)
+        field = mc.PointMassField._from_einstein_radii(x, y, einstein_radius_uas=radii)
         macro = mc.MacroLens(
             0.32,
             0.17,
@@ -332,12 +493,16 @@ class TritonTaylorTests(unittest.TestCase):
     def test_temporal_far_field_query_matches_independent_frames(self) -> None:
         """The unified query queue preserves each frame's Taylor solution."""
 
-        field = mc.PointMassField(
+        field = mc.PointMassField._from_einstein_radii(
             torch.tensor([-1.2, -0.4, 0.7, 1.5], device="cuda"),
             torch.tensor([0.8, -1.1, 0.3, -0.5], device="cuda"),
-            torch.tensor([0.12, 0.08, 0.1, 0.07], device="cuda"),
-            torch.tensor([0.002, -0.001, 0.0015, -0.002], device="cuda"),
-            torch.tensor([-0.001, 0.002, -0.0015, 0.001], device="cuda"),
+            velocity_x_uas_per_day=torch.tensor(
+                [0.002, -0.001, 0.0015, -0.002], device="cuda"
+            ),
+            velocity_y_uas_per_day=torch.tensor(
+                [-0.001, 0.002, -0.0015, 0.001], device="cuda"
+            ),
+            einstein_radius_uas=torch.tensor([0.12, 0.08, 0.1, 0.07], device="cuda"),
         )
         simulation = mc.MicrolensingSimulation.create(
             mc.MacroLens(
@@ -452,12 +617,12 @@ class TritonTaylorTests(unittest.TestCase):
 
         simulation = mc.MicrolensingSimulation.create(
             mc.MacroLens(0.1, 0.05),
-            mc.PointMassField(
+            mc.PointMassField._from_einstein_radii(
                 torch.tensor([-0.6, 0.5], device="cuda"),
                 torch.tensor([0.4, -0.3], device="cuda"),
-                torch.tensor([0.18, 0.16], device="cuda"),
-                torch.tensor([0.001, -0.0015], device="cuda"),
-                torch.tensor([-0.001, 0.0005], device="cuda"),
+                velocity_x_uas_per_day=torch.tensor([0.001, -0.0015], device="cuda"),
+                velocity_y_uas_per_day=torch.tensor([-0.001, 0.0005], device="cuda"),
+                einstein_radius_uas=torch.tensor([0.18, 0.16], device="cuda"),
             ),
             runtime=mc.RuntimeConfig(
                 device="cuda",
@@ -491,9 +656,15 @@ class TritonTaylorTests(unittest.TestCase):
             )
         )
         self.assertEqual(len(maps), 3)
-        self.assertTrue(all(item.metadata["dynamic_temporal_solver_fused"] for item in maps))
-        self.assertTrue(all(item.metadata["temporal_far_field_query_fused"] for item in maps))
-        self.assertTrue(all(item.metadata["far_field_exact_each_frame"] for item in maps))
+        self.assertTrue(
+            all(item.metadata["dynamic_temporal_solver_fused"] for item in maps)
+        )
+        self.assertTrue(
+            all(item.metadata["temporal_far_field_query_fused"] for item in maps)
+        )
+        self.assertTrue(
+            all(item.metadata["far_field_exact_each_frame"] for item in maps)
+        )
         self.assertTrue(all(item.metadata["compact_sparse_nodes"] for item in maps))
         self.assertTrue(maps[0].metadata["far_field_batched_accumulator"])
         self.assertTrue(maps[1].metadata["far_field_batched_accumulator"])
@@ -513,12 +684,16 @@ class TritonTaylorTests(unittest.TestCase):
                 shear_angle_rad=0.2,
                 smooth_matter_fraction=0.25,
             ),
-            mc.PointMassField(
+            mc.PointMassField._from_einstein_radii(
                 torch.tensor([-0.7, 0.25, 0.9], device="cuda"),
                 torch.tensor([0.45, -0.55, 0.3], device="cuda"),
-                torch.tensor([0.19, 0.15, 0.12], device="cuda"),
-                torch.tensor([0.002, -0.001, 0.0015], device="cuda"),
-                torch.tensor([-0.001, 0.0015, -0.002], device="cuda"),
+                velocity_x_uas_per_day=torch.tensor(
+                    [0.002, -0.001, 0.0015], device="cuda"
+                ),
+                velocity_y_uas_per_day=torch.tensor(
+                    [-0.001, 0.0015, -0.002], device="cuda"
+                ),
+                einstein_radius_uas=torch.tensor([0.19, 0.15, 0.12], device="cuda"),
             ),
             runtime=mc.RuntimeConfig(
                 device="cuda",
@@ -558,7 +733,7 @@ class TritonTaylorTests(unittest.TestCase):
                 torch.testing.assert_close(
                     actual.values,
                     reference.values,
-        # Atomic accumulation order changes with launch shape.
+                    # Atomic accumulation order changes with launch shape.
                     # the largest observed difference is a few float32 ulps.
                     rtol=1.0e-5,
                     atol=3.0e-5,
@@ -573,18 +748,10 @@ class TritonTaylorTests(unittest.TestCase):
         from microcaustics.solvers import biquadratic_nodes
 
         generator = torch.Generator(device="cuda").manual_seed(31)
-        node_x = torch.randn(
-            (37, 3, 3), device="cuda", generator=generator
-        )
-        node_y = torch.randn(
-            (37, 3, 3), device="cuda", generator=generator
-        )
-        expected_x, expected_y = biquadratic_nodes(
-            node_x, node_y, virtual_refinement=4
-        )
-        actual_x, actual_y = materialize_biquadratic_v4_triton(
-            node_x, node_y
-        )
+        node_x = torch.randn((37, 3, 3), device="cuda", generator=generator)
+        node_y = torch.randn((37, 3, 3), device="cuda", generator=generator)
+        expected_x, expected_y = biquadratic_nodes(node_x, node_y, virtual_refinement=4)
+        actual_x, actual_y = materialize_biquadratic_v4_triton(node_x, node_y)
         torch.testing.assert_close(actual_x, expected_x, rtol=2e-6, atol=5e-7)
         torch.testing.assert_close(actual_y, expected_y, rtol=2e-6, atol=5e-7)
 
@@ -688,7 +855,9 @@ class TritonTaylorTests(unittest.TestCase):
 
         simulation = mc.MicrolensingSimulation.create(
             mc.MacroLens(0.0, 0.0),
-            mc.PointMassField(torch.empty(0), torch.empty(0), torch.empty(0)),
+            mc.PointMassField._from_einstein_radii(
+                torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
+            ),
             runtime=mc.RuntimeConfig(
                 device="cuda",
                 backend="triton",
@@ -784,7 +953,9 @@ class TritonTaylorTests(unittest.TestCase):
 
         simulation = mc.MicrolensingSimulation.create(
             mc.MacroLens(0.0, 0.0),
-            mc.PointMassField(torch.empty(0), torch.empty(0), torch.empty(0)),
+            mc.PointMassField._from_einstein_radii(
+                torch.empty(0), torch.empty(0), einstein_radius_uas=torch.empty(0)
+            ),
             runtime=mc.RuntimeConfig(
                 device="cuda",
                 backend="triton",
@@ -855,9 +1026,7 @@ class TritonTaylorTests(unittest.TestCase):
         for compact in (False, True):
             outputs.append(
                 system.magnification_map(
-                    method=_small_production_method(
-                        compact_sparse_nodes=compact
-                    )
+                    method=_small_production_method(compact_sparse_nodes=compact)
                 )
             )
         torch.testing.assert_close(

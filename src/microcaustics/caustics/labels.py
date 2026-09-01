@@ -185,6 +185,109 @@ def winding_number(
 
 
 @torch.no_grad()
+def regular_grid_winding_number(
+    segments_uas,
+    y_axis_uas,
+    x_axis_uas,
+    *,
+    segment_chunk_size: int = 16384,
+    maximum_temporary_pairs: int = 2_000_000,
+) -> torch.Tensor:
+    """Return signed winding numbers on a uniform Cartesian grid.
+
+    The pointwise definition casts one positive-x ray per pixel.  On a regular
+    grid, one segment crossing contributes to a contiguous prefix of a row.
+    This implementation accumulates those exact prefix updates and performs a
+    row-wise cumulative sum.  It preserves the same half-open vertex rule as
+    :func:`winding_number` while reducing the work from pixel-segment pairs to
+    row-segment pairs.
+
+    ``maximum_temporary_pairs`` bounds the largest row-by-segment predicate.
+    It changes only the working set, not the returned winding numbers.
+    """
+
+    segments = torch.as_tensor(segments_uas)
+    if segments.ndim != 3 or tuple(segments.shape[1:]) != (2, 2):
+        raise ValueError("segments_uas must have shape [segment, 2, 2]")
+    y_axis = torch.as_tensor(
+        y_axis_uas,
+        device=segments.device,
+        dtype=segments.dtype,
+    ).reshape(-1)
+    x_axis = torch.as_tensor(
+        x_axis_uas,
+        device=segments.device,
+        dtype=segments.dtype,
+    ).reshape(-1)
+    if y_axis.numel() < 1 or x_axis.numel() < 1:
+        raise ValueError("grid axes must be non-empty")
+    if int(segment_chunk_size) < 1 or int(maximum_temporary_pairs) < 1:
+        raise ValueError("chunk and temporary-pair limits must be positive")
+    if y_axis.numel() > 1 and not bool(torch.all(y_axis[1:] > y_axis[:-1])):
+        raise ValueError("y_axis_uas must be strictly increasing")
+    if x_axis.numel() > 1 and not bool(torch.all(x_axis[1:] > x_axis[:-1])):
+        raise ValueError("x_axis_uas must be strictly increasing")
+
+    if segments.device.type == "cuda" and segments.dtype == torch.float32:
+        try:
+            from .triton_caustics import (
+                regular_grid_winding_number_triton,
+                triton_caustics_available,
+            )
+
+            if triton_caustics_available():
+                return regular_grid_winding_number_triton(
+                    segments,
+                    y_axis,
+                    x_axis,
+                )
+        except Exception as error:
+            from ..runtime import warn_backend_fallback
+
+            warn_backend_fallback("Triton winding map", error)
+
+    ny, nx = int(y_axis.numel()), int(x_axis.numel())
+    output = torch.zeros((ny, nx), device=segments.device, dtype=torch.int64)
+    if segments.shape[0] == 0:
+        return output
+
+    segment_chunk_size = min(int(segment_chunk_size), int(segments.shape[0]))
+    row_chunk_size = max(
+        1,
+        min(ny, int(maximum_temporary_pairs) // segment_chunk_size),
+    )
+    x_axis = x_axis.contiguous()
+    for row_start in range(0, ny, row_chunk_size):
+        row_stop = min(ny, row_start + row_chunk_size)
+        rows = y_axis[row_start:row_stop, None]
+        difference = torch.zeros(
+            (row_stop - row_start, nx + 1),
+            device=segments.device,
+            dtype=torch.int64,
+        )
+        for segment_start in range(0, segments.shape[0], segment_chunk_size):
+            block = segments[
+                segment_start : segment_start + segment_chunk_size
+            ]
+            x0 = block[None, :, 0, 0]
+            y0 = block[None, :, 0, 1]
+            x1 = block[None, :, 1, 0]
+            y1 = block[None, :, 1, 1]
+            upward = (y0 <= rows) & (rows < y1)
+            downward = (y1 <= rows) & (rows < y0)
+            crosses = upward | downward
+            safe_dy = torch.where(crosses, y1 - y0, torch.ones_like(y1))
+            intersection_x = x0 + (rows - y0) * (x1 - x0) / safe_dy
+            cutoff = torch.searchsorted(x_axis, intersection_x.contiguous())
+            signed = upward.to(torch.int64) - downward.to(torch.int64)
+            signed = torch.where(crosses, signed, torch.zeros_like(signed))
+            difference[:, 0].add_(signed.sum(dim=1))
+            difference.scatter_add_(1, cutoff, -signed)
+        output[row_start:row_stop] = torch.cumsum(difference[:, :nx], dim=1)
+    return output
+
+
+@torch.no_grad()
 def crossing_parity(
     segments_uas,
     points_uas,
@@ -278,6 +381,36 @@ def distance_to_segments(
         raise ValueError("point and segment chunk sizes must be positive")
     output_shape = points.shape[:-1]
     flat_points = points.reshape(-1, 2)
+    if segments.device.type == "cuda" and segments.dtype == torch.float32:
+        try:
+            from .triton_caustics import (
+                caustic_distances_triton,
+                triton_caustics_available,
+            )
+
+            if triton_caustics_available():
+                segment_blocks = max(1, (int(segments.shape[0]) + 255) // 256)
+                triton_point_chunk = max(
+                    1,
+                    min(
+                        int(flat_points.shape[0]),
+                        16_000_000 // segment_blocks,
+                    ),
+                )
+                chunks = [
+                    caustic_distances_triton(
+                        segments,
+                        flat_points[start : start + triton_point_chunk],
+                    )
+                    for start in range(0, flat_points.shape[0], triton_point_chunk)
+                ]
+                if chunks:
+                    return torch.cat(chunks).reshape(output_shape)
+                return torch.empty(output_shape, device=segments.device, dtype=segments.dtype)
+        except Exception:
+            # Diagnostic maps retain the portable exact implementation when
+            # Triton is unavailable or a platform-specific launch fails.
+            pass
     result = torch.full(
         (flat_points.shape[0],),
         float("inf"),

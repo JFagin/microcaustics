@@ -12,32 +12,70 @@ tutorial. It shows a ten-year, $10^7$-ray, $1024^2$ dynamic IPM calculation with
 caustic network overlaid. Its map normalization, colorbar, and indexed GIF
 palette are fixed globally across all frames.
 
-The portable reference layer includes the following capabilities.
+### Fast CUDA production path
 
-- exact chunked point-mass ray tracing and analytic Jacobians.
-- source-independent uniform-grid inverse ray shooting (IRS).
-- full-field and nested-scout IPM.
-- a direct-cell Triton IPM rasterizer plus an exact portable overlap reference.
-- a readable local-exact complex-Taylor far-field approximation.
-- fused batches of unrelated static maps and moving-star map sequences on CUDA, with
-  portable frame-by-frame equivalents.
-- critical curves, caustics, binary label maps, and distance maps.
-- physically calibrated multiband pixelated/callable sources and analytic Gaussians.
-- composable tabulated or callable intrinsic driving signals.
-- physical Page--Thorne thin disks with non-GR, approximate-GR, and primary
-  full-Kerr observer transfers.
-- nonlinear thermal reverberation with arbitrary delayed heating maps and
-  linear transfer-function extraction.
-- reproducible point-mass populations with extensible mass functions.
-- moving-source finite-source light curves.
-- coherent resolved multi-image light curves with independent lens fields,
-  trajectories, numerics, and cosmological arrival delays.
+`microcaustics` is designed for fast static and dynamic microlensing
+calculations. Its main method is inverse polygon mapping. Rather than treating
+each lens-plane sample as a single ray, it maps the corners of each lens-plane
+cell into the source plane and distributes the cell's area among the source
+pixels that it overlaps.
 
-The fused dynamic IPM production path is available. It combines temporal
-Taylor far-field queries, a shared conservative cell queue, biquadratic interpolation,
-and direct-cell rasterization without materializing triangle arrays. Optional
-caustic/label products reuse the same per-epoch far-field states, but remain opt-in so
-users do not pay for them when only maps or light curves are requested.
+The production method first scouts the lens plane to identify cells whose
+mapped rays can reach the requested source field. Cells that cannot contribute
+are skipped. Nearby microlenses are evaluated exactly, while the combined
+deflection from distant microlenses is represented by a local complex-Taylor
+expansion. Higher-order sampling within each selected cell captures curvature
+in the lens mapping and reduces finite-cell artifacts.
+
+The selected cells are mapped and accumulated directly into the magnification
+map by fused Triton kernels. This avoids storing large intermediate ray,
+polygon, and triangle arrays. Temporal batches reuse the selected geometry and
+numerical work across moving-star frames. Separate maps and light curves can
+also be processed concurrently, and compatible simulations reuse already
+compiled kernels.
+
+Caustic extraction uses compact batched marching squares. Dedicated GPU
+kernels calculate source-center crossing labels and full binary, distance, and
+signed winding maps. All caustic and label products are optional, so map-only
+and light-curve-only calculations do not pay for them.
+
+The package also includes portable Torch implementations using the same
+numerical definitions. These provide readable validation references and
+support CPU, Apple, and non-Triton environments.
+
+### Physical sources and lens systems
+
+Microlens populations can be generated from built-in or user-defined mass
+functions, including Salpeter populations. Users may control the mean mass,
+mass range, smooth-matter fraction, stellar positions, bulk motion, and
+velocity dispersion. Individual microlens masses, positions, and velocities
+can also be supplied directly. The required circular stellar field is normally
+determined automatically from the requested source region, light-loss
+tolerance, and safety scale.
+
+The package includes general-relativistic Page--Thorne accretion disks with
+full Kerr ray tracing, relativistic redshifts, observer delays, lamp-post
+heating, multiband disk images, and intrinsic source evolution. It can
+calculate steady and microlensed transfer functions, continuum light curves,
+redshift maps, and delay maps. These calculations can also be used without
+lensing for general-relativistic disk modeling and continuum reverberation
+mapping.
+
+Supernovae, analytic profiles, pixelated sources, and custom evolving sources
+use the same simulation interface. Intrinsic variability may be evaluated at a
+finer cadence than the evolving magnification maps. Arbitrary wavelength bands
+and user-defined observing schedules are supported. The package can generate
+LSST-like observations using realistic survey cadences and band-dependent
+photometric uncertainties.
+
+Multi-image simulations apply one shared intrinsic source to any number of
+macroimages. Each image may have its own macro lens parameters, microlens
+population, stellar realization, trajectory, velocity model, and numerical
+settings. Cosmological arrival-time delays can be supplied directly or
+calculated from a user-defined strong-lens model. The resulting products
+include coherent multi-image light curves, LSST-like sampled observations,
+independent magnification maps, microlensed transfer functions,
+caustic-crossing labels, and resolved strong-lens images.
 
 ## Installation
 
@@ -251,8 +289,9 @@ Expanding-supernova models derive it from the largest photospheric radius over
 the requested evolution.
 When a source trajectory is supplied to `MicrolensingSystem`, its duration is
 also included automatically so the derived map field covers the complete
-path. An explicit `PlaneGrid` is only needed for a source-independent map or
-an intentionally pixelated custom source.
+path. An explicit `PlaneGrid` is only needed for an advanced rectangular or
+off-center field. Centered source-independent maps use plain width and pixel
+arguments instead.
 
 ### 2. Generate and plot one magnification map
 
@@ -280,9 +319,41 @@ virtual_refinement=4, far_field=True)`. Use `method="irs"` for inverse ray
 shooting, or set `integration_domain` on the system to `"scout"`, `"full"`,
 or `"rectangle"`.
 
-For a source-independent map, omit `source=` and supply only
-`source_grid=mc.PlaneGrid((1024, 1024), (height_uas, width_uas))`. The tuple
-order is `(y, x)`, and the field of view is in microarcseconds.
+### Source-independent maps with directly placed stars
+
+A magnification map does not require a luminous source. It only needs the
+source-plane width and output pixel count. This two-star example specifies
+angular lens positions and physical masses. The package derives their
+Einstein radii and the required lens-plane region from the cosmological and
+map geometry.
+
+```python
+stars = mc.PointMassField(
+    x_uas=torch.tensor([-1.0, 1.0]),
+    y_uas=torch.tensor([0.0, 0.0]),
+    mass_solar=torch.tensor([0.09, 0.04]),
+)
+
+map_system = mc.MicrolensingSystem(
+    lens_redshift=0.5,
+    source_redshift=2.0,
+    macro=mc.MacroLens(convergence=0.0, shear=0.1),
+    stars=stars,
+)
+
+two_star_map = map_system.magnification_map(
+    map_width_uas=10.0,  # square source-plane width
+    map_pixels=1024,     # pixels per axis
+    rays=10_000_000,
+)
+```
+
+The centered lens plane is inferred automatically. Advanced calculations can
+choose a centered square or rectangle with `lens_plane_uas`, or use an
+explicit `PlaneRegion` for an off-center field. These controls and conversion
+between microarcseconds and mean-microlens Einstein units are demonstrated in
+the numerical-methods notebook. Use an explicit `PlaneGrid` only when the
+source map itself must be rectangular or off-center.
 
 ### 3. Generate a production light curve with labels
 
