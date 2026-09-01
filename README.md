@@ -695,36 +695,53 @@ custom spatial and spectral Torch functions, and independently sampled source
 and map cadences. The paper's Type Ia-like prototype is only an explicit named
 reproducibility preset.
 
-Resolved lensed systems use the same physical interface. Supply a mapping of
-image names to local `MacroLens` objects, followed by the distances, source,
-stellar population, and measured arrival delays only once.
+Resolved lensed systems use the same physical interface. The following example
+continues from the single-image system above and reuses its redshifts, source,
+stellar population, and intrinsic driver. Define the local macro lens for each
+image and supply the measured arrival delays once.
 
 ```python
-system = mc.MultiImageSystem(
-    images={"A": macro_a, "B": macro_b, "C": macro_c, "D": macro_d},
+image_macros = {
+    "A": mc.MacroLens(0.396, 0.396, shear_angle_deg=175.43),
+    "B": mc.MacroLens(0.391, 0.391, shear_angle_deg=141.73),
+    "C": mc.MacroLens(0.715, 0.715, shear_angle_deg=69.11),
+    "D": mc.MacroLens(0.604, 0.604, shear_angle_deg=62.54),
+}
+
+multi_image_system = mc.MultiImageSystem(
+    images=image_macros,
     lens_redshift=lens_redshift,
     source_redshift=source_redshift,
     H0=70.0,
     Om0=0.3,
     source=source,
-    stellar_population=stellar_population,
-    arrival_time_delays_days={"A": 0.0, "B": 7.4, "C": 2.1, "D": 11.8},
+    stellar_population=population,
+    arrival_time_delays_days={
+        "A": 0.0,
+        "B": 7.4,
+        "C": 2.1,
+        "D": 11.8,
+    },  # illustrative values in days; replace with measured or modeled delays
     seed=1001,
 )
-microlensing_only = system.light_curves(
+
+multi_image_microlensing = multi_image_system.light_curves(
     duration_days=3650,
     map_cadence_days=25,
     include_labels=True,
 )
 
-variable_system = system.with_source(source.with_driving_signal(driver))
-microlensing_and_variability = variable_system.light_curves(
+variable_multi_image_system = multi_image_system.with_source(
+    source.with_driving_signal(driver)
+)
+multi_image_combined = variable_multi_image_system.light_curves(
     duration_days=3650,
     map_cadence_days=25,
     source_cadence_days=1,
     include_labels=True,
 )
-maps = system.magnification_maps()  # one independent static map per image
+
+multi_image_maps = multi_image_system.magnification_maps()
 ```
 
 Each image receives an independent stellar realization. Shared numerical

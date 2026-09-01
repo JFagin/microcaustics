@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import importlib
 import json
 import re
@@ -127,6 +128,37 @@ class DocumentationIntegrityTests(unittest.TestCase):
                 with self.subTest(path=path.name, block=index):
                     compile(block, f"{path}::python-block-{index}", "exec")
         self.assertGreaterEqual(block_count, 10)
+
+    def test_readme_python_blocks_do_not_use_undefined_names(self) -> None:
+        """Treat the README tutorial blocks as one executable Python session."""
+
+        defined = set(dir(builtins))
+        unresolved: list[str] = []
+        readme = (PACKAGE_ROOT / "README.md").read_text(encoding="utf-8")
+        for index, block in enumerate(_python_blocks(readme)):
+            tree = ast.parse(block, filename=f"README.md::python-block-{index}")
+            assigned = {
+                node.id
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+            }
+            imported: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    imported.update(alias.asname or alias.name for alias in node.names)
+            available = defined | assigned | imported
+            unresolved.extend(
+                f"block {index}: {node.id}"
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id not in available
+            )
+            defined.update(assigned)
+            defined.update(imported)
+        self.assertEqual(sorted(set(unresolved)), [])
 
     def test_examples_use_public_package_imports(self) -> None:
         violations: list[str] = []
