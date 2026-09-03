@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import asdict, dataclass, is_dataclass
+from functools import cached_property
 from typing import Protocol, runtime_checkable
 
 from ..geometry import PlaneRegion
+from ..random import derive_seed
 from .mass_functions import MassFunction, salpeter_mass_function
 from .models import LensingDistances, MacroLens, PointMassField
 from .populations import (
@@ -17,6 +20,10 @@ from .populations import (
 
 _SECONDS_PER_DAY = 86_400.0
 _RADIANS_TO_MICROARCSECONDS = 180.0 / math.pi * 3600.0 * 1.0e6
+
+
+class IncompleteKinematicsWarning(RuntimeWarning):
+    """A dynamic stellar field omits a physical velocity contribution."""
 
 
 @runtime_checkable
@@ -135,6 +142,9 @@ class SkyProjectedKinematics:
     CMB dipole is projected at ``ra_deg`` and ``dec_deg`` and included by
     default. Set ``peculiar_velocity_dispersion_km_s`` to draw reproducible
     lens and source peculiar velocities after the system supplies redshifts.
+    An omitted ``seed`` inherits the containing system's independent
+    kinematic seed. Supplying it explicitly keeps the same physical bulk
+    motion when the system seed or stellar realization changes.
     """
 
     ra_deg: float
@@ -184,10 +194,6 @@ class SkyProjectedKinematics:
                 raise ValueError(
                     "peculiar_velocity_dispersion_km_s must be finite and non-negative"
                 )
-            if self.seed is None:
-                import torch
-
-                object.__setattr__(self, "seed", int(torch.seed()))
         else:
             for name in velocity_names:
                 values = getattr(self, name)
@@ -213,6 +219,23 @@ class SkyProjectedKinematics:
         dark_energy = omega_lambda / expansion2
         return matter ** (4.0 / 7.0) + dark_energy * (1.0 + matter / 2.0) / 70.0
 
+    @cached_property
+    def _peculiar_standard_draws(self) -> tuple[float, ...]:
+        """Draw the four peculiar-velocity components once, without reseeding globals."""
+
+        import torch
+
+        generator = None
+        if self.seed is not None:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(
+                derive_seed(int(self.seed), "lens_source_peculiar_velocities")
+            )
+        return tuple(
+            float(value)
+            for value in torch.randn(4, generator=generator, dtype=torch.float64)
+        )
+
     def _peculiar_velocities(
         self,
         distances: LensingDistances,
@@ -225,11 +248,6 @@ class SkyProjectedKinematics:
                 self.source_peculiar_velocity_km_s,
             )
         lens_redshift, source_redshift = self._redshifts(distances)
-        import torch
-
-        generator = torch.Generator(device="cpu")
-        assert self.seed is not None
-        generator.manual_seed(int(self.seed))
         f0 = self._growth_rate(0.0, self.omega_matter, self.omega_lambda)
         lens_sigma = (
             self.peculiar_velocity_dispersion_km_s
@@ -243,16 +261,9 @@ class SkyProjectedKinematics:
             * self._growth_rate(source_redshift, self.omega_matter, self.omega_lambda)
             / f0
         )
-        lens = tuple(
-            float(v)
-            for v in torch.randn(2, generator=generator, dtype=torch.float64)
-            * lens_sigma
-        )
-        source = tuple(
-            float(v)
-            for v in torch.randn(2, generator=generator, dtype=torch.float64)
-            * source_sigma
-        )
+        draws = self._peculiar_standard_draws
+        lens = tuple(value * lens_sigma for value in draws[:2])
+        source = tuple(value * source_sigma for value in draws[2:])
         return lens, source
 
     def _redshifts(self, distances: LensingDistances) -> tuple[float, float]:
@@ -342,6 +353,73 @@ class SkyProjectedKinematics:
                 * _SECONDS_PER_DAY
             )
         return (result[0], result[1])
+
+    def resolved_metadata(self, distances: LensingDistances) -> dict[str, object]:
+        """Return the realized observer-frame velocity decomposition."""
+
+        lens_velocity, source_velocity = self._peculiar_velocities(distances)
+        cmb_velocity = self._cmb_transverse_km_s()
+        return {
+            "coordinate_basis": "ICRS east/north",
+            "lens_peculiar_velocity_km_s": list(lens_velocity),
+            "source_peculiar_velocity_km_s": list(source_velocity),
+            "cmb_transverse_velocity_km_s": list(cmb_velocity),
+            "bulk_velocity_uas_per_day": list(
+                self.mean_velocity_uas_per_day(distances)
+            ),
+            "stellar_component_dispersion_uas_per_day": float(
+                self.component_dispersion_uas_per_day(distances)
+            ),
+        }
+
+
+def _warn_incomplete_dynamic_kinematics(
+    kinematics: StellarKinematics,
+    *,
+    stacklevel: int = 2,
+) -> None:
+    """Warn when a dynamic stellar population omits physical motion terms."""
+
+    missing: list[str] = []
+    if isinstance(kinematics, StaticKinematics):
+        missing.extend(("stellar dispersion", "CMB motion", "lens motion", "source motion"))
+    elif isinstance(kinematics, IsotropicKinematics):
+        if kinematics.dispersion_km_s == 0.0:
+            missing.append("stellar dispersion")
+        missing.extend(("separate CMB motion", "separate lens motion", "separate source motion"))
+        if not any(float(value) != 0.0 for value in kinematics.bulk_velocity_km_s):
+            missing.append("combined bulk drift")
+    elif isinstance(kinematics, SkyProjectedKinematics):
+        if kinematics.stellar_dispersion_km_s == 0.0:
+            missing.append("stellar dispersion")
+        if not kinematics.include_cmb_dipole or kinematics.cmb_speed_km_s == 0.0:
+            missing.append("CMB motion")
+        if kinematics.peculiar_velocity_dispersion_km_s is not None:
+            if kinematics.peculiar_velocity_dispersion_km_s == 0.0:
+                missing.extend(("lens peculiar motion", "source peculiar motion"))
+        else:
+            assert kinematics.lens_peculiar_velocity_km_s is not None
+            assert kinematics.source_peculiar_velocity_km_s is not None
+            if not any(float(value) != 0.0 for value in kinematics.lens_peculiar_velocity_km_s):
+                missing.append("lens peculiar motion")
+            if not any(float(value) != 0.0 for value in kinematics.source_peculiar_velocity_km_s):
+                missing.append("source peculiar motion")
+    else:
+        missing.append("verifiable stellar and bulk motion components")
+
+    if missing:
+        warnings.warn(
+            "Dynamic stellar population omits "
+            + ", ".join(missing)
+            + ". Use SkyProjectedKinematics with nonzero stellar dispersion, "
+            "CMB motion, and lens/source peculiar motions for a complete "
+            "observer-frame velocity model. Intentional controlled experiments "
+            "may suppress this warning.",
+            IncompleteKinematicsWarning,
+            stacklevel=stacklevel,
+        )
+
+
 @dataclass(frozen=True)
 class StellarAperture:
     """The full circular lens-plane region populated by compact objects."""
@@ -460,7 +538,10 @@ class StellarPopulation:
             dtype=resolved_dtype,
         )
 
-    def metadata(self) -> dict[str, object]:
+    def metadata(
+        self,
+        distances: LensingDistances | None = None,
+    ) -> dict[str, object]:
         """Return serializable mass-function and kinematic provenance."""
 
         mass_function = (
@@ -473,7 +554,7 @@ class StellarPopulation:
             if is_dataclass(self.kinematics)
             else {"type": type(self.kinematics).__name__}
         )
-        return {
+        metadata = {
             "name": self.name,
             "count_override": self.count,
             "mass_function": {
@@ -485,6 +566,31 @@ class StellarPopulation:
                 **kinematics,
             },
         }
+        if distances is not None:
+            resolved_metadata = getattr(
+                self.kinematics,
+                "resolved_metadata",
+                None,
+            )
+            if resolved_metadata is not None:
+                metadata["kinematics"]["resolved"] = resolved_metadata(distances)
+            else:
+                mean_velocity = getattr(
+                    self.kinematics,
+                    "mean_velocity_uas_per_day",
+                    None,
+                )
+                metadata["kinematics"]["resolved"] = {
+                    "bulk_velocity_uas_per_day": list(
+                        (0.0, 0.0)
+                        if mean_velocity is None
+                        else mean_velocity(distances)
+                    ),
+                    "stellar_component_dispersion_uas_per_day": float(
+                        self.kinematics.component_dispersion_uas_per_day(distances)
+                    ),
+                }
+        return metadata
 
 
 def circular_stellar_aperture(

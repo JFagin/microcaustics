@@ -6,16 +6,27 @@ implementing the smallest relevant protocol over subclassing a simulation.
 
 ## Custom finite sources
 
-Implement the public pixelated-source interface. Expose a `SourceGeometry` and
-return brightness tensors with shape `[time, band, y, x]`. Existing map and
+For a brightness function, use `CallableSource` with `source_grid_shape`,
+`field_of_view_uas`, and `bands_angstrom`. For an image array, `StaticSource`
+infers the shape. Both obtain physical geometry from the system distances.
+
+For a custom class, implement the public pixelated-source interface. Expose a `SourceGeometry` and
+return brightness tensors with shape `[time, y, x, band]` in `Jy m^-2` of
+projected source-plane area. Existing map and
 light-curve routines then work without knowing the source physics. This covers
 tabulated images, expanding transients, corona models, spectral-line emission,
 and differentiable Torch models.
 
 ## Variability and transfer functions
 
-Wrap user time series with `TabulatedSignal`, or supply a callable PSD or
-variability model. Microlensing map cadence and intrinsic source cadence remain
+Wrap user time series with `TabulatedDrivingSignal`, or supply a callable PSD or
+variability model. Attach the signal to a source that defines its response,
+not to the microlensing system. For simple multiplication, wrap a physical
+model or pixelated source with `ModulatedSource`. For a custom physical response, expose its
+`driving_signal` and implement `with_driving_signal(signal)` to return a copy
+with a bound or constant driver. Sources without a driver remain valid and
+raise an error only when explicitly asked to apply one.
+Microlensing map cadence and intrinsic source cadence remain
 independent. Sources implementing the transfer-function protocol can use the
 standalone steady and microlensed response interfaces.
 
@@ -30,7 +41,6 @@ mixed populations require no solver changes.
 Known image properties may be supplied through the advanced
 `microcaustics.multi_image.MacroImageConfig` interface.
 External macro solvers can implement `MacroModel` or use `CallableMacroModel`.
-The optional caustics adapter accepts models supported by that package.
 
 ## Instruments and outputs
 

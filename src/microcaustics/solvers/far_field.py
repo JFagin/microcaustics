@@ -122,6 +122,8 @@ class TaylorFarFieldApproximation:
         time_days: float = 0.0,
         star_chunk_size: int = 4096,
         _coefficient_override=None,
+        _local_override=None,
+        _defer_synchronize: bool = False,
     ) -> None:
         """Build local-star packs and far-field coefficients."""
 
@@ -135,6 +137,8 @@ class TaylorFarFieldApproximation:
         self.time_days = float(time_days)
         self.star_chunk_size = int(star_chunk_size)
         self._coefficient_override = _coefficient_override
+        self._local_override = _local_override
+        self._defer_synchronize = bool(_defer_synchronize)
         self.last_query_backend = "not-evaluated"
         self._build()
 
@@ -190,36 +194,72 @@ class TaylorFarFieldApproximation:
         cell_i = torch.arange(self.nx, device=runtime.device).repeat_interleave(self.ny)
         cell_j = torch.arange(self.ny, device=runtime.device).repeat(self.nx)
         n_stars = len(field)
-        mask_grid = torch.empty(
-            (n_cells, n_stars),
-            device=runtime.device,
-            dtype=torch.bool,
-        )
-        elements_per_cell = max(1, n_stars)
-        element_size = torch.empty((), dtype=runtime.dtype).element_size()
-        membership_cell_batch = max(
-            1,
-            min(n_cells, (32 * 1024**2) // max(2 * element_size * elements_per_cell, 1)),
-        )
-        star_x = field.x_uas[None]
-        star_y = field.y_uas[None]
-        for start in range(0, n_cells, membership_cell_batch):
-            stop = min(n_cells, start + membership_cell_batch)
-            ii = cell_i[start:stop]
-            jj = cell_j[start:stop]
-            dx = torch.maximum(
-                torch.maximum(self.x_edges[ii, None] - star_x, star_x - self.x_edges[ii + 1, None]),
-                zero,
+        mask_grid = None
+        if self._local_override is None:
+            mask_grid = torch.empty(
+                (n_cells, n_stars),
+                device=runtime.device,
+                dtype=torch.bool,
             )
-            dy = torch.maximum(
-                torch.maximum(self.y_edges[jj, None] - star_y, star_y - self.y_edges[jj + 1, None]),
-                zero,
+            elements_per_cell = max(1, n_stars)
+            element_size = torch.empty((), dtype=runtime.dtype).element_size()
+            membership_cell_batch = max(
+                1,
+                min(
+                    n_cells,
+                    (32 * 1024**2)
+                    // max(2 * element_size * elements_per_cell, 1),
+                ),
             )
-            mask_grid[start:stop] = dx.square() + dy.square() <= radius2
-        local_counts_tensor = mask_grid.sum(dim=1)
-        max_local_count = (
-            int(local_counts_tensor.max().detach().cpu()) if n_cells else 0
-        )
+            star_x = field.x_uas[None]
+            star_y = field.y_uas[None]
+            for start in range(0, n_cells, membership_cell_batch):
+                stop = min(n_cells, start + membership_cell_batch)
+                ii = cell_i[start:stop]
+                jj = cell_j[start:stop]
+                dx = torch.maximum(
+                    torch.maximum(
+                        self.x_edges[ii, None] - star_x,
+                        star_x - self.x_edges[ii + 1, None],
+                    ),
+                    zero,
+                )
+                dy = torch.maximum(
+                    torch.maximum(
+                        self.y_edges[jj, None] - star_y,
+                        star_y - self.y_edges[jj + 1, None],
+                    ),
+                    zero,
+                )
+                mask_grid[start:stop] = dx.square() + dy.square() <= radius2
+            local_counts_tensor = mask_grid.sum(dim=1)
+            max_local_count = (
+                int(local_counts_tensor.max().detach().cpu()) if n_cells else 0
+            )
+        else:
+            if self._coefficient_override is None:
+                raise ValueError(
+                    "batched local-star packs require precomputed coefficients"
+                )
+            (
+                local_x,
+                local_y,
+                local_mass,
+                local_counts_tensor,
+                override_maximum_local,
+                override_mean_local,
+            ) = (
+                self._local_override
+            )
+            expected_prefix = (n_cells,)
+            if (
+                tuple(local_x.shape[:1]) != expected_prefix
+                or local_y.shape != local_x.shape
+                or local_mass.shape != local_x.shape
+                or tuple(local_counts_tensor.shape) != expected_prefix
+            ):
+                raise ValueError("batched local-star pack has the wrong shape")
+            max_local_count = int(override_maximum_local)
         coefficient_shape = (
             self.nx,
             self.ny,
@@ -312,34 +352,55 @@ class TaylorFarFieldApproximation:
             self.coefficient_real = override_real.contiguous()
             self.coefficient_imag = override_imag.contiguous()
             self.coefficient_build_backend = "precomputed"
-        max_local = max(1, max_local_count)
-        local_shape = (n_cells, max_local)
-        self.local_x = torch.zeros(local_shape, device=runtime.device, dtype=runtime.dtype)
-        self.local_y = torch.zeros_like(self.local_x)
-        self.local_mass = torch.zeros_like(self.local_x)
-        rank_elements_per_cell = max(1, n_stars)
-        pack_cell_batch = max(
-            1,
-            min(n_cells, (64 * 1024**2) // max(8 * rank_elements_per_cell, 1)),
-        )
-        for start in range(0, n_cells, pack_cell_batch):
-            stop = min(n_cells, start + pack_cell_batch)
-            mask = mask_grid[start:stop]
-            rank = torch.cumsum(mask, dim=1, dtype=torch.long) - 1
-            chunk_cell, star = torch.nonzero(mask, as_tuple=True)
-            if star.numel():
-                cell = chunk_cell + start
-                local = rank[chunk_cell, star]
-                self.local_x[cell, local] = field.x_uas[star]
-                self.local_y[cell, local] = field.y_uas[star]
-                self.local_mass[cell, local] = mass[star]
-        del mask_grid
-        runtime.synchronize()
+        if self._local_override is None:
+            max_local = max(1, max_local_count)
+            local_shape = (n_cells, max_local)
+            self.local_x = torch.zeros(
+                local_shape, device=runtime.device, dtype=runtime.dtype
+            )
+            self.local_y = torch.zeros_like(self.local_x)
+            self.local_mass = torch.zeros_like(self.local_x)
+            rank_elements_per_cell = max(1, n_stars)
+            pack_cell_batch = max(
+                1,
+                min(
+                    n_cells,
+                    (64 * 1024**2) // max(8 * rank_elements_per_cell, 1),
+                ),
+            )
+            for start in range(0, n_cells, pack_cell_batch):
+                stop = min(n_cells, start + pack_cell_batch)
+                mask = mask_grid[start:stop]
+                rank = torch.cumsum(mask, dim=1, dtype=torch.long) - 1
+                chunk_cell, star = torch.nonzero(mask, as_tuple=True)
+                if star.numel():
+                    cell = chunk_cell + start
+                    local = rank[chunk_cell, star]
+                    self.local_x[cell, local] = field.x_uas[star]
+                    self.local_y[cell, local] = field.y_uas[star]
+                    self.local_mass[cell, local] = mass[star]
+            del mask_grid
+        else:
+            self.local_x = local_x
+            self.local_y = local_y
+            self.local_mass = local_mass
+        if not self._defer_synchronize:
+            runtime.synchronize()
         self.diagnostics = FarFieldDiagnostics(
             cells=(self.ny, self.nx),
             nodes_per_cell=(nodes_y, nodes_x),
             maximum_local_stars=max_local_count,
-            mean_local_stars=float(local_counts_tensor.to(torch.float64).mean().detach().cpu()),
+            mean_local_stars=(
+                float(override_mean_local)
+                if self._local_override is not None
+                else float(
+                    local_counts_tensor
+                    .to(torch.float64)
+                    .mean()
+                    .detach()
+                    .cpu()
+                )
+            ),
             build_seconds=perf_counter() - started,
         )
 
@@ -571,6 +632,110 @@ class TaylorFarFieldApproximation:
         return determinant.reshape(shape)
 
 
+def _batched_local_star_packs(
+    simulation: MicrolensingSimulation,
+    region: PlaneRegion,
+    config: FarFieldApproxConfig,
+    states,
+):
+    """Build stable per-frame local-star packs with one device synchronization.
+
+    Stars retain their original order within every spatial cell.  The packed
+    tensors therefore reproduce the scalar construction while avoiding one
+    membership allocation, ``nonzero`` shape transfer, and synchronization per
+    temporal frame.
+    """
+
+    states = tuple(states)
+    if not states:
+        return ()
+    runtime = simulation.runtime
+    fov_y, fov_x = region.field_of_view_uas
+    nx = max(1, int(config.cells_per_axis * math.sqrt(fov_x / fov_y)))
+    ny = max(1, int(config.cells_per_axis * math.sqrt(fov_y / fov_x)))
+    xmin, xmax, ymin, ymax = region.bounds_uas
+    x_edges = torch.linspace(
+        xmin, xmax, nx + 1, device=runtime.device, dtype=runtime.dtype
+    )
+    y_edges = torch.linspace(
+        ymin, ymax, ny + 1, device=runtime.device, dtype=runtime.dtype
+    )
+    cells = nx * ny
+    cell_i = torch.arange(nx, device=runtime.device).repeat_interleave(ny)
+    cell_j = torch.arange(ny, device=runtime.device).repeat(nx)
+    star_x = torch.stack([state.x_uas for state in states])
+    star_y = torch.stack([state.y_uas for state in states])
+    stars = int(star_x.shape[1])
+    radius = float(config.exact_radius_cells) * max(fov_x / nx, fov_y / ny)
+    radius *= 1.0 + 16.0 * torch.finfo(runtime.dtype).eps
+    zero = torch.zeros((), device=runtime.device, dtype=runtime.dtype)
+    radius2 = radius * radius
+    # Bound the temporary membership workspace. Ordinary production batches
+    # fit in one pass, while unusually large stellar fields are packed in a
+    # few exact frame chunks instead of risking an accelerator OOM.
+    bytes_per_frame = max(1, cells * max(stars, 1) * 12)
+    device_memory = torch.cuda.get_device_properties(runtime.device).total_memory
+    workspace_bytes = min(768 * 1024**2, max(64 * 1024**2, device_memory // 20))
+    frame_chunk = max(1, min(len(states), workspace_bytes // bytes_per_frame))
+    packed_frames = []
+    mass = states[0].einstein_radius_uas.square()
+    for start in range(0, len(states), frame_chunk):
+        stop = min(len(states), start + frame_chunk)
+        chunk_x = star_x[start:stop, None, :]
+        chunk_y = star_y[start:stop, None, :]
+        dx = torch.maximum(
+            torch.maximum(
+                x_edges[cell_i][None, :, None] - chunk_x,
+                chunk_x - x_edges[cell_i + 1][None, :, None],
+            ),
+            zero,
+        )
+        dy = torch.maximum(
+            torch.maximum(
+                y_edges[cell_j][None, :, None] - chunk_y,
+                chunk_y - y_edges[cell_j + 1][None, :, None],
+            ),
+            zero,
+        )
+        mask = dx.square() + dy.square() <= radius2
+        counts = mask.sum(dim=2, dtype=torch.int64)
+        counts_host = counts.detach().cpu()
+        maximum = max(1, int(counts_host.max()))
+        local_shape = (stop - start, cells, maximum)
+        local_x = torch.zeros(
+            local_shape, device=runtime.device, dtype=runtime.dtype
+        )
+        local_y = torch.zeros_like(local_x)
+        local_mass = torch.zeros_like(local_x)
+        frame, cell, star = torch.nonzero(mask, as_tuple=True)
+        if star.numel():
+            flat_counts = counts.reshape(-1)
+            offsets = torch.cumsum(flat_counts, dim=0) - flat_counts
+            rank = torch.arange(
+                star.numel(), device=runtime.device
+            ) - torch.repeat_interleave(
+                offsets,
+                flat_counts,
+                output_size=int(star.numel()),
+            )
+            local_x[frame, cell, rank] = chunk_x[:, 0][frame, star]
+            local_y[frame, cell, rank] = chunk_y[:, 0][frame, star]
+            local_mass[frame, cell, rank] = mass[star]
+        runtime.synchronize()
+        packed_frames.extend(
+            (
+                local_x[index],
+                local_y[index],
+                local_mass[index],
+                counts[index],
+                int(counts_host[index].max()),
+                float(counts_host[index].to(torch.float64).mean()),
+            )
+            for index in range(stop - start)
+        )
+    return tuple(packed_frames)
+
+
 def temporal_taylor_far_fields(
     simulation: MicrolensingSimulation,
     region: PlaneRegion,
@@ -593,11 +758,14 @@ def temporal_taylor_far_fields(
             "far_field_frame_count": 0,
             "far_field_exact_each_frame": True,
             "far_field_batched_accumulator": False,
+            "far_field_batched_local_pack": False,
         }
     frame_indices = list(range(len(times)))
     anchor_overrides: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    local_overrides = {}
     batched_accumulator = False
     runtime = simulation.runtime
+    states = [simulation.lens_state(times[index]) for index in frame_indices]
     if (
         len(frame_indices) > 1
         and runtime.backend.value == "triton"
@@ -619,7 +787,6 @@ def temporal_taylor_far_fields(
                 * max(cell_dx, cell_dy)
                 * (1.0 + 16.0 * torch.finfo(runtime.dtype).eps)
             )
-            states = [simulation.lens_state(times[index]) for index in frame_indices]
             center_real, center_imag = (
                 center_coefficients_rounded_local_batch_triton(
                     torch.stack([state.x_uas for state in states]),
@@ -668,6 +835,16 @@ def temporal_taylor_far_fields(
                 index: (node_real[position], node_imag[position])
                 for position, index in enumerate(frame_indices)
             }
+            packed = _batched_local_star_packs(
+                simulation,
+                region,
+                config,
+                states,
+            )
+            local_overrides = {
+                index: packed[position]
+                for position, index in enumerate(frame_indices)
+            }
             batched_accumulator = True
         except Exception as error:
             if runtime.strict_backend:
@@ -684,6 +861,8 @@ def temporal_taylor_far_fields(
             time_days=times[index],
             star_chunk_size=star_chunk_size,
             _coefficient_override=anchor_overrides.get(index),
+            _local_override=local_overrides.get(index),
+            _defer_synchronize=index in local_overrides,
         )
         for index in frame_indices
     )
@@ -691,6 +870,7 @@ def temporal_taylor_far_fields(
         "far_field_frame_count": len(output),
         "far_field_exact_each_frame": True,
         "far_field_batched_accumulator": batched_accumulator,
+        "far_field_batched_local_pack": bool(local_overrides),
     }
 
 

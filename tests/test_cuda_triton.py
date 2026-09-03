@@ -261,9 +261,10 @@ class TritonTaylorTests(unittest.TestCase):
         from microcaustics.results import CausticField
 
         generator = torch.Generator().manual_seed(314159)
-        cpu_segments = 4.0 * torch.rand(
-            (193, 2, 2), generator=generator, dtype=torch.float32
-        ) - 2.0
+        cpu_segments = (
+            4.0 * torch.rand((193, 2, 2), generator=generator, dtype=torch.float32)
+            - 2.0
+        )
         grid = mc.PlaneGrid((37, 41), (4.5, 4.25), (0.11, -0.19))
         gpu_field = CausticField(
             cpu_segments.cuda(),
@@ -357,7 +358,9 @@ class TritonTaylorTests(unittest.TestCase):
         )
         automatic = simulation.caustics(grid, far_field_approx=config)
         self.assertEqual(small_chunks.metadata["marching_squares"], "triton_compact")
-        self.assertEqual(automatic.metadata["regular_grid_determinant"], "triton_indexed")
+        self.assertEqual(
+            automatic.metadata["regular_grid_determinant"], "triton_indexed"
+        )
         self.assertEqual(automatic.metadata["determinant_ray_chunks"], 1)
         self.assertEqual(small_chunks.segment_count, one_chunk.segment_count)
         torch.testing.assert_close(
@@ -610,6 +613,14 @@ class TritonTaylorTests(unittest.TestCase):
             rtol=2e-5,
             atol=1e-7,
         )
+        for actual, expected in zip(exact_batched, frames, strict=True):
+            torch.testing.assert_close(actual.local_x, expected.local_x)
+            torch.testing.assert_close(actual.local_y, expected.local_y)
+            torch.testing.assert_close(actual.local_mass, expected.local_mass)
+            actual_x, actual_y = actual.raytrace(x, y)
+            expected_x, expected_y = expected.raytrace(x, y)
+            torch.testing.assert_close(actual_x, expected_x, rtol=0, atol=2e-6)
+            torch.testing.assert_close(actual_y, expected_y, rtol=0, atol=2e-6)
 
     @unittest.skipUnless(triton_ipm_available(), "CUDA Triton IPM is unavailable")
     def test_public_dynamic_ipm_fuses_tree_queries_and_rasterization(self) -> None:
@@ -668,9 +679,11 @@ class TritonTaylorTests(unittest.TestCase):
         self.assertTrue(all(item.metadata["compact_sparse_nodes"] for item in maps))
         self.assertTrue(maps[0].metadata["far_field_batched_accumulator"])
         self.assertTrue(maps[1].metadata["far_field_batched_accumulator"])
-        # The padded tail reuses the last real frame's complete far-field approximation.
-        # it does not need a multi-anchor coefficient build of its own.
-        self.assertFalse(maps[2].metadata["far_field_batched_accumulator"])
+        self.assertTrue(maps[0].metadata["far_field_batched_local_pack"])
+        self.assertTrue(maps[1].metadata["far_field_batched_local_pack"])
+        # The final real frame shares its exact coefficient construction with
+        # the refresh-interval endpoint used by the conservative scout union.
+        self.assertTrue(maps[2].metadata["far_field_batched_accumulator"])
         self.assertEqual(maps[-1].metadata["temporal_batch_padded_frames"], 1)
 
     @unittest.skipUnless(triton_ipm_available(), "CUDA Triton IPM is unavailable")
@@ -937,6 +950,30 @@ class TritonTaylorTests(unittest.TestCase):
             center_y=center_y,
         )
         self.assertTrue(torch.equal(actual, expected))
+        batched_corner_x = torch.stack((corner_x, corner_x + 0.13))
+        batched_corner_y = torch.stack((corner_y, corner_y - 0.07))
+        batched_center_x = torch.stack((center_x, center_x + 0.13))
+        batched_center_y = torch.stack((center_y, center_y - 0.07))
+        batched = select_source_tiles_triton(
+            batched_corner_x,
+            batched_corner_y,
+            bounds=bounds,
+            center_x=batched_center_x,
+            center_y=batched_center_y,
+        )
+        scalar = torch.stack(
+            tuple(
+                select_source_tiles_triton(
+                    batched_corner_x[index],
+                    batched_corner_y[index],
+                    bounds=bounds,
+                    center_x=batched_center_x[index],
+                    center_y=batched_center_y[index],
+                )
+                for index in range(2)
+            )
+        )
+        self.assertTrue(torch.equal(batched, scalar))
         for radius in (1, 2, 4):
             expected_dilated = torch.nn.functional.max_pool2d(
                 expected[None, None].float(),
@@ -946,6 +983,14 @@ class TritonTaylorTests(unittest.TestCase):
             )[0, 0].bool()
             actual_dilated = dilate_source_tiles_triton(actual, radius)
             self.assertTrue(torch.equal(actual_dilated, expected_dilated))
+            batched_dilated = dilate_source_tiles_triton(batched, radius)
+            scalar_dilated = torch.stack(
+                tuple(
+                    dilate_source_tiles_triton(batched[index], radius)
+                    for index in range(2)
+                )
+            )
+            self.assertTrue(torch.equal(batched_dilated, scalar_dilated))
 
     @unittest.skipUnless(triton_scout_available(), "CUDA Triton scout is unavailable")
     def test_public_tiled_ipm_uses_fused_scout(self) -> None:
@@ -988,8 +1033,9 @@ class TritonTaylorTests(unittest.TestCase):
         outputs = []
         for backend in ("torch-eager", "triton"):
             outputs.append(
-                _small_cuda_system(backend=backend).light_curve_with_labels(
+                _small_cuda_system(backend=backend).light_curve(
                     times,
+                    include_labels=True,
                     method=method,
                     schedule=schedule,
                     caustics=caustics,
@@ -998,24 +1044,60 @@ class TritonTaylorTests(unittest.TestCase):
             )
         portable, fused = outputs
         torch.testing.assert_close(
-            fused.light_curve.flux,
-            portable.light_curve.flux,
+            fused.flux,
+            portable.flux,
             rtol=5.0e-5,
             atol=5.0e-6,
         )
         torch.testing.assert_close(
-            fused.crossing_labels,
-            portable.crossing_labels,
+            fused.labels.crossing_labels,
+            portable.labels.crossing_labels,
             rtol=0.0,
             atol=0.0,
         )
-        for time in times:
+        for index in range(len(times)):
             torch.testing.assert_close(
-                fused.light_curve.maps[time].values,
-                portable.light_curve.maps[time].values,
+                fused.maps[index].values,
+                portable.maps[index].values,
                 # Scanline atomics do not have a fixed accumulation order.
                 rtol=1.0e-4,
                 atol=2.0e-4,
+            )
+
+    def test_source_owned_driver_matches_eager_compiled_and_triton(self) -> None:
+        """Daily source driving must agree across all CUDA map backends."""
+
+        outputs = []
+        driver = mc.TabulatedDrivingSignal(
+            torch.tensor([-1.0, 0.0, 1.0, 2.0, 3.0]),
+            torch.tensor([1.0, 0.8, 1.3, 0.9, 1.0]),
+        )
+        for backend in ("torch-eager", "torch-compile", "triton"):
+            base = _small_cuda_system(backend=backend)
+            system = base.with_source(mc.ModulatedSource(base.source, driver))
+            options = dict(
+                source_cadence_days=0.5,
+                include_labels=True,
+                method=_small_production_method(),
+                schedule=_small_dynamic_schedule(),
+                caustics=_small_caustic_config(),
+            )
+            off = system.light_curve((0, 1, 2), apply_driving_signal=False, **options)
+            on = system.light_curve((0, 1, 2), apply_driving_signal=True, **options)
+            amplitudes = driver.amplitudes(
+                on.times_days, bands=1, device=on.flux.device, dtype=on.flux.dtype
+            )
+            torch.testing.assert_close(
+                on.flux, off.flux * amplitudes, rtol=5e-5, atol=0
+            )
+            torch.testing.assert_close(
+                on.labels.crossing_labels, off.labels.crossing_labels
+            )
+            outputs.append(on)
+        for actual in outputs[1:]:
+            torch.testing.assert_close(actual.flux, outputs[0].flux, rtol=5e-5, atol=0)
+            torch.testing.assert_close(
+                actual.labels.crossing_labels, outputs[0].labels.crossing_labels
             )
 
     def test_compact_sparse_nodes_match_complete_cuda_path(self) -> None:
@@ -1070,14 +1152,14 @@ class TritonTaylorTests(unittest.TestCase):
             strict=True,
         ):
             torch.testing.assert_close(
-                actual.light_curve.flux,
-                expected.light_curve.flux,
+                actual.flux,
+                expected.flux,
                 rtol=5.0e-5,
                 atol=5.0e-6,
             )
             torch.testing.assert_close(
-                actual.crossing_labels,
-                expected.crossing_labels,
+                actual.labels.crossing_labels,
+                expected.labels.crossing_labels,
                 rtol=0.0,
                 atol=0.0,
             )

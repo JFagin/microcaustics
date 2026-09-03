@@ -231,6 +231,7 @@ def solve_macroimages(
     cluster_tolerance_arcsec: float | None = None,
     deduplication_tolerance_arcsec: float | None = None,
     maximum_function_evaluations: int = 200,
+    refinement_tolerance_arcsec: float = 1.0e-8,
     dtype: torch.dtype = torch.float64,
     device: torch.device | str = "cpu",
 ) -> tuple[MacroImageSolution, ...]:
@@ -239,6 +240,8 @@ def solve_macroimages(
     A regular grid supplies robust seeds and SciPy refines roots of the lens
     equation. The model's Jacobian supplies magnification and local
     convergence/shear. Its arrival-time function supplies relative delays.
+    A candidate is retained only when SciPy reports convergence and its
+    source-plane residual is no larger than ``refinement_tolerance_arcsec``.
     Results are sorted by arrival time before names are assigned.
     """
 
@@ -252,6 +255,8 @@ def solve_macroimages(
         raise ValueError("initial_grid_size and field_of_view_arcsec are too small")
     if not math.isfinite(source_x_arcsec) or not math.isfinite(source_y_arcsec):
         raise ValueError("source position must be finite")
+    if maximum_function_evaluations < 1:
+        raise ValueError("maximum_function_evaluations must be positive")
     resolved_device = torch.device(device)
 
     def tensor(value):
@@ -274,7 +279,12 @@ def solve_macroimages(
         if deduplication_tolerance_arcsec is None
         else float(deduplication_tolerance_arcsec)
     )
-    if min(source_tolerance, cluster_tolerance, deduplication_tolerance) <= 0:
+    if min(
+        source_tolerance,
+        cluster_tolerance,
+        deduplication_tolerance,
+        refinement_tolerance_arcsec,
+    ) <= 0:
         raise ValueError("image-finding tolerances must be positive")
 
     axis = torch.linspace(
@@ -329,7 +339,11 @@ def solve_macroimages(
             max_nfev=maximum_function_evaluations,
         )
         fit_residual = float(np.linalg.norm(fit.fun))
-        if np.isfinite(fit_residual):
+        if (
+            fit.success
+            and np.isfinite(fit_residual)
+            and fit_residual <= refinement_tolerance_arcsec
+        ):
             refined.append((fit_residual, float(fit.x[0]), float(fit.x[1])))
     refined.sort(key=lambda value: value[0])
     unique = []

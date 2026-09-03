@@ -7,6 +7,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -140,6 +141,60 @@ class PlottingTests(unittest.TestCase):
         )
         self.assertEqual(len(axes), 2)
         self.assertEqual(len(figure.axes), 3)
+
+    def test_source_animation_selects_band_without_changing_normalization(self) -> None:
+        from PIL import Image
+
+        from microcaustics.plotting import animations
+
+        class VariableSource:
+            geometry = mc.SourceGeometry(
+                (4, 4), (1.0, 1.0), (4000.0, 8000.0), ("blue", "red")
+            )
+
+            def brightness(self, times_days, *, dtype=None, device=None):
+                times = torch.as_tensor(times_days, dtype=dtype, device=device)
+                values = torch.stack((1.0 + times, 4.0 - times), dim=-1)
+                return values[:, None, None, :].expand(-1, 4, 4, -1)
+
+        source = VariableSource()
+        summary = mcp.standardize_source_over_time(source, [0.0, 1.0, 2.0])
+        grid = mc.PlaneGrid((4, 4), (4.0, 4.0))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "source.gif"
+            with mock.patch.object(
+                animations, "save_fixed_palette_gif", wraps=mcp.save_fixed_palette_gif
+            ) as writer:
+                mcp.animate_standardized_source_bands(
+                    source,
+                    [0.0, 1.0, 2.0],
+                    summary,
+                    grid,
+                    path,
+                    bands="red",
+                    dtype=torch.float64,
+                )
+            frames = writer.call_args.args[0]
+            # Red decreases over time, whereas the unselected blue band rises.
+            first, last = frames[0][240, 200], frames[-1][240, 200]
+            self.assertGreater(int(first[0]), int(first[2]))
+            self.assertGreater(int(last[2]), int(last[0]))
+            self.assertFalse(writer.call_args.kwargs["dither"])
+            with Image.open(path) as animation:
+                self.assertEqual(animation.n_frames, 3)
+            for invalid in ([], ["missing"], ["red", "red"]):
+                with (
+                    self.subTest(bands=invalid),
+                    self.assertRaisesRegex(ValueError, "bands"),
+                ):
+                    mcp.animate_standardized_source_bands(
+                        source,
+                        [0.0],
+                        summary,
+                        grid,
+                        path,
+                        bands=invalid,
+                    )
 
     def test_method_diagrams_execute_the_real_tree_and_scout(self) -> None:
         simulation = mc.MicrolensingSimulation.create(
@@ -474,6 +529,109 @@ class PlottingTests(unittest.TestCase):
                 np.testing.assert_array_equal(
                     decoded_first[:, -4:, :], decoded_second[:, -4:, :]
                 )
+
+    def test_gif_changing_map_cannot_dither_into_fixed_colorbar(self) -> None:
+        from PIL import Image
+
+        rng = np.random.default_rng(42)
+        cmap = plt.get_cmap("magma")
+        frames = [
+            (cmap(rng.random((100, 100)))[..., :3] * 255).astype(np.uint8)
+            for _ in range(2)
+        ]
+        strip = (cmap(np.linspace(0, 1, 100))[..., :3] * 255).astype(np.uint8)[:, None]
+        for frame in frames:
+            frame[:, -10:] = strip
+        palette = np.vstack(
+            (
+                (cmap(np.linspace(0, 1, 255))[:, :3] * 255).astype(np.uint8),
+                np.array([[0, 191, 255]], dtype=np.uint8),
+            )
+        )
+        for supplied_palette in (None, palette):
+            for dither in (False, True):
+                with (
+                    self.subTest(
+                        explicit_palette=supplied_palette is not None, dither=dither
+                    ),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
+                    path = mcp.save_fixed_palette_gif(
+                        frames,
+                        Path(temporary) / "colorbar.gif",
+                        dither=dither,
+                        palette_rgb=supplied_palette,
+                    )
+                    with Image.open(path) as animation:
+                        first = np.asarray(animation.convert("RGB"))
+                        animation.seek(1)
+                        second = np.asarray(animation.convert("RGB"))
+                    np.testing.assert_array_equal(first[:, -10:], second[:, -10:])
+
+    def test_gif_freezes_dithered_frame_zero_without_freezing_moving_pixels(self) -> None:
+        from PIL import Image
+
+        palette = np.repeat(np.array([0, 85, 170, 255], dtype=np.uint8)[:, None], 3, axis=1)
+        frame = np.full((64, 64, 3), 128, dtype=np.uint8)
+        frames = [frame.copy() for _ in range(3)]
+        frames[1][:, :32] = 255
+        frames[2][:, :32] = 0
+        # This pixel is unchanged in the first two frames, but must not be
+        # frozen because it changes later in the sequence.
+        frames[2][0, 63] = 255
+        with tempfile.TemporaryDirectory() as temporary:
+            decoded = {}
+            for freeze in (False, True):
+                path = mcp.save_fixed_palette_gif(
+                    frames,
+                    Path(temporary) / f"static_{freeze}.gif",
+                    palette_rgb=palette,
+                    dither=False,
+                    freeze_static=freeze,
+                )
+                with Image.open(path) as animation:
+                    decoded[freeze] = []
+                    for i in range(3):
+                        animation.seek(i)
+                        decoded[freeze].append(np.array(animation.convert("RGB")))
+            for image in decoded[True][1:]:
+                np.testing.assert_array_equal(
+                    image[1:, 32:], decoded[True][0][1:, 32:]
+                )
+            for frozen, ordinary in zip(decoded[True], decoded[False], strict=True):
+                np.testing.assert_array_equal(frozen[:, :32], ordinary[:, :32])
+            self.assertEqual(int(decoded[True][2][0, 63, 0]), 255)
+            smooth_mean = decoded[True][0][1:, 32:].mean()
+            banded_mean = decoded[False][0][1:, 32:].mean()
+            self.assertLess(abs(smooth_mean - 128), 2)
+            self.assertGreater(abs(banded_mean - 128), 40)
+
+    def test_gif_explicit_palette_preserves_thin_annotation_color(self) -> None:
+        from PIL import Image
+
+        palette = np.array([[0, 0, 0], [255, 255, 255], [0, 191, 255]], dtype=np.uint8)
+        frame = np.zeros((32, 32, 3), dtype=np.uint8)
+        frame[:, 1] = palette[2]  # outside the palette sampler's four-pixel stride
+        with tempfile.TemporaryDirectory() as temporary:
+            path = mcp.save_fixed_palette_gif(
+                [frame],
+                Path(temporary) / "caustic.gif",
+                palette_rgb=palette,
+                dither=False,
+            )
+            with Image.open(path) as animation:
+                decoded = np.asarray(animation.convert("RGB"))
+            np.testing.assert_array_equal(decoded, frame)
+            for invalid in (
+                np.zeros((1, 3)),
+                [[-1, 0, 0], [255, 255, 255]],
+                np.zeros((3, 4)),
+            ):
+                with (
+                    self.subTest(palette=invalid),
+                    self.assertRaisesRegex(ValueError, "palette_rgb"),
+                ):
+                    mcp.save_fixed_palette_gif([frame], path, palette_rgb=invalid)
 
 
 if __name__ == "__main__":

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import inspect
 import math
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -24,20 +24,31 @@ from .config import (
 )
 from .geometry import PlaneGrid, PlaneRegion
 from .lens import (
+    IncompleteKinematicsWarning,
     LensingDistances,
     MacroLens,
     PointMassField,
+    SkyProjectedKinematics,
     rectangular_lens_region,
 )
 from .lens.stellar import (
     StellarAperture,
     StellarPopulation,
+    _warn_incomplete_dynamic_kinematics,
     circular_stellar_aperture,
 )
 from .random import derive_seed
 from .runtime import ResolvedRuntime, resolve_runtime
 from .simulation import MicrolensingSimulation
-from .sources import PhysicalSourceModel
+from .sources import DrivingSignal, ModulatedSource, PhysicalSourceModel
+from .sources.physical import _pixelate_source
+from .sources.variability import (
+    _FixedHorizonDrivingSignal,
+    _source_at_driver_mean,
+    _source_driving_signal,
+    _source_with_signal,
+    _validate_source_driver,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -53,6 +64,77 @@ class IntegrationDomain(str, Enum):
     SCOUT = "scout"
     FULL = "full"
     RECTANGLE = "rectangle"
+
+
+def _warn_incomplete_explicit_motion(stars: PointMassField) -> None:
+    """Warn when explicit dynamic velocities omit bulk or differential motion."""
+
+    if len(stars) == 0:
+        return
+    if not stars.has_motion:
+        warnings.warn(
+            "Dynamic point-mass field contains no velocities. Stellar "
+            "dispersion and bulk motion are omitted. Supply explicit "
+            "observer-frame velocity arrays, or use a StellarPopulation with "
+            "SkyProjectedKinematics.",
+            IncompleteKinematicsWarning,
+            stacklevel=4,
+        )
+        return
+    assert stars.velocity_x_uas_per_day is not None
+    assert stars.velocity_y_uas_per_day is not None
+    velocity = torch.stack(
+        (stars.velocity_x_uas_per_day, stars.velocity_y_uas_per_day),
+        dim=1,
+    )
+    mean = velocity.mean(dim=0)
+    centered = velocity - mean
+    floating = torch.finfo(velocity.dtype)
+    scale = max(float(velocity.abs().max()), floating.tiny)
+    tolerance = 32.0 * floating.eps * scale
+    missing = []
+    if float(mean.abs().max()) <= tolerance:
+        missing.append("bulk motion")
+    if len(stars) < 2 or float(centered.abs().max()) <= tolerance:
+        missing.append("stellar velocity dispersion")
+    if missing:
+        warnings.warn(
+            "Dynamic explicit point-mass velocities omit "
+            + " and ".join(missing)
+            + ". Explicit arrays are interpreted as final observer-frame "
+            "velocities. Include projected CMB, lens, and source motion in "
+            "their common drift, plus independent stellar motion, or use a "
+            "StellarPopulation with SkyProjectedKinematics.",
+            IncompleteKinematicsWarning,
+            stacklevel=4,
+        )
+
+
+def _stellar_motion_metadata(stars: PointMassField) -> dict[str, object]:
+    """Summarize the realized observer-frame point-lens velocities."""
+
+    if not stars.has_motion or len(stars) == 0:
+        return {
+            "has_motion": False,
+            "coordinate_basis": "realization x/y",
+        }
+    assert stars.velocity_x_uas_per_day is not None
+    assert stars.velocity_y_uas_per_day is not None
+    velocity = torch.stack(
+        (stars.velocity_x_uas_per_day, stars.velocity_y_uas_per_day),
+        dim=1,
+    )
+    mean = velocity.mean(dim=0)
+    centered = velocity - mean
+    component_rms = torch.sqrt(torch.mean(centered.square(), dim=0))
+    return {
+        "has_motion": True,
+        "coordinate_basis": "realization x/y",
+        "mean_velocity_uas_per_day": [float(value) for value in mean],
+        "component_rms_uas_per_day": [
+            float(value) for value in component_rms
+        ],
+    }
 
 
 def _rotate_cartesian_components(
@@ -152,15 +234,11 @@ def _source_in_rotated_frame(source, angle_deg: float):
             "automatic shear-frame alignment requires a physical source model "
             "with position_angle_deg or position_angle_rad"
         )
-    if hasattr(source, "center_m"):
-        center = torch.as_tensor(source.center_m, dtype=torch.float64)
-        x, y = _rotate_cartesian_components(center[0], center[1], angle_deg)
-        updates["center_m"] = (float(x), float(y))
-    # Models constructed through the convenient ``bands`` mapping store both
-    # that input and normalized parallel tuples after initialization.  A
-    # dataclass replacement must retain only the normalized representation.
-    if getattr(source, "bands", None) is not None:
-        updates["bands"] = None
+    for name in ("center_m", "center_uas"):
+        if getattr(source, name, None) is not None:
+            center = torch.as_tensor(getattr(source, name), dtype=torch.float64)
+            x, y = _rotate_cartesian_components(center[0], center[1], angle_deg)
+            updates[name] = (float(x), float(y))
     return replace(source, **updates)
 
 
@@ -188,13 +266,22 @@ def _retaining_map_observer(
     requested = tuple(float(value) for value in keep_maps_at_days)
     indices: dict[int, float] = {}
     for requested_time in requested:
+        if not math.isfinite(requested_time):
+            raise ValueError("keep_maps_at_days must contain finite times in days")
         differences = torch.abs(times - requested_time)
         index = int(torch.argmin(differences))
         tolerance = max(1.0e-6, 1.0e-8 * max(1.0, abs(requested_time)))
         if float(differences[index]) > tolerance:
-            raise ValueError(
-                f"requested retained-map epoch {requested_time} is not in times_days"
+            nearby = sorted(times[torch.argsort(differences)[:2]].tolist())
+            warnings.warn(
+                f"Requested map at day {requested_time:g} is not an evaluated map "
+                f"epoch. Nearby evaluated times are {nearby}. This retention "
+                "request will be omitted. Change keep_maps_at_days or the map "
+                "cadence to retain that epoch",
+                UserWarning,
+                stacklevel=3,
             )
+            continue
         indices[index] = float(times[index])
 
     def observer(index, frame):
@@ -203,6 +290,13 @@ def _retaining_map_observer(
         if index in indices:
             retained[indices[index]] = getattr(frame, "magnification_map", frame)
 
+    def reset():
+        retained.clear()
+        reset_callback = getattr(map_observer, "reset", None)
+        if callable(reset_callback):
+            reset_callback()
+
+    observer.reset = reset
     return observer, retained
 
 
@@ -220,13 +314,21 @@ def _cadence_times(
             raise ValueError(
                 "supply times_days or duration_days/cadence_days, not both"
             )
-        times = torch.as_tensor(times_days, dtype=torch.float64).reshape(-1)
+        times = torch.as_tensor(times_days, dtype=torch.float64)
+        if times.ndim != 1:
+            raise ValueError("times_days must be a one-dimensional time axis")
     else:
         if duration_days is None or cadence_days is None:
             raise ValueError("supply times_days or both duration_days and cadence_days")
         duration = float(duration_days)
         cadence = float(cadence_days)
-        if duration < 0.0 or cadence <= 0.0:
+        if (
+            not all(
+                math.isfinite(value) for value in (duration, cadence, float(start_day))
+            )
+            or duration < 0.0
+            or cadence <= 0.0
+        ):
             raise ValueError(
                 "duration_days must be non-negative and cadence_days positive"
             )
@@ -298,10 +400,113 @@ def _with_method_options(kwargs: dict, *, dynamic: bool) -> dict:
     return resolved
 
 
+_LIGHT_CURVE_CALL_OPTIONS = frozenset(
+    {
+        "source",
+        "trajectory",
+        "strict_coverage",
+        "map_observer",
+        "keep_maps_at_days",
+    }
+)
+_LABELED_CURVE_CALL_OPTIONS = frozenset({"diagnostic_grid", "include_distance_map"})
+
+
+def _light_curve_options(
+    kwargs: dict, *, include_labels: bool, allowed_options=()
+) -> dict:
+    """Resolve the common call and warmup controls in one place.
+
+    Plain options override advanced configurations explicitly supplied in the
+    same call. Label batches inherit the temporal batch unless overridden.
+    """
+
+    options = dict(kwargs)
+    updates = {
+        name: options.pop(name)
+        for name in (
+            "temporal_batch_size",
+            "scout_refresh_frames",
+            "light_curve_batch_size",
+        )
+        if name in options
+    }
+    label_batch = options.pop("label_batch_size", None)
+    schedule = options.get("schedule")
+    if schedule is None:
+        schedule = production_dynamic_config(
+            temporal_batch_size=30 if include_labels else 49
+        )
+    options["schedule"] = replace(schedule, **updates) if updates else schedule
+    if not include_labels and (
+        label_batch is not None or options.get("caustics") is not None
+    ):
+        raise ValueError("caustic settings require include_labels=True")
+    options = _with_method_options(options, dynamic=True)
+    if options.get("method") is None:
+        options["method"] = production_ipm_config()
+    if not include_labels:
+        options.pop("caustics", None)
+    unknown = set(options) - {"method", "schedule", "caustics"} - set(allowed_options)
+    if unknown:
+        raise TypeError(f"unsupported light-curve options {sorted(unknown)}")
+    if label_batch is not None:
+        _, caustics = _production_dynamic_settings(
+            options.get("method") or production_ipm_config(),
+            options["schedule"],
+            options.get("caustics"),
+        )
+        options["caustics"] = replace(caustics, temporal_batch_size=label_batch)
+    return options
+
+
+def _light_curve_times(
+    times_days=None,
+    *,
+    duration_days=None,
+    map_cadence_days=None,
+    source_cadence_days=None,
+    flux_times_days=None,
+    start_day=0.0,
+):
+    """Resolve regular or irregular map and photometry epochs consistently."""
+
+    map_times = _cadence_times(
+        times_days,
+        duration_days=duration_days,
+        cadence_days=map_cadence_days,
+        start_day=start_day,
+    )
+    if flux_times_days is not None and source_cadence_days is not None:
+        raise ValueError("supply flux_times_days or source_cadence_days, not both")
+    if flux_times_days is not None:
+        flux_times = _cadence_times(
+            flux_times_days, duration_days=None, cadence_days=None
+        )
+    elif source_cadence_days is not None:
+        flux_times = _cadence_times(
+            None,
+            duration_days=float(map_times[-1] - map_times[0]),
+            cadence_days=source_cadence_days,
+            start_day=float(map_times[0]),
+        )
+    else:
+        return map_times, None
+    if float(flux_times[0]) < float(map_times[0]) or float(flux_times[-1]) > float(
+        map_times[-1]
+    ):
+        raise ValueError(
+            "flux_times_days must lie within the evaluated map time interval"
+        )
+    return map_times, None if torch.equal(map_times, flux_times) else flux_times
+
+
 def _production_dynamic_settings(
     method: IPMConfig | IRSConfig,
     schedule: DynamicConfig | None,
     caustics: CausticConfig | None = None,
+    *,
+    include_labels: bool = True,
 ) -> tuple[DynamicConfig, CausticConfig | None]:
     """Resolve coherent high-level dynamic and optional caustic settings."""
 
@@ -309,10 +514,12 @@ def _production_dynamic_settings(
     # steady-state throughput with thirty frames per shared map/label batch.
     # Light-curve-only calls retain the forty-nine-frame production preset.
     resolved_schedule = (
-        production_dynamic_config(temporal_batch_size=30)
+        production_dynamic_config(temporal_batch_size=30 if include_labels else 49)
         if schedule is None
         else schedule
     )
+    if not include_labels:
+        return resolved_schedule, None
     if caustics is None:
         inherited_far_field = (
             method.far_field_approx if isinstance(method, IPMConfig) else None
@@ -335,6 +542,30 @@ def _production_dynamic_settings(
             else caustics
         )
     return resolved_schedule, resolved_caustics
+
+
+def _evaluate_light_curve(
+    realization, map_times, flux_times, *, include_labels, **kwargs
+):
+    """Dispatch one resolved request without changing the numerical schedulers."""
+
+    from .results import _unified_light_curve
+
+    if flux_times is None:
+        calculate = (
+            realization.light_curve_with_labels
+            if include_labels
+            else realization.light_curve
+        )
+        result = calculate(map_times, **kwargs)
+    else:
+        calculate = (
+            realization.multirate_light_curve_with_labels
+            if include_labels
+            else realization.multirate_light_curve
+        )
+        result = calculate(map_times, flux_times, **kwargs)
+    return _unified_light_curve(result)
 
 
 def _source_grid_from_model(
@@ -442,6 +673,7 @@ class MicrolensingRealization:
     lens_region: PlaneRegion
     lens_grid: PlaneGrid
     stellar_aperture: StellarAperture | None
+    stellar_population: StellarPopulation | None = None
     source_support_radius_uas: float | None = None
     trajectory: SourceTrajectory | None = None
     sky_to_local_rotation_deg: float = 0.0
@@ -499,10 +731,11 @@ class MicrolensingRealization:
                 }
             ),
             "star_count": len(self.stars),
+            "stellar_motion": _stellar_motion_metadata(self.stars),
             "stellar_population": (
                 None
-                if self.system.stellar_population is None
-                else self.system.stellar_population.metadata()
+                if self.stellar_population is None
+                else self.stellar_population.metadata(self.system.distances)
             ),
             "runtime": {
                 "device": str(runtime.device),
@@ -512,6 +745,12 @@ class MicrolensingRealization:
             },
             "source": (None if self.source is None else dict(self.source.metadata())),
         }
+
+    @cached_property
+    def _mean_source(self):
+        """The same resolved source with constant mean driver heating."""
+
+        return _source_at_driver_mean(self.source)
 
     def magnification_map(
         self,
@@ -543,7 +782,9 @@ class MicrolensingRealization:
         resolved_method = self._method_for_domain(
             production_ipm_config() if method is None else method
         )
-        resolved_schedule, _ = _production_dynamic_settings(resolved_method, schedule)
+        resolved_schedule, _ = _production_dynamic_settings(
+            resolved_method, schedule, include_labels=False
+        )
         return self.simulation.dynamic_maps(
             self.lens_region,
             self.source_grid,
@@ -584,6 +825,79 @@ class MicrolensingRealization:
             include_distance_map=include_distance_map,
         )
 
+    def _photometry(
+        self,
+        map_times,
+        flux_times,
+        *,
+        include_labels,
+        source,
+        method,
+        trajectory,
+        schedule,
+        strict_coverage,
+        map_observer,
+        keep_maps_at_days,
+        caustics=None,
+        diagnostic_grid=None,
+        include_distance_map=False,
+    ):
+        """Resolve geometry and observers once for all four photometry schedulers."""
+
+        source = self.source if source is None else source
+        if source is None:
+            raise ValueError("light_curve requires a source model")
+        source = _pixelate_source(
+            source, self.system.distances, runtime=self.simulation.runtime
+        )
+        method = self._method_for_domain(
+            production_ipm_config() if method is None else method
+        )
+        schedule, caustics = _production_dynamic_settings(
+            method, schedule, caustics, include_labels=include_labels
+        )
+        observer, retained = _retaining_map_observer(
+            map_times, keep_maps_at_days, map_observer
+        )
+        args = [self.lens_region, self.source_grid]
+        if include_labels:
+            args.append(self.lens_grid)
+        args.append(map_times)
+        if flux_times is not None:
+            args.append(flux_times)
+        args.extend((source, self.system.distances))
+        kwargs = dict(
+            method=method,
+            trajectory=self._trajectory_in_local_frame(trajectory),
+            strict_coverage=strict_coverage,
+            map_observer=observer,
+        )
+        if include_labels:
+            kwargs.update(
+                map_schedule=schedule,
+                caustic_config=caustics,
+                diagnostic_grid=diagnostic_grid,
+                include_distance_map=include_distance_map,
+            )
+            calculate = (
+                self.simulation.light_curve_with_labels
+                if flux_times is None
+                else self.simulation.multirate_light_curve_with_labels
+            )
+        else:
+            kwargs["schedule"] = schedule
+            calculate = (
+                self.simulation.light_curve
+                if flux_times is None
+                else self.simulation.multirate_light_curve
+            )
+        result = calculate(*args, **kwargs)
+        if include_labels:
+            return replace(
+                result, light_curve=replace(result.light_curve, maps=retained)
+            )
+        return replace(result, maps=retained)
+
     def light_curve(
         self,
         times_days: Sequence[float],
@@ -598,30 +912,18 @@ class MicrolensingRealization:
     ) -> LightCurve:
         """Generate a finite-source light curve for this realization."""
 
-        resolved_source = self.source if source is None else source
-        if resolved_source is None:
-            raise ValueError("light_curve requires a source model")
-        resolved_method = self._method_for_domain(
-            production_ipm_config() if method is None else method
-        )
-        resolved_schedule, _ = _production_dynamic_settings(resolved_method, schedule)
-        observer, retained = _retaining_map_observer(
-            times_days, keep_maps_at_days, map_observer
-        )
-        resolved_trajectory = self._trajectory_in_local_frame(trajectory)
-        result = self.simulation.light_curve(
-            self.lens_region,
-            self.source_grid,
+        return self._photometry(
             times_days,
-            resolved_source,
-            self.system.distances,
-            method=resolved_method,
-            trajectory=resolved_trajectory,
-            schedule=resolved_schedule,
+            None,
+            include_labels=False,
+            source=source,
+            method=method,
+            trajectory=trajectory,
+            schedule=schedule,
             strict_coverage=strict_coverage,
-            map_observer=observer,
+            map_observer=map_observer,
+            keep_maps_at_days=keep_maps_at_days,
         )
-        return replace(result, maps=retained)
 
     def light_curves(
         self,
@@ -631,13 +933,29 @@ class MicrolensingRealization:
         method: IRSConfig | IPMConfig | None = None,
         schedule: DynamicConfig | None = None,
         map_observer=None,
+        flux_times_days=None,
     ) -> tuple[LightCurve, ...]:
         """Batch multiple sources or trajectories through one map sequence."""
+
+        requests = tuple(
+            replace(
+                request,
+                distances=request.distances or self.system.distances,
+                source=_pixelate_source(
+                    request.source,
+                    request.distances or self.system.distances,
+                    runtime=self.simulation.runtime,
+                ),
+            )
+            for request in requests
+        )
 
         resolved_method = self._method_for_domain(
             production_ipm_config() if method is None else method
         )
-        resolved_schedule, _ = _production_dynamic_settings(resolved_method, schedule)
+        resolved_schedule, _ = _production_dynamic_settings(
+            resolved_method, schedule, include_labels=False
+        )
         return self.simulation.light_curves(
             self.lens_region,
             self.source_grid,
@@ -646,6 +964,7 @@ class MicrolensingRealization:
             method=resolved_method,
             schedule=resolved_schedule,
             map_observer=map_observer,
+            flux_times_days=flux_times_days,
         )
 
     def multirate_light_curve(
@@ -663,31 +982,18 @@ class MicrolensingRealization:
     ) -> LightCurve:
         """Use sparse dynamic maps with independently sampled source evolution."""
 
-        resolved_source = self.source if source is None else source
-        if resolved_source is None:
-            raise ValueError("multirate_light_curve requires a source model")
-        resolved_method = self._method_for_domain(
-            production_ipm_config() if method is None else method
-        )
-        resolved_schedule, _ = _production_dynamic_settings(resolved_method, schedule)
-        observer, retained = _retaining_map_observer(
-            map_times_days, keep_maps_at_days, map_observer
-        )
-        resolved_trajectory = self._trajectory_in_local_frame(trajectory)
-        result = self.simulation.multirate_light_curve(
-            self.lens_region,
-            self.source_grid,
+        return self._photometry(
             map_times_days,
             flux_times_days,
-            resolved_source,
-            self.system.distances,
-            method=resolved_method,
-            trajectory=resolved_trajectory,
-            schedule=resolved_schedule,
+            include_labels=False,
+            source=source,
+            method=method,
+            trajectory=trajectory,
+            schedule=schedule,
             strict_coverage=strict_coverage,
-            map_observer=observer,
+            map_observer=map_observer,
+            keep_maps_at_days=keep_maps_at_days,
         )
-        return replace(result, maps=retained)
 
     def multirate_light_curve_with_labels(
         self,
@@ -707,41 +1013,21 @@ class MicrolensingRealization:
     ):
         """Return fine-cadence flux and labels at the sparse map epochs."""
 
-        resolved_source = self.source if source is None else source
-        if resolved_source is None:
-            raise ValueError(
-                "multirate_light_curve_with_labels requires a source model"
-            )
-        resolved_method = self._method_for_domain(
-            production_ipm_config() if method is None else method
-        )
-        resolved_schedule, resolved_caustics = _production_dynamic_settings(
-            resolved_method,
-            schedule,
-            caustics,
-        )
-        observer, retained = _retaining_map_observer(
-            map_times_days, keep_maps_at_days, map_observer
-        )
-        resolved_trajectory = self._trajectory_in_local_frame(trajectory)
-        result = self.simulation.multirate_light_curve_with_labels(
-            self.lens_region,
-            self.source_grid,
-            self.lens_grid,
+        return self._photometry(
             map_times_days,
             flux_times_days,
-            resolved_source,
-            self.system.distances,
-            method=resolved_method,
-            trajectory=resolved_trajectory,
-            map_schedule=resolved_schedule,
-            caustic_config=resolved_caustics,
+            include_labels=True,
+            source=source,
+            method=method,
+            trajectory=trajectory,
+            schedule=schedule,
             strict_coverage=strict_coverage,
+            map_observer=map_observer,
+            keep_maps_at_days=keep_maps_at_days,
+            caustics=caustics,
             diagnostic_grid=diagnostic_grid,
             include_distance_map=include_distance_map,
-            map_observer=observer,
         )
-        return replace(result, light_curve=replace(result.light_curve, maps=retained))
 
     def light_curve_with_labels(
         self,
@@ -760,38 +1046,21 @@ class MicrolensingRealization:
     ):
         """Generate a light curve with aligned source-center caustic labels."""
 
-        resolved_source = self.source if source is None else source
-        if resolved_source is None:
-            raise ValueError("light_curve_with_labels requires a source model")
-        resolved_method = self._method_for_domain(
-            production_ipm_config() if method is None else method
-        )
-        resolved_schedule, resolved_caustics = _production_dynamic_settings(
-            resolved_method,
-            schedule,
-            caustics,
-        )
-        observer, retained = _retaining_map_observer(
-            times_days, keep_maps_at_days, map_observer
-        )
-        resolved_trajectory = self._trajectory_in_local_frame(trajectory)
-        result = self.simulation.light_curve_with_labels(
-            self.lens_region,
-            self.source_grid,
-            self.lens_grid,
+        return self._photometry(
             times_days,
-            resolved_source,
-            self.system.distances,
-            method=resolved_method,
-            trajectory=resolved_trajectory,
-            map_schedule=resolved_schedule,
-            caustic_config=resolved_caustics,
+            None,
+            include_labels=True,
+            source=source,
+            method=method,
+            trajectory=trajectory,
+            schedule=schedule,
             strict_coverage=strict_coverage,
+            map_observer=map_observer,
+            keep_maps_at_days=keep_maps_at_days,
+            caustics=caustics,
             diagnostic_grid=diagnostic_grid,
             include_distance_map=include_distance_map,
-            map_observer=observer,
         )
-        return replace(result, light_curve=replace(result.light_curve, maps=retained))
 
     def caustics(
         self,
@@ -874,7 +1143,9 @@ class MicrolensingRealization:
         resolved_method = self._method_for_domain(
             production_ipm_config() if method is None else method
         )
-        resolved_schedule, _ = _production_dynamic_settings(resolved_method, schedule)
+        resolved_schedule, _ = _production_dynamic_settings(
+            resolved_method, schedule, include_labels=False
+        )
         return streaming_microlensed_transfer_functions(
             self.simulation,
             self.lens_region,
@@ -985,8 +1256,20 @@ class MicrolensingSystem:
         repr=False,
         compare=False,
     )
+    _stellar_realizations: dict[tuple[object, ...], PointMassField] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    # Internal geometry variants share the already bound driver. Ordinary
+    # dataclass replacement resets this field so a new seed binds a new signal.
+    _shared_driver: DrivingSignal | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
+        _validate_source_driver(self.source)
         if self.distances is None:
             if self.lens_redshift is None or self.source_redshift is None:
                 raise ValueError(
@@ -1058,6 +1341,7 @@ class MicrolensingSystem:
             unknown = set(supplied) - {
                 "base",
                 "stars",
+                "kinematics",
                 "variability",
                 "observations",
             }
@@ -1079,6 +1363,44 @@ class MicrolensingSystem:
         )
 
     @cached_property
+    def _bound_stellar_population(self) -> StellarPopulation | None:
+        """Bind the kinematic seed once for geometry, stars, and provenance."""
+
+        population = self.stellar_population
+        if population is None:
+            return None
+        kinematics = population.kinematics
+        seed = self.seed_for("kinematics")
+        if (
+            isinstance(kinematics, SkyProjectedKinematics)
+            and kinematics.seed is None
+            and seed is not None
+        ):
+            return replace(population, kinematics=replace(kinematics, seed=seed))
+        return population
+
+    @cached_property
+    def _bound_driving_signal(self):
+        """Bind the independent variability seed without generating the signal."""
+
+        if self._shared_driver is not None:
+            return self._shared_driver
+        signal = _source_driving_signal(self.source)
+        return (
+            signal.with_seed(self.seed_for("variability"))
+            if isinstance(signal, _FixedHorizonDrivingSignal)
+            else signal
+        )
+
+    def _with_shared_realization_state(self, signal, **changes):
+        """Copy numerical geometry while retaining randomized physical state."""
+
+        system = replace(self, **changes)
+        object.__setattr__(system, "_shared_driver", signal)
+        object.__setattr__(system, "_stellar_realizations", self._stellar_realizations)
+        return system
+
+    @cached_property
     def _resolved(self) -> MicrolensingRealization:
         if self.source is None and self.source_grid is None:
             raise ValueError(
@@ -1091,6 +1413,14 @@ class MicrolensingSystem:
             if isinstance(self.runtime, ResolvedRuntime)
             else resolve_runtime(self.runtime)
         )
+        stellar_population = self._bound_stellar_population
+        if self.duration_days > 0.0 and stellar_population is not None:
+            _warn_incomplete_dynamic_kinematics(
+                stellar_population.kinematics,
+                stacklevel=3,
+            )
+        elif self.duration_days > 0.0 and self.stars is not None:
+            _warn_incomplete_explicit_motion(self.stars)
         physical_source = isinstance(self.source, PhysicalSourceModel)
         source_has_orientation = physical_source and (
             hasattr(self.source, "position_angle_deg")
@@ -1108,7 +1438,7 @@ class MicrolensingSystem:
         )
         align_rectangle = (
             self.integration_domain is IntegrationDomain.RECTANGLE
-            and self.stellar_population is not None
+            and stellar_population is not None
             and self.lens_region is None
             and _lens_plane_region(self.lens_plane_uas) is None
             and explicit_grid_is_rotation_safe
@@ -1130,6 +1460,11 @@ class MicrolensingSystem:
             if align_rectangle and physical_source
             else self.source
         )
+        model_accepts_signal = hasattr(numerical_source_model, "with_driving_signal")
+        if self._bound_driving_signal is not None and model_accepts_signal:
+            numerical_source_model = _source_with_signal(
+                numerical_source_model, self._bound_driving_signal
+            )
         numerical_trajectory = (
             _RotatedTrajectory(self.trajectory, frame_rotation_deg)
             if align_rectangle and self.trajectory is not None
@@ -1143,31 +1478,31 @@ class MicrolensingSystem:
                 if self.source_grid is None
                 else self.source_grid
             )
-            pixelate_parameters = inspect.signature(
-                numerical_source_model.pixelate
-            ).parameters.values()
-            accepts_runtime = any(
-                parameter.name == "runtime"
-                or parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in pixelate_parameters
-            )
-            source = numerical_source_model.pixelate(
+            source = _pixelate_source(
+                numerical_source_model,
                 self.distances,
                 grid=native_source_grid,
-                **({"runtime": resolved_runtime} if accepts_runtime else {}),
+                runtime=resolved_runtime,
             )
             support_radius_method = getattr(
-                numerical_source_model, "support_radius_m", None
+                # Match explicit pixelization when a physical model is wrapped.
+                source
+                if isinstance(numerical_source_model, ModulatedSource)
+                else numerical_source_model,
+                "support_radius_m",
+                None,
             )
             if source_support_radius_uas is None and support_radius_method is not None:
-                source_support_radius_uas = float(
-                    self.distances.source_length_to_uas(
-                        support_radius_method(self.distances),
-                        dtype=torch.float64,
+                support_radius = support_radius_method(self.distances)
+                if support_radius is not None:
+                    source_support_radius_uas = float(
+                        self.distances.source_length_to_uas(
+                            support_radius,
+                            dtype=torch.float64,
+                        )
                     )
-                )
         else:
-            source = self.source
+            source = numerical_source_model
             native_source_grid = (
                 _source_grid_from_model(source, self.distances)
                 if self.source_grid is None
@@ -1185,6 +1520,12 @@ class MicrolensingSystem:
                             dtype=torch.float64,
                         )
                     )
+        if (
+            source is not None
+            and self._bound_driving_signal is not None
+            and not model_accepts_signal
+        ):
+            source = _source_with_signal(source, self._bound_driving_signal)
         assert native_source_grid is not None
         source_grid = native_source_grid
         if (
@@ -1207,12 +1548,12 @@ class MicrolensingSystem:
                 )
 
         aperture = None
-        if self.stellar_population is not None:
+        if stellar_population is not None:
             aperture = circular_stellar_aperture(
                 numerical_macro,
                 source_grid.region,
                 self.distances,
-                self.stellar_population,
+                stellar_population,
                 light_loss=self.light_loss,
                 safety_scale=self.safety_scale,
                 duration_days=self.duration_days,
@@ -1228,14 +1569,23 @@ class MicrolensingSystem:
                     aperture.radius_uas,
                     sampling_region.center_uas,
                 )
-            stars = self.stellar_population.realize(
-                sampling_aperture,
-                self.macro,
-                self.distances,
-                seed=self.seed_for("stars"),
-                device=resolved_runtime.device,
-                dtype=resolved_runtime.dtype,
+            stellar_key = (
+                float(sampling_aperture.radius_uas),
+                *map(float, sampling_aperture.center_uas),
+                str(resolved_runtime.device),
+                resolved_runtime.dtype,
             )
+            stars = self._stellar_realizations.get(stellar_key)
+            if stars is None:
+                stars = stellar_population.realize(
+                    sampling_aperture,
+                    self.macro,
+                    self.distances,
+                    seed=self.seed_for("stars"),
+                    device=resolved_runtime.device,
+                    dtype=resolved_runtime.dtype,
+                )
+                self._stellar_realizations[stellar_key] = stars
             if align_rectangle:
                 stars = _rotate_point_mass_field(stars, frame_rotation_deg)
             explicit_lens_region = (
@@ -1250,7 +1600,7 @@ class MicrolensingSystem:
                     numerical_macro,
                     source_grid.region,
                     self.distances,
-                    self.stellar_population.mass_function,
+                    stellar_population.mass_function,
                     light_loss=(
                         self.light_loss
                         if self.rectangle_light_loss is None
@@ -1294,6 +1644,7 @@ class MicrolensingSystem:
             lens_region=lens_region,
             lens_grid=lens_grid,
             stellar_aperture=aperture,
+            stellar_population=stellar_population,
             source_support_radius_uas=source_support_radius_uas,
             trajectory=numerical_trajectory,
             sky_to_local_rotation_deg=frame_rotation_deg,
@@ -1317,8 +1668,8 @@ class MicrolensingSystem:
         rebuilding the physical specification by hand.
         """
 
-        return replace(
-            self,
+        return self._with_shared_realization_state(
+            self._bound_driving_signal,
             integration_domain=IntegrationDomain(integration_domain),
         )
 
@@ -1383,16 +1734,32 @@ class MicrolensingSystem:
 
         return self._resolved.stellar_aperture
 
-    def metadata(self) -> Mapping[str, object]:
-        """Return serializable physical and realized numerical provenance."""
+    def metadata(
+        self,
+        *,
+        map_width_uas: float | None = None,
+        map_pixels: int | None = None,
+    ) -> Mapping[str, object]:
+        """Return serializable physical and realized numerical provenance.
 
-        return self._resolved.metadata()
+        Source-independent systems accept the same map geometry arguments as
+        :meth:`magnification_map`. If exactly one such geometry was used
+        already, it is selected automatically.
+        """
+
+        system = self._system_for_geometry_inspection(
+            map_width_uas=map_width_uas,
+            map_pixels=map_pixels,
+        )
+        return system._resolved.metadata()
 
     def summary(
         self,
         *,
         times_days: Sequence[float] | None = None,
         duration_days: float | None = None,
+        map_width_uas: float | None = None,
+        map_pixels: int | None = None,
         display: bool = True,
     ) -> dict[str, object]:
         """Describe derived geometry and resource scale without tracing maps.
@@ -1401,6 +1768,17 @@ class MicrolensingSystem:
         compile solver kernels. It is therefore safe to call before a large
         production calculation.
         """
+
+        system = self._system_for_geometry_inspection(
+            map_width_uas=map_width_uas,
+            map_pixels=map_pixels,
+        )
+        if system is not self:
+            return system.summary(
+                times_days=times_days,
+                duration_days=duration_days,
+                display=display,
+            )
 
         if times_days is not None:
             if duration_days is not None:
@@ -1452,22 +1830,23 @@ class MicrolensingSystem:
 
         aperture = None
         expected_stars = None
-        if self.stellar_population is not None:
+        population = self._bound_stellar_population
+        if population is not None:
             aperture = circular_stellar_aperture(
                 self.macro,
                 map_grid.region,
                 self.distances,
-                self.stellar_population,
+                population,
                 light_loss=self.light_loss,
                 safety_scale=self.safety_scale,
                 duration_days=duration,
                 motion_sigma_margin=self.stellar_motion_sigma_margin,
                 source_support_radius_uas=support_radius,
             )
-            if self.stellar_population.count is not None:
-                expected_stars = int(self.stellar_population.count)
+            if population.count is not None:
+                expected_stars = int(population.count)
             elif self.macro.compact_convergence > 0.0:
-                mean_mass = self.stellar_population.mass_function.mean_mass()
+                mean_mass = population.mass_function.mean_mass()
                 mean_radius = float(
                     self.distances.einstein_radius_uas(
                         mean_mass,
@@ -1489,7 +1868,7 @@ class MicrolensingSystem:
                     self.macro,
                     map_grid.region,
                     self.distances,
-                    self.stellar_population.mass_function,
+                    population.mass_function,
                     light_loss=(
                         self.light_loss
                         if self.rectangle_light_loss is None
@@ -1541,30 +1920,28 @@ class MicrolensingSystem:
         self,
         times_days: Sequence[float] | None = None,
         *,
-        labels: bool = False,
+        include_labels: bool = False,
         **kwargs,
     ):
         """Warm the kernels needed by a representative production call.
 
         With no time axis, one static map is generated. Supplying
         ``times_days`` warms the dynamic light-curve path, including its
-        temporal batch shape. Set ``labels=True`` to warm the source-center
+        temporal batch shape. Set ``include_labels=True`` to warm the source-center
         caustic pipeline as well. The computed result is returned so warmup
         work can still be inspected or reused.
         """
 
         if times_days is None:
-            if labels:
+            if include_labels:
                 return self.labeled_caustics(**kwargs)
             return self.magnification_map(**kwargs)
-        if labels:
-            return self.light_curve_with_labels(times_days, **kwargs)
-        return self.light_curve(times_days, **kwargs)
+        return self.light_curve(times_days, include_labels=include_labels, **kwargs)
 
     def warmup_light_curve(
         self,
         *,
-        labels: bool = False,
+        include_labels: bool = False,
         map_cadence_days: float = 25.0,
         method: IRSConfig | IPMConfig | None = None,
         schedule: DynamicConfig | None = None,
@@ -1577,25 +1954,23 @@ class MicrolensingSystem:
         compilation when a compatible kernel is not already cached.
         """
 
-        resolved_schedule = (
-            production_dynamic_config() if schedule is None else schedule
+        options = _light_curve_options(
+            {"schedule": schedule, "method": method, **kwargs},
+            include_labels=include_labels,
+            allowed_options=_LIGHT_CURVE_CALL_OPTIONS
+            | (_LABELED_CURVE_CALL_OPTIONS if include_labels else frozenset())
+            | {"apply_driving_signal", "source_cadence_days", "flux_times_days"},
         )
+        resolved_schedule = options["schedule"]
         batch = int(resolved_schedule.temporal_batch_size or 1)
         times = torch.arange(batch, dtype=torch.float32) * float(map_cadence_days)
-        call_kwargs = {
-            "schedule": resolved_schedule,
-            **({} if method is None else {"method": method}),
-            **kwargs,
-        }
-        if labels:
-            return self.light_curve_with_labels(times, **call_kwargs)
-        return self.light_curve(times, **call_kwargs)
+        return self.light_curve(times, include_labels=include_labels, **options)
 
     def with_source(
         self,
         source: PixelatedSource | PhysicalSourceModel,
     ) -> MicrolensingSystem:
-        """Return the same physical system with a replacement source model."""
+        """Replace the source and its driver without inheriting the old driver."""
 
         return replace(self, source=source, source_grid=None)
 
@@ -1635,8 +2010,8 @@ class MicrolensingSystem:
         key = (width, pixels)
         cached = self._map_grid_systems.get(key)
         if cached is None:
-            cached = replace(
-                self,
+            cached = self._with_shared_realization_state(
+                self._bound_driving_signal,
                 source_grid=PlaneGrid(
                     shape=(pixels, pixels),
                     field_of_view_uas=(width, width),
@@ -1644,6 +2019,37 @@ class MicrolensingSystem:
             )
             self._map_grid_systems[key] = cached
         return cached
+
+    def _system_for_geometry_inspection(
+        self,
+        *,
+        map_width_uas: float | None,
+        map_pixels: int | None,
+    ) -> MicrolensingSystem:
+        """Resolve source-independent geometry for metadata and summaries."""
+
+        if self.source is not None or self.source_grid is not None:
+            if map_width_uas is not None or map_pixels is not None:
+                raise ValueError(
+                    "map_width_uas and map_pixels apply only to source-independent systems"
+                )
+            return self
+        if map_width_uas is not None or map_pixels is not None:
+            return self._with_square_map_grid(
+                map_width_uas=map_width_uas,
+                map_pixels=map_pixels,
+            )
+        if len(self._map_grid_systems) == 1:
+            return next(iter(self._map_grid_systems.values()))
+        if not self._map_grid_systems:
+            raise ValueError(
+                "source-independent inspection requires map_width_uas and map_pixels. "
+                "Pass the intended map geometry to summary or metadata"
+            )
+        raise ValueError(
+            "more than one source-independent map geometry has been used. "
+            "Pass map_width_uas and map_pixels to select one"
+        )
 
     def _realize_for_times(self, times_days) -> MicrolensingRealization:
         """Return a realization whose stellar aperture covers ``times_days``."""
@@ -1655,7 +2061,10 @@ class MicrolensingSystem:
         key = float(required)
         cached = self._duration_realizations.get(key)
         if cached is None:
-            cached = replace(self, duration_days=key).realize()
+            duration_system = self._with_shared_realization_state(
+                self._bound_driving_signal, duration_days=key
+            )
+            cached = duration_system.realize()
             self._duration_realizations[key] = cached
         return cached
 
@@ -1731,106 +2140,110 @@ class MicrolensingSystem:
         duration_days: float | None = None,
         map_cadence_days: float | None = None,
         source_cadence_days: float | None = None,
+        flux_times_days: Sequence[float] | None = None,
+        include_labels: bool = False,
+        apply_driving_signal: bool | None = None,
         start_day: float = 0.0,
         **kwargs,
     ) -> LightCurve:
-        """Generate a light curve from explicit times or plain cadence values."""
+        """Generate photometry with optional source-center labels.
 
-        map_times = _cadence_times(
+        Supply a duration and map cadence, or explicit ``times_days``.
+        ``source_cadence_days`` independently controls intrinsic evolution
+        and photometry sampling. Irregular photometry uses ``flux_times_days``.
+        Plain ``rays``, ``temporal_batch_size`` and ``scout_refresh_frames``
+        control the compute budget without constructing configuration objects.
+        ``label_batch_size`` optionally overrides the inherited label batch.
+
+        Returns a LightCurve with apparent AB ``magnitude``, physical ``flux``
+        in Jy, and optional ``labels`` and integer-indexed retained ``maps``.
+        Labels are calculated only when ``include_labels=True``.
+
+        ``apply_driving_signal=None`` uses the source's driver when
+        present. ``False`` keeps its mean heating while disabling fluctuations,
+        and ``True`` requires a configured source driver. A ``source`` override
+        uses its own geometry and driver, never the previous source's driver.
+
+        Plain numerical controls override ``method``, ``schedule`` and ``caustics``.
+        Unrecognized controls raise before realization. ``keep_maps_at_days``
+        retains only evaluated map epochs and warns about unavailable requests.
+        Photometry arrays have shape [time, band]. Label epochs are separate in
+        ``labels.times_days`` and retained map epochs in ``map_times_days``.
+        """
+
+        map_times, flux_times = _light_curve_times(
             times_days,
             duration_days=duration_days,
-            cadence_days=map_cadence_days,
+            map_cadence_days=map_cadence_days,
+            source_cadence_days=source_cadence_days,
+            flux_times_days=flux_times_days,
             start_day=start_day,
         )
-        resolved = self._realize_for_times(map_times)
-        call_kwargs = _with_method_options(kwargs, dynamic=True)
-        if source_cadence_days is None or (
-            map_cadence_days is not None
-            and math.isclose(float(source_cadence_days), float(map_cadence_days))
-        ):
-            return resolved.light_curve(map_times, **call_kwargs)
-        flux_times = _cadence_times(
-            None,
-            duration_days=(float(map_times[-1]) - float(map_times[0])),
-            cadence_days=source_cadence_days,
-            start_day=float(map_times[0]),
+        call_kwargs = _light_curve_options(
+            kwargs,
+            include_labels=include_labels,
+            allowed_options=_LIGHT_CURVE_CALL_OPTIONS
+            | (_LABELED_CURVE_CALL_OPTIONS if include_labels else frozenset()),
         )
-        return resolved.multirate_light_curve(map_times, flux_times, **call_kwargs)
-
-    def light_curves(self, times_days: Sequence[float], requests, **kwargs):
-        """Batch multiple light curves through the cached realization."""
-
-        return self._realize_for_times(times_days).light_curves(
-            times_days,
-            requests,
-            **_with_method_options(kwargs, dynamic=True),
+        observer, retained = _retaining_map_observer(
+            map_times,
+            call_kwargs.pop("keep_maps_at_days", None),
+            call_kwargs.get("map_observer"),
         )
-
-    def multirate_light_curve(
-        self,
-        map_times_days: Sequence[float],
-        flux_times_days: Sequence[float],
-        **kwargs,
-    ) -> LightCurve:
-        """Evaluate source evolution more finely than the dynamic maps."""
-
-        return self._realize_for_times(map_times_days).multirate_light_curve(
-            map_times_days,
-            flux_times_days,
-            **_with_method_options(kwargs, dynamic=True),
+        call_kwargs["map_observer"] = observer
+        source_override = call_kwargs.pop("source", None)
+        system = self if source_override is None else self.with_source(source_override)
+        _validate_source_driver(system.source, apply_driving_signal)
+        resolved = system._realize_for_times(map_times)
+        if apply_driving_signal is False:
+            call_kwargs["source"] = resolved._mean_source
+        result = _evaluate_light_curve(
+            resolved,
+            map_times,
+            flux_times,
+            include_labels=include_labels,
+            **call_kwargs,
         )
+        return replace(result, maps=retained)
 
-    def multirate_light_curve_with_labels(
-        self,
-        map_times_days: Sequence[float],
-        flux_times_days: Sequence[float],
-        **kwargs,
-    ):
-        """Evaluate fine-cadence flux with labels at map epochs."""
-
-        return self._realize_for_times(
-            map_times_days
-        ).multirate_light_curve_with_labels(
-            map_times_days,
-            flux_times_days,
-            **_with_method_options(kwargs, dynamic=True),
-        )
-
-    def light_curve_with_labels(
+    def light_curves(
         self,
         times_days: Sequence[float] | None = None,
+        requests=None,
         *,
         duration_days: float | None = None,
         map_cadence_days: float | None = None,
         source_cadence_days: float | None = None,
+        flux_times_days=None,
         start_day: float = 0.0,
         **kwargs,
     ):
-        """Generate labeled photometry from explicit times or cadence values."""
+        """Sample several sources or trajectories from one shared map sequence.
 
-        map_times = _cadence_times(
+        Requests inherit this system's distances unless explicitly overridden.
+        Duration, cadence, rays and batch controls match :meth:`light_curve`.
+        Use ``batched_system_light_curves`` for independent stellar fields.
+        """
+        if requests is None:
+            raise ValueError(
+                "supply requests containing the sources or trajectories to sample"
+            )
+        map_times, flux_times = _light_curve_times(
             times_days,
             duration_days=duration_days,
-            cadence_days=map_cadence_days,
+            map_cadence_days=map_cadence_days,
+            source_cadence_days=source_cadence_days,
+            flux_times_days=flux_times_days,
             start_day=start_day,
         )
-        resolved = self._realize_for_times(map_times)
-        call_kwargs = _with_method_options(kwargs, dynamic=True)
-        if source_cadence_days is None or (
-            map_cadence_days is not None
-            and math.isclose(float(source_cadence_days), float(map_cadence_days))
-        ):
-            return resolved.light_curve_with_labels(map_times, **call_kwargs)
-        flux_times = _cadence_times(
-            None,
-            duration_days=float(map_times[-1]) - float(map_times[0]),
-            cadence_days=source_cadence_days,
-            start_day=float(map_times[0]),
+        options = _light_curve_options(
+            kwargs, include_labels=False, allowed_options={"map_observer"}
         )
-        return resolved.multirate_light_curve_with_labels(
+        return self._realize_for_times(map_times).light_curves(
             map_times,
-            flux_times,
-            **call_kwargs,
+            requests,
+            flux_times_days=flux_times,
+            **options,
         )
 
     def caustics(self, **kwargs):

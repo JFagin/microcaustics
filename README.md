@@ -7,10 +7,12 @@ interface.
 
 ![Ten-year Q2237 image-B-like dynamic magnification map with source-plane caustics](docs/assets/q2237_image_b_dynamic_magnification.gif)
 
-The animation is a complete 147-frame output of the first scientific
-tutorial. It shows a ten-year, $10^7$-ray, $1024^2$ dynamic IPM calculation with the
+The animation is a complete 147-frame output of the
+[Q2237 light-curve tutorial](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb).
+It shows a ten-year, $10^7$-ray, $1024^2$ dynamic IPM calculation with the
 caustic network overlaid. Its map normalization, colorbar, and indexed GIF
-palette are fixed globally across all frames.
+palette are fixed globally across all frames. This stellar realization was
+selected to illustrate a dense caustic network and source-center crossings.
 
 ### Fast CUDA production path
 
@@ -111,9 +113,7 @@ For an editable installation without development tools, use
 external validation packages remain optional extras. The standalone scripts
 are indexed in [`examples/README.md`](examples/README.md).
 
-The numerical core supports Python 3.10 and newer. The optional `caustics`
-interoperability layer requires Python 3.11 or newer because that is the
-minimum version supported by `caustics>=1.7`.
+The numerical core supports Python 3.10 and newer.
 
 ### Triton acceleration
 
@@ -169,9 +169,15 @@ accelerator timing. Install the notebook dependencies and launch the
 collection with the following commands.
 
 ```bash
-python -m pip install -e ".[notebooks,science]"
+python -m pip install -e ".[notebooks,science,macro]"
 jupyter lab examples/notebooks
 ```
+
+The complete collection uses the `science` dependencies for cosmology and
+numerical reference calculations. It also uses the `macro` dependencies for
+the strong-lens rendering tutorials. The `caustics` dependency in `macro`
+requires Python 3.11 or newer. The remaining package and notebooks support
+Python 3.10.
 
 Start with
 [Getting started with maps and light curves](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb).
@@ -195,7 +201,151 @@ products when those external codes are available. The remaining notebooks run
 only with the public `microcaustics` interface and their documented optional
 dependencies.
 
-## Getting started with maps and light curves
+## Magnification maps without a source model
+
+A magnification map depends on the lenses and the source-plane geometry, not
+on a disk or brightness profile. Specify the redshifts, lens parameters, and
+stellar population, then choose the map width and pixel count. The package
+derives the circular stellar field, number of stars, Einstein radii, and
+lens-plane bounds automatically.
+
+### 1. Generate a static map
+
+```python
+import microcaustics as mc
+import microcaustics.plotting as mcp
+
+map_macro = mc.MacroLens(
+    convergence=0.391,          # total convergence, kappa
+    shear=0.391,                # shear amplitude, gamma
+    shear_angle_deg=141.73,     # shear position angle in degrees
+    smooth_matter_fraction=0.0, # fraction of kappa in smooth matter
+)
+map_system = mc.MicrolensingSystem(
+    lens_redshift=0.0395,
+    source_redshift=1.695,
+    H0=70.0, Om0=0.3,           # flat cosmology, H0 in km s^-1 Mpc^-1
+    macro=map_macro,
+    stellar_population=mc.StellarPopulation.salpeter(
+        mean_mass_solar=0.3,
+        mass_ratio=100.0,       # maximum / minimum stellar mass
+    ),
+    integration_domain="scout", # "scout", "full", or "rectangle"
+    light_loss=0.01,             # stellar-aperture truncation tolerance
+    safety_scale=1.5,            # enlarge the derived circular star field
+    seed=0,                     # change for another realization, omit for random draws
+)
+
+static_map = map_system.magnification_map(
+    map_width_uas=10.0,  # full width, 10 x 10 microarcseconds
+    map_pixels=1024,     # output pixels per axis
+    rays=10_000_000,     # lens-plane sampling budget, increase for accuracy
+)
+print(static_map.values.shape)  # [1024, 1024], dimensionless magnification
+
+figure, ax = mcp.plot_magnification_map(
+    static_map, log10=True, scale_bar_uas=1.0, show_axes=False,
+)
+```
+
+This returns an unconvolved map using IPM with the Taylor far-field
+approximation. Use `method="irs"` in the map call for inverse ray shooting.
+The integration domain changes which lens-plane cells are sampled, not the
+underlying circular stellar population. More pixels alone do not improve
+sampling accuracy, so adjust `rays` as well when resolving finer structure.
+
+### 2. Add motion and generate dynamic maps
+
+Add a velocity model to the population and request a sequence of observer-frame
+times. This Q2237 image-B-like example includes stellar dispersion, lens and
+source peculiar velocities, and the sky-projected CMB motion. No luminous
+source model is required.
+
+```python
+moving_system = mc.MicrolensingSystem(
+    lens_redshift=0.0395,
+    source_redshift=1.695,
+    H0=70.0, Om0=0.3,
+    macro=map_macro,  # same local lens parameters as above
+    stellar_population=mc.StellarPopulation.salpeter(
+        mean_mass_solar=0.3, mass_ratio=100.0,
+        kinematics=mc.SkyProjectedKinematics(
+            ra_deg=340.126125, dec_deg=3.358611,  # sky position in degrees
+            stellar_dispersion_km_s=170.0,       # 1D proper stellar dispersion
+            peculiar_velocity_dispersion_km_s=235.0, # lens/source velocity scale
+            include_cmb_dipole=True,             # observer motion projected on sky
+        ),
+    ),
+    light_loss=0.01,
+    safety_scale=1.5,
+    seed=0,  # also controls the independent velocity draws
+)
+
+map_times_days = list(range(0, 3651, 25))  # 147 epochs spanning ten years
+maps = moving_system.dynamic_maps(
+    map_times_days,
+    map_width_uas=10.0,  # fixed source-plane field throughout the sequence
+    map_pixels=1024,
+    rays=10_000_000,
+    schedule=mc.production_dynamic_config(
+        temporal_batch_size=49, # frames computed together, lower for less VRAM
+        scout_refresh_frames=10, # refresh interval in map epochs, 1 disables reuse
+    ),
+)
+for frame in maps:
+    print(frame.time_days, frame.values.shape)
+    # Plot, save, or consume frame.values without retaining the whole sequence.
+```
+
+The iterator delivers individual maps from internally computed temporal
+batches. With CUDA and Triton available, the defaults use the fused production
+IPM path with `k=2`, `r=2`, `v=4`, 8-by-8 Taylor nodes per far-field cell,
+endpoint-union scout reuse, and the initial scout normalization correction.
+Every epoch gets its own far-field coefficients. The explicit `schedule`
+above shows the defaults and can be omitted.
+
+The package converts velocities to angular motion, includes cosmological time
+dilation, and sizes the stellar aperture for the requested duration. Compatible
+calls reuse compiled kernels after the first call. Consuming the iterator
+does not recompile for every frame. CPU and non-Triton environments use the
+portable implementation.
+
+### 3. Supply individual stars instead
+
+Use `stars` instead of `stellar_population` when positions and masses are
+known. Positions are in microarcseconds and masses are in solar masses.
+The package derives their Einstein radii from the redshifts.
+
+```python
+import torch
+
+stars = mc.PointMassField(
+    x_uas=torch.tensor([-1.0, 1.0]),
+    y_uas=torch.tensor([0.0, 0.0]),
+    mass_solar=torch.tensor([0.09, 0.04]),
+)
+two_star_system = mc.MicrolensingSystem(
+    lens_redshift=0.5,
+    source_redshift=2.0,
+    macro=mc.MacroLens(convergence=0.0, shear=0.1),
+    stars=stars,
+)
+two_star_map = two_star_system.magnification_map(
+    map_width_uas=10.0,  # square source-plane width
+    map_pixels=1024,     # output pixels per axis
+    rays=10_000_000,
+)
+print(two_star_map.values.shape)  # [1024, 1024], dimensionless magnification
+```
+
+The centered lens plane is inferred automatically. Advanced calculations can
+choose a centered square or rectangle with `lens_plane_uas`, or use an
+explicit `PlaneRegion` for an off-center field. Use an explicit `PlaneGrid`
+only when the source map itself must be rectangular or off-center. See the
+[static-map tutorial](examples/notebooks/getting_started/00_static_maps_and_numerical_methods.ipynb)
+for these controls and conversions to mean-microlens Einstein units.
+
+## Physical sources and light curves
 
 This example follows the first tutorial notebook. It defines one Q2237 image
 B-like physical system, generates an independent magnification map, and then
@@ -211,14 +361,19 @@ import torch
 import microcaustics as mc
 import microcaustics.plotting as mcp
 
-lens_redshift = 0.0395
-source_redshift = 1.695
-
 macro = mc.MacroLens(
-    convergence=0.391,
-    shear=0.391,
-    shear_angle_deg=141.73,
-    smooth_matter_fraction=0.0,
+    convergence=0.391,          # total convergence, kappa
+    shear=0.391,                # shear amplitude, gamma
+    shear_angle_deg=141.73,     # shear position angle in degrees
+    smooth_matter_fraction=0.0, # s, fraction of kappa in smooth matter
+)
+
+driver = mc.broken_power_law_driving_signal(
+    cadence_days=0.1,            # driver interpolation grid, not the map cadence
+    break_timescale_days=200.0,  # PSD break timescale in days
+    alpha_L=1.0,                # positive low-frequency PSD slope
+    alpha_R=3.0,                # positive high-frequency PSD slope
+    standard_deviation=0.10,    # amplitude standard deviation, mean defaults to one
 )
 
 source = mc.KerrDiskModel(
@@ -228,10 +383,11 @@ source = mc.KerrDiskModel(
                      "i": 7546, "z": 8691, "y": 9712},
     spin=0.74,
     inclination_deg=10.0,
-    position_angle_deg=175.0,
+    position_angle_deg=0.0,
     lamp_fraction=0.1,
     corona_height_above_isco_rg=20.0,
-    source_grid_shape=1024,          # pixels per source-plane axis
+    driving_signal=driver,          # optional, inherits the system's variability seed
+    source_grid_shape=1024,          # disk/map pixels per axis, e.g. 512 or 1024
     enclosed_flux_fraction=0.999,
     source_margin=1.05,
 )
@@ -241,7 +397,7 @@ kinematics = mc.SkyProjectedKinematics(
     dec_deg=3.358611,
     peculiar_velocity_dispersion_km_s=235.0,
     stellar_dispersion_km_s=170.0,
-    seed=2001,
+    include_cmb_dipole=True,        # project observer motion at this sky position
 )
 population = mc.StellarPopulation.salpeter(
     mean_mass_solar=0.3,
@@ -250,8 +406,8 @@ population = mc.StellarPopulation.salpeter(
 )
 
 system = mc.MicrolensingSystem(
-    lens_redshift=lens_redshift,
-    source_redshift=source_redshift,
+    lens_redshift=0.0395,
+    source_redshift=1.695,
     H0=70.0,                         # km s^-1 Mpc^-1
     Om0=0.3,                         # present-day matter density
     macro=macro,
@@ -261,10 +417,16 @@ system = mc.MicrolensingSystem(
     light_loss=0.01,                 # stellar-aperture truncation tolerance
     safety_scale=1.5,                # expand the derived circular star field
     stellar_motion_sigma_margin=5.0, # motion allowance over the full duration
-    seed=1001,
+    seed=0,
     caustic_grid_shape=8192,         # detA pixels per axis for labels
 )
 ```
+
+The stellar convergence is derived as $\kappa_\star=(1-s)\kappa$, where
+`s = smooth_matter_fraction`. Here `s=0` puts all the convergence in stars.
+For a population with a known stellar convergence, set
+`smooth_matter_fraction=1 - kappa_star / kappa` rather than specifying both
+independently.
 
 The system evaluates a flat matter-plus-cosmological-constant geometry in
 Torch float32. Supply an explicit `LensingDistances` object for a different
@@ -273,9 +435,14 @@ stellar-realization and peculiar-velocity seeds are separate, so both random
 processes remain independently reproducible.
 
 A single integer seed is enough for a reproducible calculation. The package
-derives stable independent streams for stars, source variability,
-observations, and each macroimage. A mapping can override only the desired
-components, for example `seed={"base": 1001, "stars": 42}`.
+derives stable independent streams for stars, sky kinematics, source
+variability, observations, and each macroimage. A mapping can override only
+the desired components, for example
+`seed={"base": 0, "stars": 1, "kinematics": 2}`. An explicit seed on a
+driving signal or `SkyProjectedKinematics` overrides the inherited stream.
+
+Most examples use `seed=0`. Choose a different integer for a new realization.
+Omitting the seed in your own calculation still draws fresh random inputs.
 
 Before allocating stars or compiling a kernel, inspect the derived geometry
 and resource scale with `system.summary(duration_days=3650)`. The returned
@@ -295,14 +462,12 @@ arguments instead.
 
 ### 2. Generate and plot one magnification map
 
-An independent static map uses the complete `k=1` source scout. This avoids the
-dynamic sequence's one-time `k=1` to `k=2` normalization correction.
-
 ```python
 magnification_map = system.magnification_map(
     time_days=0.0,
-    rays=10_000_000,
+    rays=10_000_000,  # increase for finer lens-plane sampling
 )
+print(magnification_map.values.shape)  # [1024, 1024], dimensionless magnification
 
 figure, ax = mcp.plot_magnification_map(
     magnification_map,
@@ -312,48 +477,18 @@ figure, ax = mcp.plot_magnification_map(
 )
 ```
 
-The operation infers the static `k=1` IPM preset. Common experiments remain
-plain keyword changes, for example
-`system.magnification_map(rays=5_000_000, refinement=3,
-virtual_refinement=4, far_field=True)`. Use `method="irs"` for inverse ray
-shooting, or set `integration_domain` on the system to `"scout"`, `"full"`,
-or `"rectangle"`.
+For a static map, the two main numerical controls are `rays` and `source_grid_shape`.
+`rays` sets the lens-plane sampling budget, for example
+`system.magnification_map(rays=5_000_000)`. `source_grid_shape` in the source
+definition sets the disk and magnification-map resolution. Change it to
+`512` for a smaller pixel grid or keep `1024` for the examples shown here.
+Neither requires choosing the physical source size manually.
 
-### Source-independent maps with directly placed stars
-
-A magnification map does not require a luminous source. It only needs the
-source-plane width and output pixel count. This two-star example specifies
-angular lens positions and physical masses. The package derives their
-Einstein radii and the required lens-plane region from the cosmological and
-map geometry.
-
-```python
-stars = mc.PointMassField(
-    x_uas=torch.tensor([-1.0, 1.0]),
-    y_uas=torch.tensor([0.0, 0.0]),
-    mass_solar=torch.tensor([0.09, 0.04]),
-)
-
-map_system = mc.MicrolensingSystem(
-    lens_redshift=0.5,
-    source_redshift=2.0,
-    macro=mc.MacroLens(convergence=0.0, shear=0.1),
-    stars=stars,
-)
-
-two_star_map = map_system.magnification_map(
-    map_width_uas=10.0,  # square source-plane width
-    map_pixels=1024,     # pixels per axis
-    rays=10_000_000,
-)
-```
-
-The centered lens plane is inferred automatically. Advanced calculations can
-choose a centered square or rectangle with `lens_plane_uas`, or use an
-explicit `PlaneRegion` for an off-center field. These controls and conversion
-between microarcseconds and mean-microlens Einstein units are demonstrated in
-the numerical-methods notebook. Use an explicit `PlaneGrid` only when the
-source map itself must be rectangular or off-center.
+More output pixels resolve finer structure but do not replace adequate ray
+sampling. For an initial preview, lower either control, then check convergence
+before using the result scientifically. Refinement settings are advanced
+controls described below. Use `method="irs"` for inverse ray shooting, or set
+`integration_domain` on the system to `"scout"`, `"full"`, or `"rectangle"`.
 
 ### 3. Generate a production light curve with labels
 
@@ -361,57 +496,102 @@ The shortest call uses the complete validated production path. This means
 `N=10^7`, `k=2`, true refinement `r=2`, virtual refinement `v=4`, the
 local-exact complex-Taylor far field, temporal batching, conservative
 endpoint-union scout reuse, and aligned source-center labels.
+The maps use the `source_grid_shape` set on the source above, while `rays`
+can be changed on each light-curve call. For dynamic light curves, temporal
+batch size and the scout refresh interval are also important controls.
 
 ```python
-
-microlensing_only = system.light_curve_with_labels(
+microlensing_only = system.light_curve(
     duration_days=3650,
-    map_cadence_days=25,
-    keep_maps_at_days=(0.0,),
+    map_cadence_days=25,          # 147 map epochs, including day zero
+    rays=10_000_000,              # increase for accuracy or lower for previews
+    temporal_batch_size=30,      # map epochs per batch, lower for less VRAM
+    scout_refresh_frames=10,     # refresh interval in map epochs, 1 scouts every epoch
+    include_labels=True,        # source-center labels, not full label maps
+    apply_driving_signal=False, # constant mean heating, no driving fluctuations
+    keep_maps_at_days=(0.0,),     # retain only this map, not the full sequence
 )
 
-map_at_day_zero = microlensing_only.maps[0.0]
-print(microlensing_only.light_curve.flux)  # 147 map epochs by 6 bands
-print(microlensing_only.crossing_labels)   # source-center parity
-print(microlensing_only.crossing_events)   # label transitions
-print(microlensing_only.center_distances_uas)
-print(map_at_day_zero.values)         # [1024, 1024]
+map_at_day_zero = microlensing_only.maps[0]
+print(microlensing_only.map_times_days)                # [0.0], retained map epochs
+print(microlensing_only.magnitude.shape)               # [147, 6], apparent AB magnitudes
+print(microlensing_only.flux.shape)                    # [147, 6], original Jy fluxes
+print(microlensing_only.labels.crossing_labels)        # [147], aligned binary labels
+print(microlensing_only.labels.crossing_events)        # [147], boolean label transitions
+print(microlensing_only.labels.center_distances_uas)   # [147], distances in microarcseconds
+print(map_at_day_zero.values.shape)            # [1024, 1024], magnification
 
 figure, ax = mcp.plot_light_curve(
-    microlensing_only.light_curve,
+    microlensing_only,
     bands=("i",),
-    normalize=True,
+    magnitude=True,
     show_unlensed=True,
     title="Q2237 image B-like light curve",
 )
 ```
 
+`temporal_batch_size` controls how many map epochs are processed together.
+It affects throughput and memory rather than the requested sampling accuracy.
+A short sequence can use a smaller batch to avoid unnecessary padding.
+Larger batches are not always faster, even when they divide the sequence
+length exactly. The example uses 30 for maps with labels, while the default
+light-curve-only schedule uses 49.
+
+`scout_refresh_frames` controls how long the selected lens-plane geometry is
+reused between scout refreshes. It counts map epochs, not daily source samples.
+Keep 10 as a starting point or lower it for more conservative scouting.
+Increasing it is an approximation that should be validated for the map cadence
+and lens/source motion, not chosen just to divide the batch size.
+
 Intrinsic variability can be evaluated daily while the dynamic maps remain
-on the faster 25-day cadence. The two PSD slopes are explicit user controls.
+on the coarser 25-day cadence. Turn on the driver already supplied to the disk.
 
 ```python
-driver_times = torch.arange(0.0, 3651.0, 1.0)
-driver = mc.broken_power_law_driving_signal(
-    driver_times,
-    break_timescale_days=200.0,  # PSD break timescale
-    alpha_L=1.0,                 # low-frequency PSD slope
-    alpha_R=3.0,                 # high-frequency PSD slope
-    standard_deviation=0.10,     # fractional driving variability
-    seed=3001,
-    extrapolation="hold",        # hold the endpoint over small delay offsets
-)
-
-variable_system = system.with_source(source.with_driving_signal(driver))
-combined = variable_system.light_curve_with_labels(
+combined = system.light_curve(
     duration_days=3650,
     map_cadence_days=25,         # microlensing map cadence
     source_cadence_days=1,       # intrinsic source cadence
+    rays=10_000_000,             # same map accuracy control as above
+    temporal_batch_size=30,
+    scout_refresh_frames=10,
+    include_labels=True,
+    apply_driving_signal=True,
 )
+print(combined.magnitude.shape)                # [3651, 6], daily AB magnitudes
+print(combined.labels.crossing_labels.shape)   # [147], labels stay at the map cadence
+print(combined.labels.times_days.shape)        # [147], separate label epochs
 ```
 
-Here is the same production calculation with its principal numerical controls
-made explicit. These are ordinary configurations, so users can change any
-value for accuracy, speed, memory, or convergence studies.
+The driver is generated once on a fixed grid. Defaults cover day -1000 through
+day 7300, with fivefold FFT padding followed by cropping to reduce boundary
+effects. Shorter light-curve requests reuse the same driver samples. Set
+`max_duration_days`, `history_days`, or `padding_factor` on the driver to change
+these choices. The 1000-day history is not sufficient for every source or arrival
+delay. Out-of-range queries raise an error rather than hold an endpoint.
+Changing the generation grid can change the entire realization even with the
+same seed. A driver-specific `seed` overrides the inherited system seed.
+
+Omitting `apply_driving_signal` uses the supplied driver automatically. Setting
+it to false holds the driver at its mean without removing lamp heating or
+freezing other source evolution, such as supernova expansion. Custom signals
+use unit baseline unless their metadata supplies `mean_amplitude`.
+
+To construct a source with no driving signal, omit `driving_signal` from the
+disk constructor. Light curves then work without an extra switch. Explicitly
+requesting `apply_driving_signal=True` for a source without a driver raises an
+error. Supernovae evolve through their own source model and need no driver.
+For a custom source, use `ModulatedSource` only when you intend additional
+multiplicative brightness modulation. Replacing a source replaces its driver
+too, without inheriting the previous source's driver.
+
+Only requested maps are retained. A request that is not an evaluated map epoch
+produces a warning and is omitted, without interpolation or extra ray tracing.
+Inspect `result.map_times_days` before indexing `result.maps`.
+
+For advanced use, the same calculation can expose refinement, additional scout
+controls, and far-field settings explicitly. You can leave these at their
+defaults when adjusting ray count, pixel resolution, temporal batch size, and
+the scout refresh interval.
 
 ```python
 far_field = mc.FarFieldApproxConfig(
@@ -452,13 +632,14 @@ labels = mc.CausticConfig(
     minimum_alignment_gauges=3, # minimum trusted temporal alignment set
 )
 
-explicit_result = system.light_curve_with_labels(
+explicit_result = system.light_curve(
     duration_days=3650,
     map_cadence_days=25,
     source_cadence_days=1,
     method=method,
     schedule=schedule,
     caustics=labels,
+    include_labels=True,
     keep_maps_at_days=(0.0,),
 )
 ```
@@ -483,12 +664,15 @@ An explicit warmup can separate first-call compilation from production work.
 
 ```python
 # Use a representative temporal batch so the production batch shape is warm.
-system.warmup_light_curve(labels=True)
+system.warmup_light_curve(include_labels=True, temporal_batch_size=30)
 
 # Subsequent compatible calls reuse the realization and warmed kernels.
-next_result = system.light_curve_with_labels(
+next_result = system.light_curve(
     duration_days=3650,
     map_cadence_days=25,
+    rays=10_000_000,  # keep the numerical settings fixed to reuse warmed kernels
+    temporal_batch_size=30,
+    include_labels=True,
 )
 ```
 
@@ -504,7 +688,7 @@ together. Each seed produces a new star field. Compatible Triton or
 compiled-Torch kernels are reused.
 
 ```python
-systems = [system.with_seed(seed) for seed in range(1001, 1009)]
+systems = [system.with_seed(seed) for seed in range(8)]
 maps = mc.batched_system_maps(
     systems,
     batch_size=8,  # automatically reduced if necessary to avoid an OOM
@@ -517,14 +701,21 @@ its own stars, source, trajectory, variability, maps, and labels.
 ```python
 batch = mc.batched_system_light_curves(
     systems,
-    map_times_days=range(0, 3651, 25),
-    flux_times_days=range(0, 3651),
+    duration_days=3650,
+    map_cadence_days=25,
+    source_cadence_days=1,
+    rays=10_000_000,
+    temporal_batch_size=30,
+    scout_refresh_frames=10,
     curves_per_batch=3,  # complete independent systems, not shared maps
     include_labels=True,
 )
 curves = batch.light_curves
-print(batch.seconds_per_curve, batch.executed_batch_sizes)
+print(curves[0].magnitude.shape, batch.executed_batch_sizes)
 ```
+
+Pass `profile=True` to collect batch wall time and `batch.seconds_per_curve`.
+They are unavailable by default, without timing-only device synchronization.
 
 CUDA memory exhaustion reduces only the active concurrency and retries the
 same numerical calculation. The best concurrency depends on the star count,
@@ -542,18 +733,9 @@ controls can require one new compiled specialization. A substantially
 different stellar count can also produce a new compiled-Torch shape variant.
 This compilation is cached and reused by later compatible realizations.
 
-Timing collection is disabled by default because GPU synchronization can
-reduce throughput. Request synchronized end-to-end or component timing only
-when it is needed.
-
-```python
-runtime = mc.RuntimeConfig(profiling="total")
-runtime = mc.RuntimeConfig(profiling="detailed")
-```
-
-With `profiling="off"`, `result.timing.collected` is false and no timing-only
-accelerator barriers are inserted. Use `benchmark_callable` when comparing
-first-call and warmed performance across repeated calls.
+Timing collection is off by default and does not add timing-only GPU
+synchronization. See the [timing guide](docs/timing.md) for optional profiling
+and first-call versus warmed performance measurements.
 
 `integration_domain="scout"` is the fast production path. It evaluates only
 cells that can map into the source field. `"full"` evaluates every cell in the
@@ -574,6 +756,8 @@ The main accuracy and throughput controls in the example are listed below.
 | Control | Meaning |
 |---|---|
 | `rays` | Requested base lens-plane cell budget, $N$ |
+| `source_grid_shape` | Disk and magnification-map pixels per axis, set on the source model |
+| `map_pixels` | Magnification-map pixels per axis when no source model is supplied |
 | `integration_domain` | `"scout"`, `"full"`, or `"rectangle"` integration region |
 | `scout_ratio` | Scout coarsening factor, $k$, used only by the scout domain |
 | `refinement` | True lens-equation refinement, $r$ |
@@ -608,6 +792,17 @@ Physical models such as `KerrDiskModel`, `ThinDiskModel`, and `GaussianModel`
 choose their own pixel grids. Existing pixelated, callable, expanding-supernova, and custom
 sources can still be supplied directly. A source is optional when only a
 magnification map is required.
+
+Custom `CallableSource` models accept `source_grid_shape`, `field_of_view_uas`,
+and `bands_angstrom` directly. `StaticSource` accepts the same angular extent
+and bands and infers the pixel shape from its image. The system handles the
+distance conversion, so no separate geometry object is needed. See the
+[custom-source guide](docs/sources.md) for physical brightness units and examples.
+
+Standalone disks also need no lens setup. For example,
+`source.pixelate(source_redshift=1.695, H0=70, Om0=0.3)` returns the resolved
+disk for images and continuum reverberation. Supernova models inherit the
+system redshift and distance when passed directly to a system.
 
 Point lenses may be supplied directly or sampled from any object implementing
 the `MassFunction` protocol. Population builders expose their lens region and
@@ -702,19 +897,32 @@ image and supply the measured arrival delays once.
 
 ```python
 image_macros = {
-    "A": mc.MacroLens(0.396, 0.396, shear_angle_deg=175.43),
-    "B": mc.MacroLens(0.391, 0.391, shear_angle_deg=141.73),
-    "C": mc.MacroLens(0.715, 0.715, shear_angle_deg=69.11),
-    "D": mc.MacroLens(0.604, 0.604, shear_angle_deg=62.54),
+    # Each image has its own kappa, gamma, shear angle, and smooth fraction.
+    "A": mc.MacroLens(
+        convergence=0.396, shear=0.396,
+        shear_angle_deg=175.43, smooth_matter_fraction=0.0,
+    ),
+    "B": mc.MacroLens(
+        convergence=0.391, shear=0.391,
+        shear_angle_deg=141.73, smooth_matter_fraction=0.0,
+    ),
+    "C": mc.MacroLens(
+        convergence=0.715, shear=0.715,
+        shear_angle_deg=69.11, smooth_matter_fraction=0.0,
+    ),
+    "D": mc.MacroLens(
+        convergence=0.604, shear=0.604,
+        shear_angle_deg=62.54, smooth_matter_fraction=0.0,
+    ),
 }
 
 multi_image_system = mc.MultiImageSystem(
     images=image_macros,
-    lens_redshift=lens_redshift,
-    source_redshift=source_redshift,
+    lens_redshift=0.0395,
+    source_redshift=1.695,
     H0=70.0,
     Om0=0.3,
-    source=source,
+    source=source,  # its intrinsic driver realization is shared across all images
     stellar_population=population,
     arrival_time_delays_days={
         "A": 0.0,
@@ -722,26 +930,28 @@ multi_image_system = mc.MultiImageSystem(
         "C": 2.1,
         "D": 11.8,
     },  # illustrative values in days; replace with measured or modeled delays
-    seed=1001,
+    seed=0,
 )
 
 multi_image_microlensing = multi_image_system.light_curves(
     duration_days=3650,
     map_cadence_days=25,
+    rays=10_000_000,  # sampling budget per image and map epoch
     include_labels=True,
+    apply_driving_signal=False,
 )
 
-variable_multi_image_system = multi_image_system.with_source(
-    source.with_driving_signal(driver)
-)
-multi_image_combined = variable_multi_image_system.light_curves(
+multi_image_combined = multi_image_system.light_curves(
     duration_days=3650,
     map_cadence_days=25,
     source_cadence_days=1,
+    rays=10_000_000,
     include_labels=True,
+    apply_driving_signal=True,
 )
 
-multi_image_maps = multi_image_system.magnification_maps()
+multi_image_maps = multi_image_system.magnification_maps(rays=10_000_000)
+print(multi_image_maps["B"].values.shape)  # [1024, 1024], image B at day zero
 ```
 
 Each image receives an independent stellar realization. Shared numerical
@@ -750,7 +960,7 @@ interface applies cosmological time delays only to intrinsic source evolution
 while keeping lens motion in observer time. Global macro-model results can be
 passed directly to `MultiImageSystem.from_macroimage_solutions`.
 The same object provides `dynamic_maps`, `caustics`, `labeled_caustics`,
-`multirate_light_curves`, and microlensing-weighted `transfer_functions`.
+fine-cadence `light_curves`, and microlensing-weighted `transfer_functions`.
 See
 [`docs/multi_image.md`](docs/multi_image.md) and
 [`examples/multi_image_light_curves.py`](examples/multi_image_light_curves.py).

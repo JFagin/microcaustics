@@ -435,6 +435,7 @@ class MicrolensingSimulation:
         method: IRSConfig | IPMConfig,
         schedule: DynamicConfig | None = None,
         map_observer=None,
+        flux_times_days=None,
     ) -> tuple[LightCurve, ...]:
         """Stream one map sequence into multiple finite-source light curves.
 
@@ -456,6 +457,7 @@ class MicrolensingSimulation:
             method=method,
             schedule=schedule,
             map_observer=map_observer,
+            flux_times_days=flux_times_days,
         )
 
     def multirate_light_curve(

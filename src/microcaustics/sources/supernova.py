@@ -4,19 +4,20 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
+from copy import copy
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 import torch
 
-from .base import SourceGeometry, _as_times
+from .base import SourceGeometry, _as_times, _geometry_grid
+from .physical import _resolve_source_distances
 
 _C = 299_792_458.0
 _H = 6.626_070_15e-34
 _K_B = 1.380_649e-23
 _SIGMA_SB = 5.670_374_419e-8
 _SECONDS_PER_DAY = 86_400.0
-_MPC_M = 3.085_677_581_491_367e22
 _ANGSTROM_M = 1.0e-10
 
 
@@ -145,7 +146,7 @@ class PhotosphereAppearance:
     """
 
     axis_ratio: float = 1.0
-    position_angle_rad: float = 0.0
+    position_angle_deg: float = 0.0
     limb_darkening: float = 0.5
     achromatic_phase_rest_days: float = 0.0
     chromatic_transition_rest_days: float = 1.0
@@ -157,7 +158,7 @@ class PhotosphereAppearance:
     def __post_init__(self) -> None:
         finite = {
             "axis_ratio": self.axis_ratio,
-            "position_angle_rad": self.position_angle_rad,
+            "position_angle_deg": self.position_angle_deg,
             "limb_darkening": self.limb_darkening,
             "achromatic_phase_rest_days": self.achromatic_phase_rest_days,
             "chromatic_transition_rest_days": (self.chromatic_transition_rest_days),
@@ -188,7 +189,7 @@ class PhotosphereAppearance:
 
         return {
             "axis_ratio": self.axis_ratio,
-            "position_angle_rad": self.position_angle_rad,
+            "position_angle_deg": self.position_angle_deg,
             "limb_darkening": self.limb_darkening,
             "achromatic_phase_rest_days": self.achromatic_phase_rest_days,
             "chromatic_transition_rest_days": (self.chromatic_transition_rest_days),
@@ -216,7 +217,11 @@ class ExpandingPhotosphereSource:
     returns values broadcastable to ``[time, y, x, band]``. An optional
     ``spectral_modifier`` receives ``(rest_time, rest_wavelength)`` and returns
     factors broadcastable to ``[time, band]``. Brightness is Jy per square
-    meter of projected source plane.
+    meter of projected source plane. Omit ``source_redshift`` when passing the
+    model to a system. The system supplies its cosmological geometry. For
+    standalone use, pass it here or to ``pixelate(source_redshift=...)``.
+    ``maximum_observer_time_days`` fixes the source field over a declared
+    evolution interval rather than changing it for every light-curve request.
     """
 
     is_time_static = False
@@ -224,7 +229,7 @@ class ExpandingPhotosphereSource:
     def __init__(
         self,
         *,
-        redshift: float,
+        source_redshift: float | None = None,
         wavelengths_angstrom: Sequence[float] | None = None,
         bands_angstrom: Mapping[str, float] | None = None,
         maximum_observer_time_days: float,
@@ -232,18 +237,22 @@ class ExpandingPhotosphereSource:
         band_names: Sequence[str] | None = None,
         source_grid_shape: int = 256,
         explosion_time_days: float = 0.0,
-        source_fov_margin: float = 1.05,
+        source_margin: float = 1.05,
         appearance: PhotosphereAppearance | None = None,
         spatial_profile: SpatialProfile | None = None,
         spectral_modifier: SpectralModifier | None = None,
         maximum_photosphere_radius_m: float | None = None,
         luminosity_distance_m: float | None = None,
-        hubble_km_s_mpc: float = 70.0,
-        omega_matter: float = 0.3,
-        omega_lambda: float = 0.7,
+        H0: float | None = None,
+        Om0: float | None = None,
         name: str = "expanding_photosphere",
     ) -> None:
-        self.redshift = self._positive(redshift, "redshift")
+        self.source_redshift = (
+            None
+            if source_redshift is None
+            else self._positive(source_redshift, "source_redshift")
+        )
+        self._H0, self._Om0 = H0, Om0
         self.maximum_observer_time_days = self._finite(
             maximum_observer_time_days,
             "maximum_observer_time_days",
@@ -263,12 +272,12 @@ class ExpandingPhotosphereSource:
         if not isinstance(source_grid_shape, int) or source_grid_shape < 2:
             raise ValueError("source_grid_shape must be an integer of at least two")
         self.source_grid_shape = source_grid_shape
-        self.source_fov_margin = self._positive(
-            source_fov_margin,
-            "source_fov_margin",
+        self.source_margin = self._positive(
+            source_margin,
+            "source_margin",
         )
-        if self.source_fov_margin <= 1:
-            raise ValueError("source_fov_margin must be greater than one")
+        if self.source_margin <= 1:
+            raise ValueError("source_margin must be greater than one")
         self.name = str(name)
         if not self.name:
             raise ValueError("name must be non-empty")
@@ -299,47 +308,126 @@ class ExpandingPhotosphereSource:
         self.wavelengths_angstrom = wavelengths
         self.band_names = bands
 
-        self.hubble_km_s_mpc = self._positive(
-            hubble_km_s_mpc,
-            "hubble_km_s_mpc",
+        self._luminosity_distance_override = (
+            None
+            if luminosity_distance_m is None
+            else self._positive(luminosity_distance_m, "luminosity_distance_m")
         )
-        self.omega_matter = self._nonnegative(omega_matter, "omega_matter")
-        self.omega_lambda = self._nonnegative(omega_lambda, "omega_lambda")
-        if luminosity_distance_m is None:
-            self.luminosity_distance_m = self._luminosity_distance_m()
-            self.distance_source = "flat_lcdm"
-        else:
-            self.luminosity_distance_m = self._positive(
-                luminosity_distance_m,
-                "luminosity_distance_m",
+        self._radius_override = (
+            None
+            if maximum_photosphere_radius_m is None
+            else self._positive(
+                maximum_photosphere_radius_m, "maximum_photosphere_radius_m"
             )
-            self.distance_source = "user"
+        )
+        self.geometry = None
+        self.maximum_photosphere_radius_m = self._radius_override
+        self.maximum_radius_source = (
+            "user" if self._radius_override is not None else "sampled_evolution"
+        )
+        self.luminosity_distance_m = self._luminosity_distance_override
+        self.distance_source = (
+            "user" if self._luminosity_distance_override is not None else "unresolved"
+        )
+        self._coordinate_cache = {}
+        if self.source_redshift is not None:
+            self._initialize_geometry(
+                _resolve_source_distances(
+                    None,
+                    source_redshift=self.source_redshift,
+                    H0=H0,
+                    Om0=Om0,
+                )
+            )
 
-        if maximum_photosphere_radius_m is None:
-            maximum_radius = self._sample_maximum_radius()
-            self.maximum_radius_source = "sampled_evolution"
-        else:
-            maximum_radius = self._positive(
-                maximum_photosphere_radius_m,
-                "maximum_photosphere_radius_m",
+    @property
+    def redshift(self) -> float:
+        """Resolved source redshift used for rest-frame evolution."""
+        if self.source_redshift is None:
+            raise ValueError(
+                "resolve this supernova through a system or pixelate(source_redshift=...) first"
             )
-            self.maximum_radius_source = "user"
-        self.maximum_photosphere_radius_m = maximum_radius
+        return self.source_redshift
+
+    def _initialize_geometry(self, distances):
+        if distances.source_redshift is None:
+            raise ValueError("supernova evolution requires a source redshift")
+        self.source_redshift = float(distances.source_redshift)
+        self.luminosity_distance_m = (
+            self._luminosity_distance_override
+            if self._luminosity_distance_override is not None
+            else distances.source_m * (1 + self.redshift) ** 2
+        )
+        self.distance_source = (
+            "user"
+            if self._luminosity_distance_override is not None
+            else "source_geometry"
+        )
+        self.maximum_photosphere_radius_m = (
+            self._sample_maximum_radius()
+            if self._radius_override is None
+            else self._radius_override
+        )
+        self.maximum_radius_source = (
+            "sampled_evolution" if self._radius_override is None else "user"
+        )
         pixel_scale = (
-            2.0
-            * maximum_radius
-            * self.source_fov_margin
+            2
+            * self.maximum_photosphere_radius_m
+            * self.source_margin
             / self.source_grid_shape
         )
         self.geometry = SourceGeometry(
-            shape=(self.source_grid_shape, self.source_grid_shape),
-            pixel_scale_m=(pixel_scale, pixel_scale),
-            wavelengths_angstrom=wavelengths,
-            band_names=bands,
+            self.source_grid_shape,
+            (pixel_scale, pixel_scale),
+            self.wavelengths_angstrom,
+            self.band_names,
         )
-        self._coordinate_cache: dict[
-            tuple[str, torch.dtype], tuple[torch.Tensor, torch.Tensor]
-        ] = {}
+        self._coordinate_cache = {}
+
+    def pixelate(
+        self,
+        distances=None,
+        *,
+        source_redshift=None,
+        H0=None,
+        Om0=None,
+        grid=None,
+        policy=None,
+        runtime=None,
+    ):
+        """Resolve a supernova using system distances or source-only cosmology.
+
+        The evolution horizon fixes the field size, independently of a later
+        light-curve duration. An explicit luminosity distance remains supported.
+        The original source specification is never mutated by a system.
+        """
+        if policy is not None:
+            raise ValueError("set source_grid_shape and source_margin on the supernova")
+        resolved = _resolve_source_distances(
+            distances,
+            source_redshift=source_redshift,
+            model_redshift=self.source_redshift,
+            H0=(self._H0 if H0 is None else H0) if distances is None else H0,
+            Om0=(self._Om0 if Om0 is None else Om0) if distances is None else Om0,
+            runtime=runtime,
+        )
+        result = copy(self)
+        result._initialize_geometry(resolved)
+        native = _geometry_grid(result.geometry, resolved)
+        if grid is not None and any(
+            a > b * (1 + 1e-6)
+            for a, b in zip(
+                native.field_of_view_uas, grid.field_of_view_uas, strict=True
+            )
+        ):
+            raise ValueError("source_grid does not enclose the supernova source field")
+        return result
+
+    def recommended_grid(self, distances, policy=None):
+        """Return the fixed angular field that encloses the expanding source."""
+        source = self.pixelate(distances, policy=policy)
+        return _geometry_grid(source.geometry, distances)
 
     @staticmethod
     def _finite(value: float, name: str) -> float:
@@ -355,13 +443,6 @@ class ExpandingPhotosphereSource:
             raise ValueError(f"{name} must be positive")
         return result
 
-    @classmethod
-    def _nonnegative(cls, value: float, name: str) -> float:
-        result = cls._finite(value, name)
-        if result < 0:
-            raise ValueError(f"{name} must be non-negative")
-        return result
-
     def observer_to_rest_time(self, times_days) -> torch.Tensor:
         """Convert observer epochs to elapsed rest-frame days."""
 
@@ -373,12 +454,14 @@ class ExpandingPhotosphereSource:
 
         ``distances`` is accepted for compatibility with physical source
         models. The expanding source already stores its source-plane radius.
-        The separate ``source_fov_margin`` remains a numerical image margin
+        The separate ``source_margin`` remains a numerical image margin
         and is therefore not part of the emitting support.
         """
 
-        del distances
-        return float(self.maximum_photosphere_radius_m)
+        source = self if distances is None else self.pixelate(distances)
+        if source.geometry is None:
+            raise ValueError("resolve the source geometry before querying its support")
+        return float(source.maximum_photosphere_radius_m)
 
     def _sample_maximum_radius(self) -> float:
         rest_maximum = (self.maximum_observer_time_days - self.explosion_time_days) / (
@@ -391,20 +474,6 @@ class ExpandingPhotosphereSource:
         if not torch.isfinite(radii).all() or torch.any(radii <= 0):
             raise ValueError("evolution radii must be finite and positive")
         return float(radii.max())
-
-    def _luminosity_distance_m(self) -> float:
-        redshift = torch.linspace(0.0, self.redshift, 4097, dtype=torch.float64)
-        omega_curvature = 1.0 - self.omega_matter - self.omega_lambda
-        expansion = torch.sqrt(
-            self.omega_matter * (1.0 + redshift).pow(3)
-            + omega_curvature * (1.0 + redshift).pow(2)
-            + self.omega_lambda
-        )
-        if not torch.isfinite(expansion).all() or torch.any(expansion <= 0):
-            raise ValueError("cosmology produces an invalid expansion history")
-        integral = float(torch.trapezoid(1.0 / expansion, redshift))
-        hubble_si = self.hubble_km_s_mpc * 1_000.0 / _MPC_M
-        return (1.0 + self.redshift) * _C / hubble_si * integral
 
     def _coordinates(
         self,
@@ -421,8 +490,8 @@ class ExpandingPhotosphereSource:
         x = (torch.arange(nx, device=device, dtype=dtype) + 0.5 - nx / 2) * dx
         y = (torch.arange(ny, device=device, dtype=dtype) + 0.5 - ny / 2) * dy
         y, x = torch.meshgrid(y, x, indexing="ij")
-        cosine = math.cos(self.appearance.position_angle_rad)
-        sine = math.sin(self.appearance.position_angle_rad)
+        cosine = math.cos(math.radians(self.appearance.position_angle_deg))
+        sine = math.sin(math.radians(self.appearance.position_angle_deg))
         rotated_x = cosine * x + sine * y
         rotated_y = -sine * x + cosine * y
         self._coordinate_cache[key] = (rotated_x, rotated_y)
@@ -495,7 +564,15 @@ class ExpandingPhotosphereSource:
     ) -> torch.Tensor:
         """Return ``[time, y, x, band]`` brightness in Jy per square meter."""
 
+        if self.geometry is None:
+            raise ValueError(
+                "resolve this source through a system or pixelate(source_redshift=...) before brightness"
+            )
         times = _as_times(times_days)
+        if bool(torch.any(times > self.maximum_observer_time_days)):
+            raise ValueError(
+                "source times exceed maximum_observer_time_days; increase the supernova horizon to size a field that covers them"
+            )
         resolved_device = times.device if device is None else torch.device(device)
         resolved_dtype = dtype or (
             times.dtype if times.is_floating_point() else torch.get_default_dtype()
@@ -632,12 +709,12 @@ class ExpandingPhotosphereSource:
             "type": "expanding_photosphere",
             "name": self.name,
             "brightness_units": "Jy m^-2 projected source plane",
-            "redshift": self.redshift,
+            "redshift": self.source_redshift,
             "explosion_time_observer_days": self.explosion_time_days,
             "maximum_observer_time_days": self.maximum_observer_time_days,
             "maximum_photosphere_radius_m": self.maximum_photosphere_radius_m,
             "maximum_radius_source": self.maximum_radius_source,
-            "source_fov_margin": self.source_fov_margin,
+            "source_margin": self.source_margin,
             "source_grid_shape": self.source_grid_shape,
             "luminosity_distance_m": self.luminosity_distance_m,
             "distance_source": self.distance_source,
@@ -678,7 +755,7 @@ def paper_type_ia_supernova_source(
     )
     appearance = PhotosphereAppearance(
         axis_ratio=0.9,
-        position_angle_rad=math.radians(25.0),
+        position_angle_deg=25.0,
         limb_darkening=0.5,
         achromatic_phase_rest_days=21.0,
         chromatic_transition_rest_days=7.0,
@@ -688,14 +765,16 @@ def paper_type_ia_supernova_source(
         uv_blanketing_tau_late=1.0,
     )
     return ExpandingPhotosphereSource(
-        redshift=redshift,
+        source_redshift=redshift,
+        H0=70.0,
+        Om0=0.3,
         wavelengths_angstrom=wavelengths_angstrom,
         maximum_observer_time_days=maximum_observer_time_days,
         evolution=evolution,
         band_names=band_names,
         source_grid_shape=source_grid_shape,
         explosion_time_days=explosion_time_days,
-        source_fov_margin=1.05,
+        source_margin=1.05,
         appearance=appearance,
         luminosity_distance_m=luminosity_distance_m,
         name="paper_type_ia_prototype",

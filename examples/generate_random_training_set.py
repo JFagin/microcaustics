@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import multiprocessing as mp
 import os
-import secrets
 from pathlib import Path
 
 import torch
@@ -72,8 +71,14 @@ def _worker(
         first_system, map_times, flux_times, rays=args.rays
     )
     saved = save_example(
-        output, first_index, first_result, first_centers, first_system.source,
-        first_system.metadata, runtime_seconds=first_elapsed, worker=worker,
+        output,
+        first_index,
+        first_result,
+        first_centers,
+        first_system.source,
+        first_system.metadata,
+        runtime_seconds=first_elapsed,
+        worker=worker,
     )
     print(
         f"[worker {worker} {device}] {saved.name}: {first_elapsed:.3f} s "
@@ -111,8 +116,14 @@ def _worker(
                 "curve_batch_oom_reductions": batch_report.oom_reductions,
             }
             saved = save_example(
-                output, index, result, centers, system.source, metadata,
-                runtime_seconds=elapsed, worker=worker,
+                output,
+                index,
+                result,
+                centers,
+                system.source,
+                metadata,
+                runtime_seconds=elapsed,
+                worker=worker,
             )
             print(
                 f"[worker {worker} {device}] {saved.name}: {elapsed:.3f} s "
@@ -130,11 +141,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
-        help=(
-            "base seed for exact reproducibility. When omitted, draw and print "
-            "a fresh base seed that is also stored with every example"
-        ),
+        default=0,
+        help="reproducible base seed (default 0); example indices select new realizations",
     )
     parser.add_argument("--days", type=float, default=3650.0)
     parser.add_argument("--epochs", type=int, default=147)
@@ -167,11 +175,7 @@ def main() -> None:
     """Launch normal spawned workers without an external distributed runner."""
 
     args = _parse_args()
-    if args.seed is None:
-        args.seed = secrets.randbelow(2**63 - args.count)
-        print(f"No --seed supplied. Sampled reproducible base_seed={args.seed}")
-    else:
-        print(f"Using explicit reproducible base_seed={args.seed}")
+    print(f"Using reproducible base_seed={args.seed}")
     if args.device == "cpu" or not torch.cuda.is_available():
         devices = ("cpu",)
     else:
@@ -180,8 +184,7 @@ def main() -> None:
             raise RuntimeError("no CUDA devices were selected")
         devices = tuple(f"cuda:{index}" for index in gpu_ids)
     shards = tuple(
-        tuple(range(worker, args.count, len(devices)))
-        for worker in range(len(devices))
+        tuple(range(worker, args.count, len(devices))) for worker in range(len(devices))
     )
     print(f"devices={devices}, shard_sizes={tuple(map(len, shards))}")
     if len(devices) == 1:

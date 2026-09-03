@@ -15,15 +15,20 @@ class _FakeRealization:
     def __init__(self, value: float) -> None:
         runtime = SimpleNamespace(device=torch.device("cpu"))
         self.simulation = SimpleNamespace(runtime=runtime)
+        self.source = None
         self.value = float(value)
 
     def light_curve(self, times, **_kwargs):
         count = len(tuple(times))
-        return SimpleNamespace(flux=torch.full((count, 1), self.value))
+        return mc.LightCurve(
+            torch.as_tensor(times), torch.full((count, 1), self.value), ("g",)
+        )
 
     def multirate_light_curve(self, _map_times, flux_times, **_kwargs):
         count = len(tuple(flux_times))
-        return SimpleNamespace(flux=torch.full((count, 1), self.value))
+        return mc.LightCurve(
+            torch.as_tensor(flux_times), torch.full((count, 1), self.value), ("g",)
+        )
 
 
 class IndependentLightCurveBatchTests(unittest.TestCase):

@@ -16,7 +16,15 @@ import numpy as np
 import torch
 
 from .geometry import PlaneGrid
-from .results import LightCurve, MagnificationMap
+from .results import LightCurve, LightCurveLabels, MagnificationMap
+
+_LABEL_ARRAYS = (
+    "times_days",
+    "crossing_labels",
+    "crossing_events",
+    "center_distances_uas",
+    "center_distance_censored",
+)
 
 
 def _json_text(metadata) -> str:
@@ -73,6 +81,8 @@ def save_light_curve(light_curve: LightCurve, path: str | Path) -> Path:
 
     Retained maps are separate products and can be saved with
     :func:`save_magnification_map`. This keeps light-curve archives compact.
+    Source-center label arrays and their independent time axis are preserved.
+    Full caustic geometry is not serialized and loads as ``labels.caustics=None``.
     """
 
     destination = Path(path)
@@ -84,12 +94,25 @@ def save_light_curve(light_curve: LightCurve, path: str | Path) -> Path:
     )
     np.savez_compressed(
         destination,
+        schema_version=np.asarray(2),
+        has_labels=np.asarray(light_curve.labels is not None),
         times_days=light_curve.times_days.detach().cpu().numpy(),
         flux=light_curve.flux.detach().cpu().numpy(),
         unlensed_flux=unlensed,
         has_unlensed=np.asarray(light_curve.unlensed_flux is not None),
         band_names=np.asarray(light_curve.band_names),
         metadata_json=np.asarray(_json_text(light_curve.metadata)),
+        **(
+            {
+                f"labels_{name}": getattr(light_curve.labels, name)
+                .detach()
+                .cpu()
+                .numpy()
+                for name in _LABEL_ARRAYS
+            }
+            if light_curve.labels is not None
+            else {}
+        ),
     )
     return destination
 
@@ -97,9 +120,28 @@ def save_light_curve(light_curve: LightCurve, path: str | Path) -> Path:
 def load_light_curve(
     path: str | Path, *, device: str | torch.device = "cpu"
 ) -> LightCurve:
-    """Load a light curve saved by :func:`save_light_curve`."""
+    """Load photometry and optional center labels onto the requested device.
+
+    Older photometry-only archives remain readable. Retained maps and full
+    caustic geometry are separate products, not reconstructed from label arrays.
+    """
 
     with np.load(Path(path), allow_pickle=False) as stored:
+        if int(stored.get("schema_version", 1)) not in (1, 2):
+            raise ValueError("unsupported light-curve archive schema_version")
+        labels = None
+        if bool(stored.get("has_labels", False)):
+            missing = [name for name in _LABEL_ARRAYS if f"labels_{name}" not in stored]
+            if missing:
+                raise ValueError(
+                    f"light-curve archive is missing label arrays {missing}"
+                )
+            labels = LightCurveLabels(
+                **{
+                    name: torch.from_numpy(stored[f"labels_{name}"].copy()).to(device)
+                    for name in _LABEL_ARRAYS
+                }
+            )
         unlensed = None
         if bool(stored["has_unlensed"]):
             unlensed = torch.from_numpy(stored["unlensed_flux"].copy()).to(device)
@@ -109,4 +151,5 @@ def load_light_curve(
             band_names=tuple(str(value) for value in stored["band_names"]),
             unlensed_flux=unlensed,
             metadata=json.loads(str(stored["metadata_json"])),
+            labels=labels,
         )

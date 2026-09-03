@@ -51,7 +51,6 @@ nav:
       - Relativistic sources: relativistic_sources.md
       - Multi-image systems: multi_image.md
       - Macro-image rendering: macro_image_rendering.md
-      - caustics interoperability: caustics_interoperability.md
       - Plotting: plotting.md
   - Development:
       - Design: design.md

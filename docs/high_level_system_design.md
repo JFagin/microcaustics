@@ -49,12 +49,17 @@ low-level objects directly.
 The Salpeter convenience constructor is
 
 ```python
+import microcaustics as mc
+
 population = mc.StellarPopulation.salpeter(
     mean_mass_solar=0.3,
     mass_ratio=100,
-    kinematics=mc.IsotropicKinematics(
-        dispersion_km_s=180,
-        bulk_velocity_km_s=(0, 0),
+    kinematics=mc.SkyProjectedKinematics(
+        ra_deg=340.126125,
+        dec_deg=3.358611,
+        stellar_dispersion_km_s=170,
+        peculiar_velocity_dispersion_km_s=235,
+        include_cmb_dipole=True,
     ),
 )
 ```
@@ -73,11 +78,16 @@ controlled experiments.
 Physical kinematics are resolved into the observer-frame angular velocities
 already stored by `PointMassField`.
 
-`IsotropicKinematics` accepts a one-dimensional proper velocity dispersion
-and an optional Cartesian bulk velocity in km/s. Both are converted with the
-lens angular-diameter distance and observer-frame time dilation. The derived
-stellar aperture includes both the requested bulk drift and a configurable
-multiple of the random dispersion over the simulated duration.
+`SkyProjectedKinematics` is the physical default demonstrated in the guides.
+It includes the projected CMB dipole, lens and source peculiar velocities,
+and a one-dimensional stellar proper-velocity dispersion. The derived stellar
+aperture includes the resulting bulk drift and a configurable multiple of the
+random dispersion over the simulated duration.
+
+`IsotropicKinematics` accepts a one-dimensional dispersion and one already
+combined Cartesian bulk velocity. It is useful for controlled studies, but a
+dynamic system warns because it cannot verify the separate CMB, lens, and
+source contributions.
 
 The built-in models currently include the following.
 
@@ -104,6 +114,11 @@ pixelated source without finite support must provide an explicit source grid.
 A physical source is optional. A centered square source-independent map uses
 `map_width_uas` and `map_pixels` on the map method. `PlaneGrid` remains the
 advanced interface for rectangular or off-center fields.
+
+The same width and pixel arguments are accepted by `summary()` and
+`metadata()`. After exactly one source-independent geometry has been used,
+both inspection methods select it automatically. When several geometries have
+been used, pass the two arguments explicitly to remove any ambiguity.
 
 Direct point-lens catalogs use positions in microarcseconds and masses in
 solar masses. Their angular Einstein radii are derived from the system
@@ -169,6 +184,14 @@ truncated experiments.
 The recommended observational interface is
 
 ```python
+macro = mc.MacroLens(convergence=0.391, shear=0.391)
+source_model = mc.GaussianModel(
+    sigma_uas=(0.05, 0.08),
+    bands_angstrom={"g": 4770.0, "i": 7625.0},
+    total_flux=(20e-6, 15e-6),
+    source_grid_shape=256,
+)
+runtime = mc.RuntimeConfig(device="auto", backend="auto")
 system = mc.MicrolensingSystem(
     lens_redshift=0.0395,
     source_redshift=1.695,
@@ -178,8 +201,9 @@ system = mc.MicrolensingSystem(
     source=source_model,
     stellar_population=population,
     duration_days=3650,
-    seed=1001,
+    seed=0,
     runtime=runtime,
+    caustic_grid_shape=256,
 )
 ```
 
@@ -193,8 +217,9 @@ system.stellar_aperture
 system.metadata()
 ```
 
-Use `system.with_seed(new_seed)` to create an independent stellar realization
-without repeating the physical setup. Compatible compiled kernels are reused.
+Use `system.with_seed(new_seed)` to create an independent stellar realization.
+Its physical setup is recalculated when needed, while compatible compiled
+kernels are reused.
 
 Advanced integrations can use `system.realization` to access the underlying
 low-level simulation and every derived object together.
@@ -202,19 +227,39 @@ low-level simulation and every derived object together.
 Convenience methods delegate to the existing numerical implementation.
 
 ```python
-system.magnification_map(...)
-system.dynamic_maps(...)
-system.light_curve(...)
-system.light_curve_with_labels(...)
-system.dynamic_labeled_maps(...)
-system.transfer_functions(...)
+static_map = system.magnification_map(rays=262_144)
+dynamic_maps = tuple(system.dynamic_maps((0.0, 25.0), rays=262_144))
+curve = system.light_curve(
+    duration_days=25.0,
+    map_cadence_days=25.0,
+    source_cadence_days=1.0,
+    rays=262_144,
+)
+labeled_curve = system.light_curve(
+    duration_days=25.0,
+    map_cadence_days=25.0,
+    include_labels=True,
+    rays=262_144,
+)
+labeled_maps = tuple(
+    system.dynamic_labeled_maps((0.0, 25.0), rays=262_144)
+)
 ```
+
+Sources with response-delay maps additionally support steady and microlensed
+transfer functions as described in the relativistic-source guide.
 
 The high-level layer performs setup once and adds no per-frame numerical work.
 Use `keep_maps_at_days=(...)` on a light-curve call to return a small selected
 set of maps directly. Streaming observers remain available when every frame
 must be exported. `system.warmup_light_curve(...)` performs and returns a representative
 call so compatible compiled kernels can be reused explicitly.
+
+The light-curve call also accepts `temporal_batch_size`, `scout_refresh_frames`,
+`rays`, and an independent `source_cadence_days`. It returns apparent AB
+`magnitude`, original Jy `flux`, and optional `labels` with their own time axis.
+Retained maps use integer indices. `result.maps[0]` corresponds to
+`result.map_times_days[0]`. Unavailable retention requests warn and are omitted.
 
 ## Numerical settings
 

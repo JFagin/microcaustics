@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -11,6 +12,7 @@ import torch
 
 from ..geometry import PlaneGrid
 from ..lens import LensingDistances
+from ..lens.models import _source_distances_from_redshift
 from ..relativity import (
     ObserverScreen,
     add_observer_coordinates,
@@ -43,9 +45,7 @@ def _resolve_bands(
     names = tuple(str(value) for value in band_names)
     if bands_angstrom is not None:
         mapped_names = tuple(str(name) for name in bands_angstrom)
-        mapped_wavelengths = tuple(
-            float(value) for value in bands_angstrom.values()
-        )
+        mapped_wavelengths = tuple(float(value) for value in bands_angstrom.values())
         if (wavelengths or names) and (
             names != mapped_names or wavelengths != mapped_wavelengths
         ):
@@ -72,7 +72,11 @@ def _resolve_sampling(
 ) -> SourceGridConfig:
     """Apply convenient scalar sampling overrides to a grid policy."""
 
-    if source_grid_shape is None and enclosed_flux_fraction is None and source_margin is None:
+    if (
+        source_grid_shape is None
+        and enclosed_flux_fraction is None
+        and source_margin is None
+    ):
         return grid
     return replace(
         grid,
@@ -141,6 +145,69 @@ class PhysicalSourceModel(Protocol):
         """Materialize this physical model on one angular grid."""
 
         ...
+
+
+def _pixelate_source(source, distances, *, grid=None, policy=None, runtime=None):
+    """Resolve a model once while accepting portable third-party pixelizers."""
+    if not isinstance(source, PhysicalSourceModel):
+        return source
+    parameters = inspect.signature(source.pixelate).parameters.values()
+    accepts_runtime = any(
+        item.name == "runtime" or item.kind is inspect.Parameter.VAR_KEYWORD
+        for item in parameters
+    )
+    return source.pixelate(
+        distances,
+        grid=grid,
+        **({"policy": policy} if policy is not None else {}),
+        **({"runtime": runtime} if accepts_runtime else {}),
+    )
+
+
+def _resolve_source_distances(
+    distances,
+    *,
+    source_redshift=None,
+    model_redshift=None,
+    H0=None,
+    Om0=None,
+    runtime=None,
+):
+    """Bind cosmology once, accepting either system geometry or source-only inputs."""
+    if distances is not None:
+        if source_redshift is not None or H0 is not None or Om0 is not None:
+            raise ValueError("supply distances or source_redshift/H0/Om0, not both")
+        if (
+            model_redshift is not None
+            and distances.source_redshift is not None
+            and not math.isclose(
+                float(model_redshift), float(distances.source_redshift), rel_tol=1e-7
+            )
+        ):
+            raise ValueError(
+                "source redshift differs from the system's source redshift"
+            )
+        return distances
+    if source_redshift is None:
+        source_redshift = model_redshift
+    elif model_redshift is not None and not math.isclose(
+        float(source_redshift), float(model_redshift), rel_tol=1e-7
+    ):
+        raise ValueError("source_redshift conflicts with the source model")
+    if source_redshift is None:
+        raise ValueError(
+            "supply source_redshift for a standalone source, or pass the model to a MicrolensingSystem"
+        )
+    resolved = (
+        runtime if isinstance(runtime, ResolvedRuntime) else resolve_runtime(runtime)
+    )
+    return _source_distances_from_redshift(
+        source_redshift,
+        H0=67.66 if H0 is None else H0,
+        Om0=0.30966 if Om0 is None else Om0,
+        device=resolved.device,
+        dtype=resolved.dtype,
+    )
 
 
 @dataclass(frozen=True)
@@ -265,15 +332,30 @@ class ThinDiskModel:
 
     def pixelate(
         self,
-        distances: LensingDistances,
+        distances: LensingDistances | None = None,
         *,
+        source_redshift: float | None = None,
+        H0: float | None = None,
+        Om0: float | None = None,
         grid: PlaneGrid | None = None,
         policy: SourceGridConfig | None = None,
         runtime: RuntimeConfig | ResolvedRuntime | None = None,
     ) -> ThinDiskSource:
-        """Materialize the disk using the existing validated source class."""
+        """Materialize the disk using the validated source calculation.
 
-        del runtime
+        Standalone callers supply ``source_redshift``, ``H0`` and ``Om0``.
+        A system instead passes its existing ``distances``. These alternatives
+        are mutually exclusive. ``grid`` overrides only the pixelization.
+        """
+
+        distances = _resolve_source_distances(
+            distances,
+            source_redshift=source_redshift,
+            model_redshift=self.source_redshift,
+            H0=H0,
+            Om0=Om0,
+            runtime=runtime,
+        )
 
         resolved_grid = (
             self.recommended_grid(distances, policy) if grid is None else grid
@@ -348,6 +430,9 @@ class KerrDiskModel:
     name: str = "kerr_thin_disk"
 
     def __post_init__(self) -> None:
+        from .variability import _validate_source_driver
+
+        _validate_source_driver(self)
         wavelengths, names = _resolve_bands(
             self.wavelengths_angstrom,
             self.band_names,
@@ -451,13 +536,31 @@ class KerrDiskModel:
 
     def pixelate(
         self,
-        distances: LensingDistances,
+        distances: LensingDistances | None = None,
         *,
+        source_redshift: float | None = None,
+        H0: float | None = None,
+        Om0: float | None = None,
         grid: PlaneGrid | None = None,
         policy: SourceGridConfig | None = None,
         runtime: RuntimeConfig | ResolvedRuntime | None = None,
     ) -> TransferredThinDiskSource | ThermalReprocessingSource:
-        """Trace and materialize the full-Kerr source on one angular grid."""
+        """Trace and materialize the full-Kerr source on one angular grid.
+
+        Use ``source_redshift`` with optional ``H0`` and ``Om0`` without a
+        lens. Systems pass their existing ``distances`` instead. ``runtime``
+        controls device, dtype and compilation as in microlensing calls.
+        Resolved angular extent is retained in the transfer metadata for plots.
+        """
+
+        distances = _resolve_source_distances(
+            distances,
+            source_redshift=source_redshift,
+            model_redshift=self.source_redshift,
+            H0=H0,
+            Om0=Om0,
+            runtime=runtime,
+        )
 
         resolved_grid = (
             self.recommended_grid(distances, policy) if grid is None else grid
@@ -494,6 +597,18 @@ class KerrDiskModel:
                 self.compile_solver and resolved_runtime.device.type == "cuda"
             ),
             repair_max_passes=self.primary_repair_max_passes,
+        )
+        # Keep the resolved angular field with standalone GR products so
+        # plotting does not require rebuilding cosmological geometry.
+        primary = replace(
+            primary,
+            transfer=replace(
+                primary.transfer,
+                metadata={
+                    **primary.transfer.metadata,
+                    "source_field_of_view_uas": tuple(resolved_grid.field_of_view_uas),
+                },
+            ),
         )
         pixel_scale_m = distances.uas_to_source_length(
             resolved_grid.pixel_scale_uas,
@@ -558,64 +673,32 @@ class KerrDiskModel:
 class GaussianModel:
     """A physical elliptical Gaussian without a predetermined pixel grid.
 
-    ``sigma_m`` may contain one major-axis width per band. The widest band
+    Supply ``sigma_uas`` or ``sigma_m``, with one major-axis width per band
+    or a shared scalar. Angular parameters are resolved by the system. The widest band
     defines the common field. The optional central hole changes the brightness
     profile but not the conservative outer support calculation. ``total_flux``
     is the observed integrated spectral flux density in Jy, either shared by
     all bands or specified once per band.
     """
 
-    sigma_m: float | tuple[float, ...]
+    sigma_m: float | tuple[float, ...] | None = None
     wavelengths_angstrom: tuple[float, ...] = ()
     band_names: tuple[str, ...] = ()
     bands_angstrom: Mapping[str, float] | None = None
     total_flux: float | tuple[float, ...] = 1.0
     axis_ratio: float = 1.0
-    position_angle_rad: float = 0.0
-    center_m: tuple[float, float] = (0.0, 0.0)
-    hole_radius_m: float = 0.0
+    position_angle_deg: float = 0.0
+    center_m: tuple[float, float] | None = None
+    hole_radius_m: float | None = None
     hole_power: float = 4.0
     grid: SourceGridConfig = SourceGridConfig()
     source_grid_shape: int | tuple[int, int] | None = None
     enclosed_flux_fraction: float | None = None
     source_margin: float | None = None
     name: str = "gaussian"
-
-    @classmethod
-    def from_angular(
-        cls,
-        distances: LensingDistances,
-        *,
-        sigma_uas: float | tuple[float, ...],
-        bands_angstrom: Mapping[str, float] | None = None,
-        wavelengths_angstrom: tuple[float, ...] = (),
-        band_names: tuple[str, ...] = (),
-        center_uas: tuple[float, float] = (0.0, 0.0),
-        **kwargs,
-    ) -> GaussianModel:
-        """Construct a Gaussian from angular widths in microarcseconds.
-
-        This convenience avoids manual angular-to-physical conversions in
-        observational workflows. The stored source remains physical and can
-        be inspected through the ordinary ``sigma_m`` and ``center_m`` fields.
-        """
-
-        widths = torch.as_tensor(sigma_uas, dtype=torch.float64)
-        centers = torch.as_tensor(center_uas, dtype=torch.float64)
-        width_m = distances.uas_to_source_length(widths, dtype=torch.float64)
-        center_m = distances.uas_to_source_length(centers, dtype=torch.float64)
-        return cls(
-            sigma_m=(
-                float(width_m)
-                if width_m.ndim == 0
-                else tuple(float(value) for value in width_m.reshape(-1))
-            ),
-            bands_angstrom=bands_angstrom,
-            wavelengths_angstrom=wavelengths_angstrom,
-            band_names=band_names,
-            center_m=tuple(float(value) for value in center_m.reshape(-1)),
-            **kwargs,
-        )
+    sigma_uas: float | tuple[float, ...] | None = None
+    center_uas: tuple[float, float] | None = None
+    hole_radius_uas: float | None = None
 
     def __post_init__(self) -> None:
         wavelengths, names = _resolve_bands(
@@ -635,15 +718,22 @@ class GaussianModel:
                 source_margin=self.source_margin,
             ),
         )
+        if (self.sigma_m is None) == (self.sigma_uas is None):
+            raise ValueError("supply exactly one of sigma_uas or sigma_m")
+        width = self.sigma_m if self.sigma_uas is None else self.sigma_uas
         widths = (
-            (float(self.sigma_m),)
-            if isinstance(self.sigma_m, (int, float))
-            else tuple(float(value) for value in self.sigma_m)
+            (float(width),)
+            if isinstance(width, (int, float))
+            else tuple(float(value) for value in width)
         )
-        if not widths or any(value <= 0.0 for value in widths):
-            raise ValueError("sigma_m must be positive")
+        if not widths or any(
+            not math.isfinite(value) or value <= 0.0 for value in widths
+        ):
+            raise ValueError("Gaussian widths must be finite and positive")
         if len(widths) not in (1, len(self.band_names)):
-            raise ValueError("sigma_m must be scalar or contain one value per band")
+            raise ValueError(
+                "Gaussian widths must be scalar or contain one value per band"
+            )
         if not 0.0 < self.axis_ratio <= 1.0:
             raise ValueError("axis_ratio must lie in (0, 1]")
         if len(self.wavelengths_angstrom) != len(self.band_names):
@@ -652,12 +742,53 @@ class GaussianModel:
             raise ValueError("band names must be non-empty and unique")
         if any(value <= 0.0 for value in self.wavelengths_angstrom):
             raise ValueError("wavelengths must be positive")
-        if len(self.center_m) != 2:
-            raise ValueError("center_m must contain x and y")
-        if self.hole_radius_m < 0.0:
-            raise ValueError("hole_radius_m must be non-negative")
+        if not math.isfinite(self.position_angle_deg):
+            raise ValueError("position_angle_deg must be finite")
+        if self.center_m is not None and self.center_uas is not None:
+            raise ValueError("supply center_uas or center_m, not both")
+        if self.hole_radius_m is not None and self.hole_radius_uas is not None:
+            raise ValueError("supply hole_radius_uas or hole_radius_m, not both")
+        for name in ("center_m", "center_uas"):
+            center = getattr(self, name)
+            if center is not None and (
+                len(center) != 2 or any(not math.isfinite(v) for v in center)
+            ):
+                raise ValueError(f"{name} must contain finite x and y coordinates")
+        for name in ("hole_radius_m", "hole_radius_uas"):
+            radius = getattr(self, name)
+            if radius is not None and (not math.isfinite(radius) or radius < 0):
+                raise ValueError(f"{name} must be finite and non-negative")
         if self.hole_power <= 0.0:
             raise ValueError("hole_power must be positive")
+
+    def _physical_parameters(self, distances):
+        """Convert angular inputs during setup without changing this model."""
+        widths = self.sigma_m
+        if widths is None:
+            converted = distances.uas_to_source_length(
+                self.sigma_uas, dtype=torch.float64
+            )
+            widths = (
+                float(converted)
+                if converted.ndim == 0
+                else tuple(float(v) for v in converted)
+            )
+        center = (0.0, 0.0) if self.center_m is None else self.center_m
+        if self.center_uas is not None:
+            center = tuple(
+                float(v)
+                for v in distances.uas_to_source_length(
+                    self.center_uas, dtype=torch.float64
+                )
+            )
+        hole = 0.0 if self.hole_radius_m is None else self.hole_radius_m
+        if self.hole_radius_uas is not None:
+            hole = float(
+                distances.uas_to_source_length(
+                    self.hole_radius_uas, dtype=torch.float64
+                )
+            )
+        return widths, center, hole
 
     def support_radius_m(
         self,
@@ -666,9 +797,10 @@ class GaussianModel:
     ) -> float:
         """Return the major-axis radius enclosing the requested Gaussian flux."""
 
-        del distances
         resolved = self.grid if policy is None else policy
-        widths = torch.as_tensor(self.sigma_m, dtype=torch.float64).reshape(-1)
+        widths = torch.as_tensor(
+            self._physical_parameters(distances)[0], dtype=torch.float64
+        ).reshape(-1)
         quantile = math.sqrt(-2.0 * math.log1p(-resolved.enclosed_flux_fraction))
         return float(widths.max()) * quantile * resolved.margin
 
@@ -681,12 +813,13 @@ class GaussianModel:
 
         resolved = self.grid if policy is None else policy
         radius = self.support_radius_m(distances, resolved)
-        cosine = math.cos(self.position_angle_rad)
-        sine = math.sin(self.position_angle_rad)
+        cosine = math.cos(math.radians(self.position_angle_deg))
+        sine = math.sin(math.radians(self.position_angle_deg))
         half_x = math.hypot(radius * cosine, radius * self.axis_ratio * sine)
         half_y = math.hypot(radius * sine, radius * self.axis_ratio * cosine)
-        half_x += abs(float(self.center_m[0]))
-        half_y += abs(float(self.center_m[1]))
+        center = self._physical_parameters(distances)[1]
+        half_x += abs(float(center[0]))
+        half_y += abs(float(center[1]))
         fov_uas = distances.source_length_to_uas(
             (2.0 * half_y, 2.0 * half_x),
             dtype=torch.float64,
@@ -698,15 +831,30 @@ class GaussianModel:
 
     def pixelate(
         self,
-        distances: LensingDistances,
+        distances: LensingDistances | None = None,
         *,
+        source_redshift: float | None = None,
+        H0: float | None = None,
+        Om0: float | None = None,
         grid: PlaneGrid | None = None,
         policy: SourceGridConfig | None = None,
         runtime: RuntimeConfig | ResolvedRuntime | None = None,
     ) -> GaussianSource:
-        """Materialize the analytic profile on an angular source grid."""
+        """Materialize the analytic profile on an angular source grid.
 
-        del runtime
+        Pass either system ``distances`` or standalone ``source_redshift``
+        with optional ``H0`` and ``Om0``. No lens parameters are needed for
+        source-only evaluation. Angular inputs are resolved once at setup.
+        """
+
+        distances = _resolve_source_distances(
+            distances,
+            source_redshift=source_redshift,
+            model_redshift=None,
+            H0=H0,
+            Om0=Om0,
+            runtime=runtime,
+        )
 
         resolved_grid = (
             self.recommended_grid(distances, policy) if grid is None else grid
@@ -722,14 +870,15 @@ class GaussianModel:
             wavelengths_angstrom=tuple(float(v) for v in self.wavelengths_angstrom),
             band_names=tuple(self.band_names),
         )
+        widths, center, hole = self._physical_parameters(distances)
         return GaussianSource(
             geometry=geometry,
-            sigma_m=self.sigma_m,
+            sigma_m=widths,
             total_flux=self.total_flux,
             axis_ratio=self.axis_ratio,
-            position_angle_rad=self.position_angle_rad,
-            center_m=self.center_m,
-            hole_radius_m=self.hole_radius_m,
+            position_angle_rad=math.radians(self.position_angle_deg),
+            center_m=center,
+            hole_radius_m=hole,
             hole_power=self.hole_power,
             name=self.name,
         )

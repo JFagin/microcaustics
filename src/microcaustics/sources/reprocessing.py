@@ -471,5 +471,5 @@ class ThermalReprocessingSource:
             "brightness_units": "Jy m^-2 projected source plane",
             "response_semantics": "additive T^4 per unit driver",
             "heating": dict(self.heating_metadata or {}),
-            "is_time_static": False,
+            "is_time_static": bool(self.is_time_static),
         }

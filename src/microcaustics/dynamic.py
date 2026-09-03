@@ -512,10 +512,7 @@ class DynamicMapScheduler:
         coverage.
         """
 
-        from .solvers.far_field import (
-            TaylorFarFieldApproximation,
-            temporal_taylor_far_field_window,
-        )
+        from .solvers.far_field import temporal_taylor_far_field_window
         from .solvers.ipm import _source_scout_cells, dual_scout_scalar_correction
 
         assert isinstance(self.method, IPMConfig)
@@ -553,60 +550,76 @@ class DynamicMapScheduler:
                 # the union of those independently selected cells.
                 scout_anchor_indices = list(real_indices)
             scout_anchor_indices = sorted(set(scout_anchor_indices))
+            requested_far_field_indices = sorted(
+                set(real_indices) | set(scout_anchor_indices)
+            )
             if self.method.far_field_approx.enabled:
-                far_fields, temporal_far_field_metadata = temporal_taylor_far_field_window(
+                requested_far_fields, temporal_far_field_metadata = temporal_taylor_far_field_window(
                     self.simulation,
                     self.lens_region,
                     self.method.far_field_approx,
                     self.times,
-                    real_indices,
+                    requested_far_field_indices,
+                )
+                far_field_by_index = dict(
+                    zip(
+                        requested_far_field_indices,
+                        requested_far_fields,
+                        strict=True,
+                    )
+                )
+                far_fields = tuple(
+                    far_field_by_index[index] for index in real_indices
                 )
             else:
                 far_fields = (None,) * len(real_indices)
+                far_field_by_index = {
+                    index: None for index in requested_far_field_indices
+                }
                 temporal_far_field_metadata = {
                     "far_field_enabled": False,
                     "far_field_frame_count": 0,
                     "far_field_exact_each_frame": True,
                     "far_field_batched_accumulator": False,
+                    "far_field_batched_local_pack": False,
                 }
-            far_field_by_index = {
-                index: far_fields[index - batch_start] for index in real_indices
-            }
-            for index in scout_anchor_indices:
-                if index not in far_field_by_index:
-                    far_field_by_index[index] = (
-                        TaylorFarFieldApproximation(
-                            self.simulation,
-                            self.lens_region,
-                            self.method.far_field_approx,
-                            time_days=self.times[index],
-                        )
-                        if self.method.far_field_approx.enabled
-                        else None
-                    )
             runtime.synchronize()
             far_fields_prepared = perf_counter()
-            all_cells = []
-            fine_shape = None
-            scout_metadata_rows = []
-            for anchor in scout_anchor_indices:
-                cells, fine_ny, fine_nx, metadata = _source_scout_cells(
-                    self.simulation,
-                    far_field_by_index[anchor],
-                    self.lens_region,
-                    self.source_grid,
-                    self.method,
-                    time_days=self.times[anchor],
+            from .solvers.ipm import _source_scout_union_temporal
+
+            batched_scout = _source_scout_union_temporal(
+                self.simulation,
+                tuple(far_field_by_index[index] for index in scout_anchor_indices),
+                self.lens_region,
+                self.source_grid,
+                self.method,
+            )
+            if batched_scout is not None:
+                endpoint_cells, fine_ny, fine_nx, scout_metadata_rows = (
+                    batched_scout
                 )
-                if fine_shape is None:
-                    fine_shape = (fine_ny, fine_nx)
-                elif fine_shape != (fine_ny, fine_nx):
-                    raise RuntimeError("dynamic scout fine-grid shape changed")
-                all_cells.append(cells)
-                scout_metadata_rows.append(metadata)
-            assert fine_shape is not None
-            fine_ny, fine_nx = fine_shape
-            endpoint_cells = torch.unique(torch.cat(all_cells))
+            else:
+                all_cells = []
+                fine_shape = None
+                scout_metadata_rows = []
+                for anchor in scout_anchor_indices:
+                    cells, fine_ny, fine_nx, metadata = _source_scout_cells(
+                        self.simulation,
+                        far_field_by_index[anchor],
+                        self.lens_region,
+                        self.source_grid,
+                        self.method,
+                        time_days=self.times[anchor],
+                    )
+                    if fine_shape is None:
+                        fine_shape = (fine_ny, fine_nx)
+                    elif fine_shape != (fine_ny, fine_nx):
+                        raise RuntimeError("dynamic scout fine-grid shape changed")
+                    all_cells.append(cells)
+                    scout_metadata_rows.append(metadata)
+                assert fine_shape is not None
+                fine_ny, fine_nx = fine_shape
+                endpoint_cells = torch.unique(torch.cat(all_cells))
             if (
                 self.method.dual_scout_scalar_correction
                 and scalar_correction is None

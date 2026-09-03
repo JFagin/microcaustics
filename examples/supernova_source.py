@@ -17,7 +17,7 @@ evolution = mc.PowerLawExponentialPhotosphere(
     temperature_ceiling_k=16_500.0,
 )
 source = mc.ExpandingPhotosphereSource(
-    redshift=0.65,
+    source_redshift=0.65,
     wavelengths_angstrom=(4_827.0, 6_223.0, 7_546.0),
     band_names=("g", "r", "i"),
     maximum_observer_time_days=180.0,

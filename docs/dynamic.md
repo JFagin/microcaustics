@@ -1,5 +1,33 @@
 # Dynamic-map scheduling
 
+For a physical `MicrolensingSystem`, the usual light-curve call is
+
+```python
+curve = system.light_curve(
+    duration_days=3650,
+    map_cadence_days=25,
+    source_cadence_days=1,
+    rays=10_000_000,
+    temporal_batch_size=30,
+    scout_refresh_frames=10,
+    include_labels=True,
+    keep_maps_at_days=(0.0,),
+)
+
+magnitudes = curve.magnitude       # [photometry epoch, band], apparent AB mag
+labels = curve.labels             # source-center labels at map epochs
+first_map = curve.maps[0]          # first retained map
+```
+
+An optional driver belongs to the source. Omit `apply_driving_signal` to use
+that driver when present, or set it to `False` to retain its baseline without
+fluctuations. Setting it to `True` requires a source with a configured driver.
+Supernova expansion and other independent source evolution are unaffected by
+this switch.
+
+The lower-level examples below use `MicrolensingSimulation`, named
+`simulation`, when direct control of the grids and scheduler is useful.
+
 Point-lens velocities are expressed in microarcseconds per day. Passing a time
 axis to `MicrolensingSimulation.dynamic_maps` streams source-independent maps
 in the same order:
@@ -19,12 +47,12 @@ maps = simulation.dynamic_maps(
 
 On CUDA float32 with the Triton backend, this is genuine fused temporal IPM:
 
-- far-field Taylor coefficients are accumulated together at anchor frames.
+- far-field Taylor coefficients are accumulated in batches for every map epoch.
 - local-star membership and positions remain exact at every frame.
 - one Taylor far-field query launch traces the shared node coordinates for every
   frame in a temporal batch.
 - retained cells are interpolated and rasterized directly into a stack of
-  maps without materializing global triangle arrays. And
+  maps without materializing global triangle arrays.
 - a short final batch may be padded to the compiled temporal shape, with the
   synthetic maps discarded.
 
@@ -62,26 +90,24 @@ source-center labels at the sparse map epochs.
 
 ## Streaming finite-source light curves
 
-`MicrolensingSimulation.light_curve` evaluates a source in temporal batches and
+`MicrolensingSystem.light_curve` evaluates a source in temporal batches and
 consumes each map immediately. Only the final flux array is retained. To derive
 several source or trajectory realizations from the same map sequence, use
 `light_curves`:
 
 ```python
 requests = [
-    mc.LightCurveRequest(source_a, distances, trajectory=track_a, name="a"),
-    mc.LightCurveRequest(source_b, distances, trajectory=track_b, name="b"),
+    mc.LightCurveRequest(source_a, trajectory=track_a, name="a"),
+    mc.LightCurveRequest(source_b, trajectory=track_b, name="b"),
 ]
-curves = simulation.light_curves(
-    lens_region,
-    source_grid,
-    times_days,
-    requests,
-    method=ipm,
-    schedule=mc.DynamicConfig(
-        temporal_batch_size=49,
-        light_curve_batch_size=8,
-    ),
+curves = system.light_curves(
+    requests=requests,
+    duration_days=3650,
+    map_cadence_days=25,
+    source_cadence_days=1,
+    rays=10_000_000,
+    temporal_batch_size=49,
+    light_curve_batch_size=8,
 )
 ```
 
@@ -89,8 +115,18 @@ Compatible source-array shapes are passed through one batched map-sampling
 operation. Different shapes, band counts, physical scales, and coverage rules
 remain valid and are grouped automatically. The expensive maps are still made
 only once. This is independent-source photometry behind a shared macroimage.
-the package does not describe it as fused map generation across unrelated lens
+The package does not describe it as fused map generation across unrelated lens
 systems.
+
+Shared-map requests inherit the system distances unless explicitly overridden.
+Source models are pixelated once before sampling. Fine-cadence evolution uses
+the same two-map interpolation as individual light curves. Each dynamic map
+is generated once for the whole request list.
+
+Use `batched_system_light_curves` for unrelated stellar realizations. It and
+`tune_system_light_curve_batch` accept the same duration, cadence, rays, and
+temporal-batch keywords. Static batches use
+`mc.batched_system_maps(systems, rays=10_000_000, batch_size=2)`.
 
 ## Exact and approximate reuse
 
@@ -110,8 +146,8 @@ CUDA/Triton coefficient-accumulation call, but no coefficient table is
 interpolated in time. This preserves pixel-level map fidelity while retaining
 the throughput benefit of temporal batching.
 
-Every result records its anchor frames, selected-cell count, whether endpoint
-union was used, and whether the selection was approximate. This provenance is
+Every map result records its scout refresh endpoints, selected-cell count,
+whether endpoint union was used, and whether the selection was approximate. This provenance is
 kept even when map values are consumed immediately by a light-curve routine.
 
 The scheduler halves `cell_chunk_size` after a CUDA out-of-memory allocation
@@ -121,8 +157,9 @@ the minimum spatial chunk still does not fit, the temporal batch is split and
 retried. This second backoff is also lossless.
 
 `temporal_batch_size` defines the fused map shape and source-evaluation batch.
-When it is omitted, CUDA uses the validated paper batch of 49 while portable
-devices stream one frame at a time. Enable `AutoTuningConfig` explicitly to
+High-level light curves default to 49 without labels and 30 with labels.
+The low-level scheduler can choose its device default when its batch is
+unspecified. Enable `AutoTuningConfig` explicitly to
 benchmark alternative temporal and spatial work sizes. See
 [`tuning.md`](tuning.md). A user-supplied value is honored when tuning is
 disabled, unless lossless OOM backoff must split it.
@@ -160,4 +197,6 @@ the dynamic correction. For a
 more conservative validation run, also set `scout_refresh_frames=1` and
 optionally disable the scalar correction. The returned metadata identifies
 every activated approximation, anchor frame, padding count, OOM reduction,
-and actual raster backend.
+and actual raster backend. The high-level labeled light-curve call uses batch
+30 unless overridden. Both the map batch and the label batch can be set
+explicitly with `temporal_batch_size` and `label_batch_size`.

@@ -328,6 +328,124 @@ def _source_scout_cells(
 
 
 @torch.no_grad()
+def _source_scout_union_temporal(
+    simulation: MicrolensingSimulation,
+    far_fields,
+    lens_region: PlaneRegion,
+    source_grid: PlaneGrid,
+    config: IPMConfig,
+):
+    """Select the union of several endpoint scouts in one CUDA query.
+
+    The dynamic production scheduler needs only the union of its endpoint
+    selections.  Tracing their shared corner lattice as one temporal queue and
+    reducing the selected masks on the device avoids one Python launch and one
+    compacted-index transfer per endpoint.  The selected cells are identical
+    to the scalar :func:`_source_scout_cells` result.  Unsupported runtimes
+    return ``None`` so the portable scheduler keeps its readable scalar path.
+    """
+
+    far_fields = tuple(far_fields)
+    runtime = simulation.runtime
+    if (
+        not far_fields
+        or any(item is None for item in far_fields)
+        or config.scout_trace_centers
+        or runtime.backend is not Backend.TRITON
+        or runtime.device.type != "cuda"
+        or runtime.dtype != torch.float32
+    ):
+        return None
+
+    from .far_field import BatchedTaylorFarFieldApproximation
+    from .triton_scout import (
+        dilate_source_tiles_triton,
+        select_source_tiles_triton,
+    )
+
+    ratio = int(config.scout_ratio)
+    fine_ny, fine_nx = _ipm_cell_shape(config.rays, lens_region, ratio)
+    coarse_ny = fine_ny // ratio
+    coarse_nx = fine_nx // ratio
+    lens_xmin, lens_xmax, lens_ymin, lens_ymax = lens_region.bounds_uas
+    x_edges = torch.linspace(
+        lens_xmin,
+        lens_xmax,
+        coarse_nx + 1,
+        device=runtime.device,
+        dtype=runtime.dtype,
+    )
+    y_edges = torch.linspace(
+        lens_ymin,
+        lens_ymax,
+        coarse_ny + 1,
+        device=runtime.device,
+        dtype=runtime.dtype,
+    )
+    vertex_count = int((coarse_ny + 1) * (coarse_nx + 1))
+    linear = torch.arange(vertex_count, device=runtime.device)
+    row = torch.div(linear, coarse_nx + 1, rounding_mode="floor")
+    column = linear - row * (coarse_nx + 1)
+    query_x = x_edges[column]
+    query_y = y_edges[row]
+    batched = BatchedTaylorFarFieldApproximation(far_fields)
+    corner_x, corner_y = batched.raytrace(query_x, query_y)
+    corner_shape = (len(far_fields), coarse_ny + 1, coarse_nx + 1)
+    corner_x = corner_x.reshape(corner_shape)
+    corner_y = corner_y.reshape(corner_shape)
+
+    source_xmin, source_xmax, source_ymin, source_ymax = source_grid.bounds_uas
+    source_dy, source_dx = source_grid.pixel_scale_uas
+    halo_x = float(config.scout_halo_pixels) * source_dx
+    halo_y = float(config.scout_halo_pixels) * source_dy
+    selected = select_source_tiles_triton(
+        corner_x,
+        corner_y,
+        bounds=(
+            source_xmin - halo_x,
+            source_xmax + halo_x,
+            source_ymin - halo_y,
+            source_ymax + halo_y,
+        ),
+    )
+    selected_before = selected.sum(dim=(-2, -1), dtype=torch.int64)
+    selected = dilate_source_tiles_triton(
+        selected,
+        config.scout_dilation_cells,
+    )
+    selected_after = selected.sum(dim=(-2, -1), dtype=torch.int64)
+    union_tiles = selected.any(dim=0).nonzero(as_tuple=False)
+    local_y, local_x = torch.meshgrid(
+        torch.arange(ratio, device=runtime.device),
+        torch.arange(ratio, device=runtime.device),
+        indexing="ij",
+    )
+    fine_rows = union_tiles[:, 0, None] * ratio + local_y.reshape(1, -1)
+    fine_columns = union_tiles[:, 1, None] * ratio + local_x.reshape(1, -1)
+    fine_linear = (fine_rows * fine_nx + fine_columns).reshape(-1)
+    counts = torch.stack((selected_before, selected_after)).detach().cpu()
+    metadata = [
+        {
+            "scout_ratio": ratio,
+            "scout_grid_rows": coarse_ny,
+            "scout_grid_columns": coarse_nx,
+            "scout_corner_traces": vertex_count,
+            "scout_center_traces": 0,
+            "scout_trace_centers": False,
+            "scout_selector": "triton_temporal_fused",
+            "scout_selected_before_dilation": int(counts[0, frame]),
+            "scout_selected_tiles": int(counts[1, frame]),
+            "selected_fine_cells": int(counts[1, frame]) * ratio * ratio,
+            "selected_fine_fraction": float(
+                int(counts[1, frame]) * ratio * ratio / (fine_ny * fine_nx)
+            ),
+        }
+        for frame in range(len(far_fields))
+    ]
+    return fine_linear, fine_ny, fine_nx, metadata
+
+
+@torch.no_grad()
 def dual_scout_scalar_correction(
     simulation: MicrolensingSimulation,
     far_field,

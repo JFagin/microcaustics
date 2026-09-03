@@ -31,9 +31,6 @@ output/
 .jupyter_*/
 .ipython/
 qa_latest/
-examples/notebooks/q2237_production_tutorial_output/
-examples/notebooks/microcaustics_tutorial_output/
-examples/notebooks/relativistic_transfer_output/
-examples/notebooks/*_output/
-examples/notebooks/generated/
+examples/notebooks/**/*_output/
+examples/notebooks/**/generated/
 /relativistic_transfer_output/

@@ -1,5 +1,80 @@
 # Source models and driving signals
 
+## Optional source driving
+
+Attach a driver to the source that defines its response. A driver is optional
+and does not require manually constructing a time array.
+
+```python
+driver = mc.broken_power_law_driving_signal(
+    cadence_days=0.1,
+    break_timescale_days=200,
+    alpha_L=1,
+    alpha_R=3,
+    standard_deviation=0.1,
+)
+
+source = mc.KerrDiskModel(
+    black_hole_mass_solar=1e8,
+    eddington_ratio=0.1,
+    bands_angstrom={"g": 4800, "r": 6200},
+    driving_signal=driver,
+)
+```
+
+Pass `source=source` when constructing `MicrolensingSystem` or
+`MultiImageSystem`. Neither system accepts a separate `driving_signal`.
+The source's driver inherits the system's independent variability seed
+unless explicitly overridden. Multi-image systems share one intrinsic driver
+and apply the image arrival delays to source time only.
+
+Call `system.light_curve(..., apply_driving_signal=False)` for constant mean
+driver heating, or use `apply_driving_signal=True` for intrinsic variability.
+Omitting the switch uses the source's driver when one is configured. Disabling the driver does not
+disable other evolution such as photospheric expansion. Custom multiplicative
+drivers use unit baseline unless their metadata supplies `mean_amplitude`.
+
+A source without a driver needs no special handling. Omitting the switch or
+setting it to `False` evaluates that source normally. Setting it to `True`
+raises an error before realization. The built-in supernova model does not
+accept a driving signal. Its radius, luminosity, and temperature already
+describe its intrinsic evolution. Use an explicit `ModulatedSource` wrapper
+if an additional brightness modulation is scientifically intended.
+
+To construct a steady Kerr disk with no driver, omit `driving_signal` from the
+disk constructor. This retains the existing static thin-disk model. To compare
+a reverberating disk against its own mean lamp heating, retain its driver and
+set `apply_driving_signal=False` instead.
+
+The generation grid defaults to 1000 days of prehistory and a 7300-day maximum
+duration. Fivefold FFT padding generates a longer stochastic series before
+cropping. It does not repeat the retained realization. Sampling is lazy and
+occurs once per bound driver, so a shorter light-curve request uses the same
+samples. The 0.1-day driver grid and daily source sampling do not require daily
+or sub-daily microlensing maps.
+
+Set `history_days`, `max_duration_days`, and `padding_factor` on the driver for
+other workloads. Queries outside the declared horizon raise an actionable
+error. History must cover reverberation and macroimage delays. Changing the
+generation grid changes the realization even with the same seed.
+
+A per-call `source=` override or a `with_source(...)` replacement uses its own
+geometry and driver in both single-image and multi-image calculations. It
+never inherits the previous source's driver. Independent-system batches apply
+the same switch to every input and reject `True` if any source lacks a driver.
+
+Sampled drivers reuse their interpolation tables on each requested device and
+dtype. Treat sample tensors as immutable and construct a new driver to replace
+them. Tables that require gradients are not cached. Concurrent curves sharing
+one bound driver also share one generated realization, including unseeded runs.
+
+Explicit sampled and callable signals remain available for custom sources and
+standalone continuum reverberation calculations, as described below.
+Explicit sample times cannot be combined with the automatic cadence or horizon
+arguments. The requested sample times already define that grid.
+
+## Physical source interface
+
 Microlensing solvers never depend on a particular source class. A pixelated
 source supplies a `SourceGeometry` and returns brightness with shape
 `[time, y, x, band]`. Band names and wavelengths are arbitrary. LSST `ugrizy`
@@ -16,23 +91,51 @@ magnification-only calculations, but need a physical normalization before
 absolute photometry is requested. `flux_to_magnitude` converts Jy directly to
 AB magnitudes using the fixed 3631 Jy definition.
 
-Custom pixelated sources can define their geometry directly in observable
-angular units. The constructor performs the source-plane distance conversion,
-so notebook and application code does not need a manual microarcsecond-to-metre
-constant:
+Custom sources can specify their angular extent, pixel count, and wavelengths
+directly. The system supplies its distances when it resolves the source.
 
 ```python
-geometry = mc.SourceGeometry.from_angular(
-    distances,
-    shape=(512, 512),
+source = mc.CallableSource(
+    my_brightness_function,
+    source_grid_shape=256,
     field_of_view_uas=(8.0, 8.0),
-    bands=("blue", "red"),
+    bands_angstrom={"blue": 4800.0, "red": 7500.0},  # observed wavelengths in Angstrom
 )
-source = mc.CallableSource(geometry, my_brightness_function)
 ```
+
+The `bands_angstrom` mapping uses the same name and units as the built-in
+physical source models.
 
 The callable must return physical surface brightness in `Jy m^-2` when the
 result will be converted to absolute fluxes or AB magnitudes.
+It may accept only `times_days`, or `times_days, *, geometry` when it needs
+physical coordinates or `geometry.pixel_area_m2` for normalization. The
+geometry keyword is detected once during setup, not on every brightness call.
+The system does not normalize or reinterpret the supplied brightness.
+
+Static images use the same convention and infer the pixel dimensions from
+their `[y, x, band]` array.
+
+```python
+source = mc.StaticSource(
+    image,
+    field_of_view_uas=8.0,
+    bands_angstrom={"blue": 4800.0, "red": 7500.0},
+)
+```
+
+Scalar extents describe square fields. Tuples use `(height, width)` in
+microarcseconds, while shapes use `(ny, nx)`. Custom sources keep their
+declared pixels even if the magnification map uses another resolution.
+
+Explicit shared geometry is still available through `SourceGeometry(...)`.
+Give either `field_of_view_uas` or physical `pixel_scale_m`, never both.
+Angular geometry remains unresolved until the system supplies its distances.
+For a standalone calculation with no microlensing system, call
+`source.pixelate(source_redshift=1.5, H0=70, Om0=0.3)` before evaluating a
+callback that needs physical pixel sizes. An explicit `distances` object is
+still accepted for a custom cosmology. The same source specification can
+be reused at different redshifts without changing the original object.
 
 Built-in lightweight sources include `StaticSource`, `GaussianSource`, an
 elliptical Gaussian with an optional smooth central hole, physical thin disks,
@@ -42,8 +145,10 @@ radiation calculation.
 
 The physical wrappers `GaussianModel`, `ThinDiskModel`, and `KerrDiskModel`
 choose their own source support and pixel geometry. They can therefore be
-passed directly to `MicrolensingSystem`. `GaussianModel.from_angular` accepts
-observational widths in microarcseconds without manual unit conversion. Give
+passed directly to `MicrolensingSystem`. `GaussianModel` accepts `sigma_uas`
+or `sigma_m` directly, with optional `center_uas` or `center_m` and
+`hole_radius_uas` or `hole_radius_m`. Its `position_angle_deg` is in degrees,
+as for the disk models. Do not supply both units for the same quantity. Give
 the trajectory and duration to the system when a source also moves:
 
 ```python
@@ -81,20 +186,26 @@ evolution = mc.PowerLawExponentialPhotosphere(
 )
 
 source = mc.ExpandingPhotosphereSource(
-    redshift=0.65,
-    wavelengths_angstrom=(4_800.0, 6_200.0, 7_500.0),
-    band_names=("blue", "middle", "red"),
+    bands_angstrom={"blue": 4800.0, "middle": 6200.0, "red": 7500.0},
     maximum_observer_time_days=180.0,
     evolution=evolution,
     source_grid_shape=256,
+    source_margin=1.05,
+    appearance=mc.PhotosphereAppearance(position_angle_deg=25.0),
 )
 ```
 
-The source grid is fixed by the largest radius over the requested interval.
-the photosphere can evolve daily while dynamic maps use an independently
-chosen cadence. Arbitrary bands and resolutions are supported. A known
-luminosity distance can be supplied directly, or the built-in flat-Lambda-CDM
-distance calculation can be configured.
+Pass this model directly to a system. It supplies the source redshift and
+converts its angular-diameter distance to a luminosity distance. Explicit
+source redshifts must agree with the system. A known `luminosity_distance_m`
+can still override the brightness distance.
+
+The largest radius over `maximum_observer_time_days` fixes the source grid.
+Shorter light-curve requests keep that grid unchanged. Longer source-time
+requests raise an error explaining how to extend the horizon. For a standalone
+source, use `source.pixelate(source_redshift=0.65, H0=70, Om0=0.3)` before
+evaluating brightness. No lens parameters are needed. Source evolution and
+map cadence remain independent.
 For a non-monotonic or sharply varying custom radius law, pass a conservative
 `maximum_photosphere_radius_m` directly instead of relying on initialization
 sampling to size the fixed field.
@@ -122,11 +233,21 @@ signal = mc.TabulatedDrivingSignal(
 variable_source = mc.ModulatedSource(static_source, signal)
 ```
 
+The wrapped source may also be a `ThinDiskModel`, `GaussianModel`, or other
+physical model. The system handles pixelization, so there is no need to
+calculate distances or call `.pixelate()` before adding coherent modulation.
+
 The table may contain one achromatic amplitude or one amplitude per band.
 `CallableDrivingSignal` accepts an arbitrary differentiable PyTorch callable.
 Signals are multiplicative and must be finite and non-negative. More involved
 reverberation models can implement the same `PixelatedSource` protocol without
 passing through this simple wrapper.
+
+A custom source with an attached `driving_signal` can implement
+`with_driving_signal(signal)` to return a copy with that signal. This lets the
+system bind the inherited variability seed and lets the driver switch provide
+a constant mean amplitude without changing the source's physical response.
+Custom source evolution remains the responsibility of `brightness(...)`.
 
 The resolved-quasar example driver is a lognormal realization of a smoothly broken power-law
 PSD, not a damped random walk:
@@ -138,7 +259,7 @@ signal = mc.broken_power_law_driving_signal(
     alpha_L=1.0,
     alpha_R=3.0,
     standard_deviation=0.3,
-    seed=17,
+    seed=0,
 )
 ```
 
@@ -158,7 +279,7 @@ signal = mc.driving_signal_from_psd(
     my_psd,
     fourier_sampling="gaussian",  # or "random_phase"
     amplitude_transform="lognormal",
-    seed=17,
+    seed=0,
 )
 ```
 

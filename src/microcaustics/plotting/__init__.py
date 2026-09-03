@@ -16,6 +16,7 @@ from ._common import (
 )
 from .animations import animate_standardized_source_bands, save_fixed_palette_gif
 from .caustics import plot_anchor_gauge, plot_caustics
+from .datasets import plot_labeled_map_gallery, plot_light_curve_dataset
 from .light_curves import (
     plot_light_curve,
     plot_multi_image_light_curves,
@@ -62,7 +63,9 @@ __all__ = [
     "plot_distance_map",
     "plot_far_field_method",
     "plot_label_map",
+    "plot_labeled_map_gallery",
     "plot_light_curve",
+    "plot_light_curve_dataset",
     "plot_magnification_map",
     "plot_map_comparison",
     "plot_ipm_scout_method",

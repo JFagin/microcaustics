@@ -1,24 +1,19 @@
 # Thin disks and relativistic source calculations
 
-`ThinDiskSource` is a physical, static continuum disk implementing the same
+`ThinDiskModel` specifies a physical, static continuum disk implementing the same
 signed-spin ISCO, Page--Thorne radial dissipation, color correction, and
 observed-frequency convention as the validated paper implementation. It is an
-ordinary `PixelatedSource`, so it can be used with IRS, IPM, external maps, or
-without microlensing.
+object that chooses its own pixel grid. Its resolved source can be used with
+IRS, IPM, external maps, or without microlensing.
 
 ```python
-disk = mc.ThinDiskSource.from_lensing_distances(
-    geometry,
-    black_hole_mass_solar=1.0e9,
-    eddington_ratio=0.1,
-    distances=distances,
-    source_redshift=1.7,
-    spin=0.7,
-    inclination_deg=30.0,
-    position_angle_deg=15.0,
-    color_correction=1.0,
+model = mc.ThinDiskModel(
+    black_hole_mass_solar=1e9, eddington_ratio=0.1,
+    bands_angstrom={"g": 4800, "i": 7500}, source_grid_shape=256,
+    spin=0.7, inclination_deg=30, position_angle_deg=15,
     relativity="approximate",
 )
+disk = model.pixelate(source_redshift=1.7, H0=70, Om0=0.3)
 ```
 
 Pixels use package-standard array order `(y, x)` and represent the projected
@@ -42,10 +37,12 @@ geometry:
 
 ```python
 driver = mc.broken_power_law_driving_signal(
-    torch.arange(-200.0, 3651.0),
+    cadence_days=0.1,
     break_timescale_days=200.0,
-    seed=12,
-    extrapolation="hold",
+    alpha_L=1.0,
+    alpha_R=3.0,
+    standard_deviation=0.1,
+    seed=0,
 )
 disk = mc.KerrDiskModel(
     black_hole_mass_solar=10**9.08,
@@ -53,21 +50,26 @@ disk = mc.KerrDiskModel(
     bands_angstrom={"u": 3671.0, "g": 4827.0, "r": 6223.0},
     spin=0.74,
     inclination_deg=10.0,
-    position_angle_deg=175.0,
-    source_redshift=1.695,
+    position_angle_deg=0.0,
     lamp_fraction=0.1,
     corona_height_above_isco_rg=20.0,
     driving_signal=driver,
     source_grid_shape=1024,
     source_margin=1.05,
 )
-source = disk.pixelate(distances, runtime=runtime)
+source = disk.pixelate(source_redshift=1.695, H0=70.0, Om0=0.3)
 ```
 
 Omit `driving_signal` for a static relativistic disk. Use
 `disk.with_driving_signal(signal)` to retain every other choice. Resolution,
 enclosed-flux support, outer margin, lamppost sampling, and compile behavior
 remain explicit numerical controls.
+
+This standalone path needs no lens redshift or microlensing system. When
+lensing is needed, pass the disk model directly to the system instead.
+Advanced callers may still supply `distances`, `grid`, and `runtime` to
+`pixelate`. Source-only cosmological inputs and explicit distances cannot
+be combined.
 
 The full-GR frequency-shift map is already part of the returned source. No
 microlensing calculation is required:
@@ -91,6 +93,7 @@ azimuth_rad = source.transfer.emission_azimuth_rad
 observer_delay_days = source.transfer.relative_delay_days
 continuum_lag_days = source.delay_days
 heating_response_temperature4 = source.response_temperature4
+field_of_view_uas = source.transfer.metadata["source_field_of_view_uas"]
 ```
 
 `relative_delay_days` is the disk-to-observer propagation term and has its own
@@ -113,11 +116,20 @@ azimuth. `TransferredThinDiskSource` converts any compatible transfer into a
 physical Page--Thorne source:
 
 ```python
+import torch
+import microcaustics as mc
+
+black_hole_mass_solar = 1.0e9
+source_redshift = 1.7
+distances = mc.LensingDistances.from_redshifts(0.5, source_redshift)
+gravitational_radius_m = float(
+    mc.gravitational_radius_m(black_hole_mass_solar)
+)
 screen = mc.ObserverScreen.uniform(
     (1024, 1024),
     half_size_rg=80.0,
     gravitational_radius_m=gravitational_radius_m,
-    observer_distance_m=observer_distance_m,
+    observer_distance_m=float(distances.source_m),
 )
 screen = screen.rotated(position_angle_deg=15.0)
 
@@ -131,20 +143,27 @@ trace = mc.trace_primary_equatorial(
 coordinates = mc.add_observer_coordinates(
     trace,
     screen,
-    black_hole_mass_solar=1.0e9,
+    black_hole_mass_solar=black_hole_mass_solar,
     spin=0.7,
     inclination_deg=30.0,
-    source_redshift=1.7,
+    source_redshift=source_redshift,
     coordinate_dtype=torch.float64,
 )
 
+pixel_scale_m = 160.0 * gravitational_radius_m / 1024
+geometry = mc.SourceGeometry(
+    shape=(1024, 1024),
+    pixel_scale_m=(pixel_scale_m, pixel_scale_m),
+    wavelengths_angstrom=(4770.0, 6231.0, 7625.0),
+    band_names=("g", "r", "i"),
+)
 source = mc.TransferredThinDiskSource(
     geometry,
     coordinates.transfer,
-    black_hole_mass_solar=1.0e9,
+    black_hole_mass_solar=black_hole_mass_solar,
     eddington_ratio=0.1,
     spin=0.7,
-    source_redshift=1.7,
+    source_redshift=source_redshift,
 )
 ```
 
@@ -159,6 +178,7 @@ Page--Thorne profile, optional axial-lamp heating, the reddest requested
 rest-frame wavelength, and a configurable enclosed-flux fraction:
 
 ```python
+shape = (1024, 1024)
 outer_rg = mc.thin_disk_flux_radius_rg(
     black_hole_mass_solar=1.0e9,
     eddington_ratio=0.1,
@@ -170,7 +190,14 @@ outer_rg = mc.thin_disk_flux_radius_rg(
     flux_fraction=0.999,
     safety_factor=1.05,
 )
-screen = mc.ObserverScreen.uniform(shape, outer_rg, ...)
+screen = mc.ObserverScreen.uniform(
+    shape,
+    half_size_rg=outer_rg,
+    gravitational_radius_m=float(mc.gravitational_radius_m(1.0e9)),
+    observer_distance_m=float(
+        mc.LensingDistances.from_redshifts(0.5, 1.7).source_m
+    ),
+)
 ```
 
 Use the same radius for the Kerr disk boundary, source pixel scale, and

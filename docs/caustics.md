@@ -15,9 +15,11 @@ label.
 
 Finite determinant grids can clip critical-curve components, so an infinite
 positive-x parity ray is not a reliable production label. Use
-`labeled_caustics`, `dynamic_labeled_caustics`, `dynamic_labeled_maps`, or
-`light_curve_with_labels` instead. These methods use the validated production
-construction:
+`system.light_curve(..., include_labels=True)` for photometry with center
+labels. The low-level `MicrolensingSimulation` also provides
+`labeled_caustics`, `dynamic_labeled_caustics`, `dynamic_labeled_maps`, and
+`light_curve_with_labels`. These methods use the validated production
+construction.
 
 - nine reproducibly offset anchors and nine distinct gauge probes just inside
   the requested source boundary.
@@ -25,7 +27,7 @@ construction:
 - redundant anchor-pair constraints followed by a majority vote at the source
   center and each gauge.
 - per-query rejection of votes intersecting a critical-curve component clipped
-  by the determinant-grid boundary. And
+  by the determinant-grid boundary.
 - safe gauge consensus to remove the arbitrary global binary XOR between
   adjacent epochs.
 
@@ -41,7 +43,7 @@ decision.
 
 Nine anchors and nine gauges are validated paper defaults, not hard-coded
 limits. `anchor_count` and `gauge_count` are independent positive integers.
-increasing them adds redundant paths and decreasing them reduces label work.
+Increasing them adds redundant paths and decreasing them reduces label work.
 The configured `minimum_alignment_gauges` must not exceed `gauge_count`.
 
 High-level `MicrolensingSystem` calls do not require a `CausticConfig`. When it
@@ -68,31 +70,28 @@ crossings = [frame.labels.center_crossing for frame in frames]
 
 The determinant grid controls caustic resolution and is independent of the
 magnification-map grid. The paper calculation uses an 8192-pixel long axis.
-smaller grids are useful for examples and tests.
+Smaller grids are useful for examples and tests.
 
 ## Sharing work with maps and light curves
 
 For fused tiled IPM, `dynamic_labeled_maps` reuses the already-built temporal
 far-field states for detA evaluation and caustic endpoint tracing. It does not
-rebuild the far field. `light_curve_with_labels` consumes those maps
-immediately, retaining only the final fluxes and lightweight caustic products:
+rebuild the far field. The high-level light-curve call consumes those maps
+immediately, retaining only the final fluxes and lightweight caustic products.
 
 ```python
-result = simulation.light_curve_with_labels(
-    lens_region,
-    source_grid,
-    lens_grid,
-    times_days,
-    source,
-    distances,
-    method=ipm,
-    map_schedule=mc.DynamicConfig(temporal_batch_size=30),
-    caustic_config=caustic_config,
+result = system.light_curve(
+    duration_days=3650,
+    map_cadence_days=25,
+    rays=10_000_000,
+    temporal_batch_size=30,
+    include_labels=True,
 )
 
-flux = result.light_curve.flux
-labels = result.crossing_labels
-events = result.crossing_events
+flux = result.flux
+labels = result.labels.crossing_labels
+events = result.labels.crossing_events
+label_times = result.labels.times_days
 ```
 
 `center_distance_uas` is always finite. Because caustics are extracted over a
@@ -101,8 +100,8 @@ circle contained in that field. When no in-field caustic exists, the returned
 distance is therefore `R_src`, while `center_distance_censored` is true:
 
 ```python
-distance_uas = result.center_distances_uas
-distance_censored = result.center_distance_censored
+distance_uas = result.labels.center_distances_uas
+distance_censored = result.labels.center_distance_censored
 ```
 
 At censored epochs, `distance_uas == R_src` means only

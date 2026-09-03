@@ -5,3 +5,4 @@ matplotlib>=3.7
 pytest>=8
 pytest-cov>=5
 scipy>=1.10
+tomli>=2; python_version < "3.11"

@@ -8,6 +8,18 @@ import microcaustics as mc
 
 runtime = mc.RuntimeConfig(device="cpu", backend=mc.Backend.TORCH_EAGER)
 distances = mc.LensingDistances(1.0e25, 2.0e25, 1.0e25)
+kinematics = mc.SkyProjectedKinematics(
+    ra_deg=340.126125,
+    dec_deg=3.358611,
+    stellar_dispersion_km_s=170.0,
+    peculiar_velocity_dispersion_km_s=235.0,
+    include_cmb_dipole=True,
+    lens_redshift=0.08,
+    source_redshift=0.18,
+    seed=0,
+)
+bulk_x, bulk_y = kinematics.mean_velocity_uas_per_day(distances)
+dispersion = kinematics.component_dispersion_uas_per_day(distances)
 source_shape = (64, 64)
 source_fov_uas = (2.0, 2.0)
 pixel_scale_m = distances.uas_to_source_length(
@@ -35,8 +47,8 @@ def stars(offset: float) -> mc.PointMassField:
         x_uas=torch.tensor([-0.5 + offset, 0.45 + offset]),
         y_uas=torch.tensor([0.3, -0.25]),
         mass_solar=torch.tensor([0.002579, 0.002037]),
-        velocity_x_uas_per_day=torch.tensor([0.001, -0.0007]),
-        velocity_y_uas_per_day=torch.tensor([-0.0004, 0.0008]),
+        velocity_x_uas_per_day=bulk_x + dispersion * torch.tensor([0.7, -0.6]),
+        velocity_y_uas_per_day=bulk_y + dispersion * torch.tensor([-0.4, 0.5]),
     )
 
 

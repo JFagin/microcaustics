@@ -17,6 +17,8 @@ def save_fixed_palette_gif(
     fps: float = 8.0,
     colors: int = 256,
     dither: bool = True,
+    palette_rgb: np.ndarray | None = None,
+    freeze_static: bool = True,
 ) -> Path:
     """Save RGB frames with one shared GIF palette.
 
@@ -24,7 +26,8 @@ def save_fixed_palette_gif(
     A scientifically fixed Matplotlib normalization can then *appear* to
     change because the indexed GIF palette changes.  This helper derives one
     palette from representative pixels across the complete animation and
-    quantizes every frame against that same palette.
+    quantizes every frame against that same palette. Dithering is fixed to
+    pixel coordinates so changing map pixels cannot alter a static colorbar.
 
     Parameters
     ----------
@@ -39,9 +42,20 @@ def save_fixed_palette_gif(
     colors
         Number of entries in the shared palette, between 2 and 256.
     dither
-        Apply deterministic Floyd--Steinberg dithering against the shared
-        palette. This substantially reduces visible color banding while the
-        palette and scientific normalization remain fixed across all frames.
+        Apply a fixed ordered dither to reduce banding. Unlike error diffusion,
+        this never propagates changing quantization errors into nearby pixels.
+    palette_rgb
+        Optional ``[2..256, 3]`` palette of integer RGB colors on ``[0, 255]``.
+        Overrides ``colors``. Supplying the plotted colormap and annotation
+        colors preserves the full gradient and thin overlays that automatic
+        palette sampling might otherwise miss.
+    freeze_static
+        Encode pixels that are identical in every RGB frame once, using
+        error-diffusion dithering on frame zero. Reuse their exact palette
+        indices throughout the GIF. This smooths stationary colorbars without
+        adding noise to moving images or allowing the bar to flicker. Only
+        unchanged input pixels are frozen. Set to False to apply ``dither``
+        uniformly, including static elements.
     """
 
     try:
@@ -66,23 +80,63 @@ def save_fixed_palette_gif(
     if any(array.shape != shape for array in arrays):
         raise ValueError("all GIF frames must have the same shape")
 
-    # A deterministic spatial/temporal subsample limits palette construction
-    # memory without favoring the first animation frame.
-    sample_frames = arrays[:: max(1, len(arrays) // 16)]
-    sample = np.concatenate(
-        [frame[::4, ::4].reshape(-1, 3) for frame in sample_frames], axis=0
-    )
-    palette_source = Image.fromarray(sample.reshape(-1, 1, 3), mode="RGB")
-    palette = palette_source.quantize(
-        colors=int(colors), method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE
-    )
-    dither_mode = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
-    indexed = [
-        Image.fromarray(frame, mode="RGB").quantize(
-            palette=palette, dither=dither_mode
+    if palette_rgb is None:
+        # Sample across the animation without favoring its first frame.
+        sample_frames = arrays[:: max(1, len(arrays) // 16)]
+        sample = np.concatenate(
+            [frame[::4, ::4].reshape(-1, 3) for frame in sample_frames], axis=0
         )
-        for frame in arrays
-    ]
+        palette = Image.fromarray(sample.reshape(-1, 1, 3)).quantize(
+            colors=int(colors),
+            method=Image.Quantize.MEDIANCUT,
+            dither=Image.Dither.NONE,
+        )
+    else:
+        rgb = np.asarray(palette_rgb)
+        if (
+            rgb.ndim != 2
+            or rgb.shape[1] != 3
+            or not 2 <= len(rgb) <= 256
+            or not np.issubdtype(rgb.dtype, np.integer)
+            or np.any(rgb < 0)
+            or np.any(rgb > 255)
+        ):
+            raise ValueError(
+                "palette_rgb must be [2..256, 3] integer RGB values on [0, 255]"
+            )
+        palette = Image.new("P", (1, 1))
+        padded = np.concatenate((rgb, np.repeat(rgb[-1:], 256 - len(rgb), axis=0)))
+        palette.putpalette(padded.astype(np.uint8).ravel().tolist())
+
+    # A small, zero-mean Bayer pattern is spatially fixed, not frame-dependent.
+    bayer = np.array(
+        [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]], dtype=np.float32
+    )
+    offsets = ((bayer + 0.5) / 16.0 - 0.5) * 6.0
+    offsets = np.tile(offsets, ((shape[0] + 3) // 4, (shape[1] + 3) // 4))
+    offsets = offsets[: shape[0], : shape[1], None]
+    static_mask = None
+    if freeze_static and len(arrays) > 1:
+        static_mask = np.ones(shape[:2], dtype=bool)
+        for frame in arrays[1:]:
+            static_mask &= np.all(frame == arrays[0], axis=-1)
+        # Quantize once. Repeating error diffusion on later frames would let
+        # changing map pixels influence the otherwise stationary colorbar.
+        static_indices = Image.fromarray(arrays[0]).quantize(
+            palette=palette, dither=Image.Dither.FLOYDSTEINBERG
+        )
+    indexed = []
+    for frame in arrays:
+        if dither:
+            frame = np.rint(np.clip(frame.astype(np.float32) + offsets, 0, 255)).astype(
+                np.uint8
+            )
+        encoded = Image.fromarray(frame).quantize(
+            palette=palette, dither=Image.Dither.NONE
+        )
+        if static_mask is not None:
+            encoded.paste(static_indices, mask=Image.fromarray(static_mask))
+        indexed.append(encoded)
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     indexed[0].save(
@@ -104,6 +158,7 @@ def animate_standardized_source_bands(
     grid,
     path: str | Path,
     *,
+    bands: Iterable[str] | str | None = None,
     batch_size: int = 4,
     fps: float = 8.0,
     scale_bar_uas: float = 1.0,
@@ -118,7 +173,12 @@ def animate_standardized_source_bands(
     :func:`microcaustics.plotting.standardize_source_over_time`. The same
     temporal mean, support mask, clipping interval, Matplotlib normalization,
     and GIF palette are applied to every frame. This avoids both scientific
-    renormalization and palette flicker.
+    renormalization and palette flicker. ``bands`` selects displayed band names
+    without changing the source or its normalization. For example,
+    ``bands="i"`` makes a compact single-band animation. Omit it for all bands.
+    The colormap and neutral annotation colors are explicitly preserved in
+    the GIF palette. Moving disk pixels remain undithered. Static elements
+    such as the colorbar are encoded once and reused in every frame.
     """
 
     import matplotlib.pyplot as plt
@@ -129,11 +189,24 @@ def animate_standardized_source_bands(
         raise ValueError("times_days must be a non-empty one-dimensional sequence")
     if int(batch_size) < 1:
         raise ValueError("batch_size must be positive")
-    band_names = tuple(source.geometry.band_names)
+    available = tuple(source.geometry.band_names)
+    band_names = (
+        available
+        if bands is None
+        else (bands,)
+        if isinstance(bands, str)
+        else tuple(bands)
+    )
+    if not band_names or len(set(band_names)) != len(band_names):
+        raise ValueError("bands must contain at least one unique band name")
+    if any(name not in available for name in band_names):
+        raise ValueError(f"bands must be selected from {available}")
+    band_indices = tuple(available.index(name) for name in band_names)
     figure, axes = plt.subplots(
         1,
         len(band_names),
-        figsize=figsize or (2.65 * len(band_names), 2.7),
+        figsize=figsize
+        or ((5.6, 4.8) if len(band_names) == 1 else (2.65 * len(band_names), 2.7)),
         squeeze=False,
     )
     axes = axes[0]
@@ -147,6 +220,7 @@ def animate_standardized_source_bands(
             vmin=standardization.clip[0],
             vmax=standardization.clip[1],
             aspect="equal",
+            interpolation="bilinear",
         )
         artists.append(artist)
         axis.set_title(f"{band} band")
@@ -162,7 +236,7 @@ def animate_standardized_source_bands(
         figure,
         axes[-1],
         artists[-1],
-        label=r"$(B_\lambda-\overline{B}_\lambda)/\sigma_{\overline{B}_\lambda}$",
+        label=r"$(B_\lambda-\overline{B}_\lambda)/\sigma_{B_\lambda}$",
     )
     time_text = axes[0].text(
         0.03,
@@ -175,7 +249,11 @@ def animate_standardized_source_bands(
         bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.72, "pad": 1.5},
     )
     figure.subplots_adjust(
-        left=0.015, right=0.955, bottom=0.04, top=0.88, wspace=0.13
+        left=0.04 if len(band_names) == 1 else 0.015,
+        right=0.80 if len(band_names) == 1 else 0.955,
+        bottom=0.04,
+        top=0.88,
+        wspace=0.13,
     )
     frames = []
     for chunk in times.split(int(batch_size)):
@@ -183,11 +261,23 @@ def animate_standardized_source_bands(
         values = values.detach().cpu().numpy().astype(np.float64, copy=False)
         for time_day, image in zip(chunk, values, strict=True):
             standardized = standardization.standardize(image)
-            for band_index, artist in enumerate(artists):
+            for band_index, artist in zip(band_indices, artists, strict=True):
                 artist.set_data(standardized[:, :, band_index])
             time_text.set_text(f"t = {float(time_day) / 365.0:.1f} yr")
             figure.canvas.draw()
             frames.append(np.asarray(figure.canvas.buffer_rgba())[..., :3].copy())
-    destination = save_fixed_palette_gif(frames, path, fps=fps, dither=True)
+    palette_rgb = np.vstack(
+        (
+            (plt.get_cmap(cmap)(np.linspace(0, 1, 240))[:, :3] * 255).astype(np.uint8),
+            np.repeat(np.linspace(0, 255, 16, dtype=np.uint8)[:, None], 3, axis=1),
+        )
+    )
+    destination = save_fixed_palette_gif(
+        frames,
+        path,
+        fps=fps,
+        dither=False,
+        palette_rgb=palette_rgb,
+    )
     plt.close(figure)
     return destination

@@ -16,8 +16,58 @@ _MEGAPARSEC_M = 3.085677581491367e22
 _SPEED_OF_LIGHT_KM_S = 299_792.458
 
 
+class _SourceCoordinates:
+    """Shared physical/angular conversions for source and lens geometries."""
+
+    def source_length_to_uas(self, length_m, *, device=None, dtype=torch.float32):
+        """Convert proper source-plane meters to microarcseconds."""
+        return (
+            torch.as_tensor(length_m, device=device, dtype=dtype)
+            / self.source_m
+            * float(_RADIANS_TO_MICROARCSECONDS)
+        )
+
+    def uas_to_source_length(self, angle_uas, *, device=None, dtype=torch.float32):
+        """Convert source-plane microarcseconds to proper meters."""
+        return (
+            torch.as_tensor(angle_uas, device=device, dtype=dtype)
+            * float(_MICROARCSECONDS_TO_RADIANS)
+            * self.source_m
+        )
+
+
 @dataclass(frozen=True)
-class LensingDistances:
+class _SourceDistances(_SourceCoordinates):
+    """Source-only angular geometry used internally by standalone sources."""
+
+    source_m: float
+    source_redshift: float
+
+
+def _source_distances_from_redshift(source_redshift, *, H0, Om0, device, dtype):
+    """Resolve a flat cosmology without inventing an unused lens plane."""
+    redshift = float(source_redshift)
+    if not math.isfinite(redshift) or redshift <= 0:
+        raise ValueError("source_redshift must be finite and positive")
+    if not math.isfinite(H0) or H0 <= 0 or not math.isfinite(Om0) or not 0 <= Om0 <= 1:
+        raise ValueError("H0 must be positive and Om0 must lie in [0, 1]")
+    z = torch.linspace(0, redshift, 16_385, device=device, dtype=dtype)
+    inverse_expansion = torch.rsqrt(Om0 * (1 + z).pow(3) + (1 - Om0))
+    integral = (
+        0.5 * redshift / 16_384 * (inverse_expansion[:-1] + inverse_expansion[1:])
+    ).cumsum(0)[-1]
+    return _SourceDistances(
+        source_m=float(integral)
+        * _SPEED_OF_LIGHT_KM_S
+        / H0
+        * _MEGAPARSEC_M
+        / (1 + redshift),
+        source_redshift=redshift,
+    )
+
+
+@dataclass(frozen=True)
+class LensingDistances(_SourceCoordinates):
     """Angular-diameter distances required by a single lens plane.
 
     All three values are in meters. Keeping this lightweight container in the
@@ -181,30 +231,6 @@ class LensingDistances:
             * distance_factor
         )
         return radius_rad * float(_RADIANS_TO_MICROARCSECONDS)
-
-    def source_length_to_uas(
-        self,
-        length_m,
-        *,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype = torch.float32,
-    ) -> torch.Tensor:
-        """Convert a proper transverse source-plane length to an angle."""
-
-        length = torch.as_tensor(length_m, device=device, dtype=dtype)
-        return length / self.source_m * float(_RADIANS_TO_MICROARCSECONDS)
-
-    def uas_to_source_length(
-        self,
-        angle_uas,
-        *,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype = torch.float32,
-    ) -> torch.Tensor:
-        """Convert a source-plane angle to a proper transverse length."""
-
-        angle = torch.as_tensor(angle_uas, device=device, dtype=dtype)
-        return angle * float(_MICROARCSECONDS_TO_RADIANS) * self.source_m
 
 
 def _distances_from_arguments(

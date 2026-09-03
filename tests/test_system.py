@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import torch
@@ -130,6 +131,72 @@ class MicrolensingSystemTests(unittest.TestCase):
         )
         self.assertEqual(len(dynamic), 2)
         self.assertEqual(dynamic[0].grid, generated.grid)
+
+        summary = system.summary(display=False)
+        metadata = system.metadata()
+        self.assertEqual(summary["source_shape"], (8, 8))
+        self.assertEqual(metadata["source_grid"]["shape"], [8, 8])
+
+    def test_source_independent_inspection_selects_map_geometry(self) -> None:
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            stars=self._stars(),
+            lens_region=self.lens_region,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        with self.assertRaisesRegex(ValueError, "map_width_uas and map_pixels"):
+            system.summary(display=False)
+        selected = system.summary(
+            map_width_uas=3.0,
+            map_pixels=12,
+            display=False,
+        )
+        self.assertEqual(selected["source_shape"], (12, 12))
+        system._with_square_map_grid(map_width_uas=4.0, map_pixels=16)
+        with self.assertRaisesRegex(ValueError, "more than one"):
+            system.metadata()
+        metadata = system.metadata(map_width_uas=4.0, map_pixels=16)
+        self.assertEqual(metadata["source_grid"]["shape"], [16, 16])
+
+    def test_unseeded_numerical_variants_retain_one_stellar_realization(self) -> None:
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            stellar_population=mc.StellarPopulation.salpeter(count=8),
+            source_grid=mc.PlaneGrid((8, 8), (2.0, 2.0)),
+            integration_domain="scout",
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        scout_stars = system.realized_stars
+        full_stars = system.with_integration_domain("full").realized_stars
+        torch.testing.assert_close(scout_stars.x_uas, full_stars.x_uas, rtol=0, atol=0)
+        torch.testing.assert_close(scout_stars.y_uas, full_stars.y_uas, rtol=0, atol=0)
+        torch.testing.assert_close(
+            scout_stars.mass_solar,
+            full_stars.mass_solar,
+            rtol=0,
+            atol=0,
+        )
+
+        map_system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            stellar_population=mc.StellarPopulation.salpeter(count=8),
+            integration_domain="full",
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        coarse = map_system._with_square_map_grid(
+            map_width_uas=2.0,
+            map_pixels=8,
+        ).realized_stars
+        fine = map_system._with_square_map_grid(
+            map_width_uas=2.0,
+            map_pixels=16,
+        ).realized_stars
+        torch.testing.assert_close(coarse.x_uas, fine.x_uas, rtol=0, atol=0)
+        torch.testing.assert_close(coarse.y_uas, fine.y_uas, rtol=0, atol=0)
+        torch.testing.assert_close(coarse.mass_solar, fine.mass_solar, rtol=0, atol=0)
 
     def test_source_independent_map_geometry_validation(self) -> None:
         system = mc.MicrolensingSystem(
@@ -307,20 +374,23 @@ class MicrolensingSystemTests(unittest.TestCase):
 
     def test_rectangle_uses_internal_shear_aligned_coordinates(self) -> None:
         angle_deg = 37.5
-        source = mc.GaussianModel.from_angular(
-            self.distances,
+        source = mc.GaussianModel(
             sigma_uas=0.12,
             bands_angstrom={"optical": 6_000.0},
             axis_ratio=0.6,
-            position_angle_rad=math.radians(23.0),
+            position_angle_deg=23.0,
             source_grid_shape=24,
         )
-        population = mc.StellarPopulation.salpeter(count=12)
+        population = mc.StellarPopulation.salpeter(
+            count=12,
+            kinematics=mc.SkyProjectedKinematics(ra_deg=340.126125, dec_deg=3.358611),
+        )
         common = dict(
             macro=mc.MacroLens(0.3, 0.2, shear_angle_deg=angle_deg),
             distances=self.distances,
             source=source,
             stellar_population=population,
+            duration_days=100.0,
             seed=1001,
             runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
         )
@@ -349,6 +419,17 @@ class MicrolensingSystemTests(unittest.TestCase):
         )
         torch.testing.assert_close(rectangle.stars.x_uas, expected_x)
         torch.testing.assert_close(rectangle.stars.y_uas, expected_y)
+        for day in (0.0, 100.0):
+            sky = full.stars.at_time(day)
+            local = rectangle.stars.at_time(day)
+            torch.testing.assert_close(
+                local.x_uas,
+                math.cos(angle) * sky.x_uas + math.sin(angle) * sky.y_uas,
+            )
+            torch.testing.assert_close(
+                local.y_uas,
+                -math.sin(angle) * sky.x_uas + math.cos(angle) * sky.y_uas,
+            )
 
         expected_region = mc.rectangular_lens_region(
             mc.MacroLens(0.3, 0.2, shear_angle_deg=0.0),
@@ -367,8 +448,7 @@ class MicrolensingSystemTests(unittest.TestCase):
             initial_position_uas=(0.3, -0.2),
             velocity_uas_per_day=(0.02, 0.01),
         )
-        source = mc.GaussianModel.from_angular(
-            self.distances,
+        source = mc.GaussianModel(
             sigma_uas=0.1,
             bands_angstrom={"optical": 6_000.0},
             source_grid_shape=16,
@@ -598,8 +678,8 @@ class MicrolensingSystemTests(unittest.TestCase):
             ),
             keep_maps_at_days=(0.0, 1.0),
         )
-        self.assertEqual(tuple(curve.maps), (0.0, 1.0))
-        self.assertEqual(curve.maps[0.0].time_days, 0.0)
+        self.assertEqual(curve.map_times_days.tolist(), [0.0, 1.0])
+        self.assertEqual(curve.maps[0].time_days, 0.0)
 
     def test_profiling_is_opt_in(self) -> None:
         common = dict(
@@ -624,8 +704,7 @@ class MicrolensingSystemTests(unittest.TestCase):
         torch.testing.assert_close(ordinary.values, profiled.values)
 
     def test_angular_gaussian_and_trajectory_grid_hide_unit_plumbing(self) -> None:
-        model = mc.GaussianModel.from_angular(
-            self.distances,
+        model = mc.GaussianModel(
             sigma_uas=(0.1, 0.2),
             wavelengths_angstrom=(5000.0, 7000.0),
             band_names=("g", "i"),
@@ -637,7 +716,7 @@ class MicrolensingSystemTests(unittest.TestCase):
         )
         expected = self.distances.uas_to_source_length((0.1, 0.2), dtype=torch.float64)
         torch.testing.assert_close(
-            torch.tensor(model.sigma_m, dtype=torch.float64),
+            torch.tensor(model.pixelate(self.distances).sigma_m, dtype=torch.float64),
             expected,
         )
         grid = model.recommended_grid(self.distances)
@@ -836,6 +915,269 @@ class MicrolensingSystemTests(unittest.TestCase):
             metadata["kinematics"]["ra_deg"],
             340.126125,
         )
+        resolved = population.metadata(self.distances)["kinematics"]["resolved"]
+        self.assertEqual(len(resolved["lens_peculiar_velocity_km_s"]), 2)
+        self.assertEqual(len(resolved["source_peculiar_velocity_km_s"]), 2)
+        self.assertEqual(len(resolved["cmb_transverse_velocity_km_s"]), 2)
+        self.assertEqual(len(resolved["bulk_velocity_uas_per_day"]), 2)
+        self.assertGreater(
+            resolved["stellar_component_dispersion_uas_per_day"],
+            0.0,
+        )
+        self.assertEqual(resolved["coordinate_basis"], "ICRS east/north")
+
+    def test_system_seed_is_inherited_by_sampled_sky_kinematics(self) -> None:
+        population = mc.StellarPopulation.salpeter(
+            count=32,
+            kinematics=mc.SkyProjectedKinematics(
+                ra_deg=340.126125,
+                dec_deg=3.358611,
+            ),
+        )
+
+        def realize(seed):
+            return mc.MicrolensingSystem(
+                macro=self.macro,
+                distances=self.distances,
+                source_grid=self.source_grid,
+                stellar_population=population,
+                duration_days=10.0,
+                runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+                seed=seed,
+            ).realize()
+
+        first = realize(123)
+        second = realize(123)
+        different = realize(124)
+        torch.testing.assert_close(
+            first.stars.velocity_x_uas_per_day,
+            second.stars.velocity_x_uas_per_day,
+            rtol=0.0,
+            atol=0.0,
+        )
+        self.assertFalse(
+            torch.equal(
+                first.stars.velocity_x_uas_per_day,
+                different.stars.velocity_x_uas_per_day,
+            )
+        )
+        self.assertIsNone(population.kinematics.seed)
+        self.assertEqual(
+            first.stellar_population.kinematics.seed,
+            mc.derive_seed(123, "kinematics"),
+        )
+        resolved = first.metadata()["stellar_population"]["kinematics"]["resolved"]
+        self.assertEqual(resolved["coordinate_basis"], "ICRS east/north")
+
+    def test_component_seed_can_override_sampled_sky_kinematics(self) -> None:
+        population = mc.StellarPopulation.salpeter(
+            count=8,
+            kinematics=mc.SkyProjectedKinematics(ra_deg=1.0, dec_deg=2.0),
+        )
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            source_grid=self.source_grid,
+            stellar_population=population,
+            duration_days=10.0,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+            seed={"base": 123, "kinematics": 77},
+        )
+        self.assertEqual(system.realize().stellar_population.kinematics.seed, 77)
+
+    def test_unseeded_sky_kinematics_draws_once_without_reseeding(self) -> None:
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(811)
+            expected_first = torch.randn(4, dtype=torch.float64)
+            expected_second = torch.randn(4, dtype=torch.float64)
+            expected_next = torch.rand(3)
+            torch.manual_seed(811)
+            first = mc.SkyProjectedKinematics(ra_deg=1.0, dec_deg=2.0)
+            second = mc.SkyProjectedKinematics(ra_deg=1.0, dec_deg=2.0)
+            first_velocity = first.mean_velocity_uas_per_day(self.distances)
+            self.assertEqual(
+                first.mean_velocity_uas_per_day(self.distances), first_velocity
+            )
+            second_velocity = second.mean_velocity_uas_per_day(self.distances)
+            self.assertNotEqual(first_velocity, second_velocity)
+            self.assertIsNone(first.seed)
+            self.assertIsNone(second.seed)
+            self.assertEqual(first._peculiar_standard_draws, tuple(expected_first.tolist()))
+            self.assertEqual(second._peculiar_standard_draws, tuple(expected_second.tolist()))
+            torch.testing.assert_close(torch.rand(3), expected_next, rtol=0, atol=0)
+
+    def test_seeded_sky_kinematics_does_not_advance_global_stream(self) -> None:
+        with torch.random.fork_rng(devices=[]):
+            before = torch.get_rng_state().clone()
+            kinematics = mc.SkyProjectedKinematics(ra_deg=1.0, dec_deg=2.0, seed=0)
+            kinematics.mean_velocity_uas_per_day(self.distances)
+            torch.testing.assert_close(torch.get_rng_state(), before)
+
+    def test_summary_and_realization_use_the_same_kinematics(self) -> None:
+        for seed in (None, 0):
+            with self.subTest(seed=seed):
+                system = mc.MicrolensingSystem(
+                    macro=self.macro,
+                    distances=self.distances,
+                    source_grid=self.source_grid,
+                    stellar_population=mc.StellarPopulation.salpeter(
+                        count=16,
+                        kinematics=mc.SkyProjectedKinematics(ra_deg=1.0, dec_deg=2.0),
+                    ),
+                    seed=seed,
+                    runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+                )
+                summary = system.summary(duration_days=100.0, display=False)
+                realized = system._realize_for_times([0.0, 100.0])
+                self.assertEqual(
+                    summary["stellar_aperture_radius_uas"],
+                    realized.stellar_aperture.radius_uas,
+                )
+
+    def test_explicit_sky_seed_overrides_system_and_component_seeds(self) -> None:
+        kinematics = mc.SkyProjectedKinematics(ra_deg=1.0, dec_deg=2.0, seed=77)
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            source_grid=self.source_grid,
+            stellar_population=mc.StellarPopulation.salpeter(
+                count=8, kinematics=kinematics
+            ),
+            seed={"base": 0, "kinematics": 9},
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        self.assertIs(system.realize().stellar_population.kinematics, kinematics)
+
+    def test_sky_kinematics_projects_the_cmb_dipole(self) -> None:
+        shared = {
+            "ra_deg": 340.126125,
+            "dec_deg": 3.358611,
+            "stellar_dispersion_km_s": 170.0,
+            "lens_peculiar_velocity_km_s": (0.0, 0.0),
+            "source_peculiar_velocity_km_s": (0.0, 0.0),
+        }
+        with_cmb = mc.SkyProjectedKinematics(
+            **shared,
+            include_cmb_dipole=True,
+        ).mean_velocity_uas_per_day(self.distances)
+        without_cmb = mc.SkyProjectedKinematics(
+            **shared,
+            include_cmb_dipole=False,
+        ).mean_velocity_uas_per_day(self.distances)
+        self.assertEqual(without_cmb, (0.0, 0.0))
+        self.assertNotEqual(with_cmb, without_cmb)
+
+    def test_dynamic_population_warns_when_motion_components_are_missing(self) -> None:
+        def system(kinematics):
+            return mc.MicrolensingSystem(
+                macro=self.macro,
+                distances=self.distances,
+                source_grid=self.source_grid,
+                stellar_population=mc.StellarPopulation.salpeter(
+                    count=8,
+                    kinematics=kinematics,
+                ),
+                duration_days=10.0,
+                runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+                seed=0,
+            )
+
+        with self.assertWarnsRegex(mc.IncompleteKinematicsWarning, "CMB motion"):
+            system(mc.IsotropicKinematics(dispersion_km_s=170.0)).realize()
+        with self.assertWarnsRegex(
+            mc.IncompleteKinematicsWarning, "stellar dispersion"
+        ):
+            system(mc.StaticKinematics()).realize()
+        with self.assertWarnsRegex(
+            mc.IncompleteKinematicsWarning, "lens peculiar motion"
+        ):
+            system(
+                mc.SkyProjectedKinematics(
+                    ra_deg=1.0,
+                    dec_deg=2.0,
+                    stellar_dispersion_km_s=170.0,
+                    peculiar_velocity_dispersion_km_s=0.0,
+                )
+            ).realize()
+
+    def test_dynamic_explicit_stationary_field_warns(self) -> None:
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            source_grid=self.source_grid,
+            stars=mc.PointMassField([0.0], [0.0], [0.3]),
+            duration_days=10.0,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        with self.assertWarnsRegex(
+            mc.IncompleteKinematicsWarning, "contains no velocities"
+        ):
+            system.realize()
+
+    def test_empty_dynamic_catalog_has_no_motion_warning_or_invalid_metadata(self) -> None:
+        system = mc.MicrolensingSystem(
+            macro=mc.MacroLens(0.0, 0.0),
+            distances=self.distances,
+            source_grid=self.source_grid,
+            stars=mc.PointMassField([], [], [],
+                velocity_x_uas_per_day=[], velocity_y_uas_per_day=[]),
+            duration_days=10.0,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", mc.IncompleteKinematicsWarning)
+            self.assertFalse(system.realize().metadata()["stellar_motion"]["has_motion"])
+
+    def test_dynamic_explicit_motion_warns_for_missing_components(self) -> None:
+        def system(velocity_x, velocity_y):
+            return mc.MicrolensingSystem(
+                macro=self.macro,
+                distances=self.distances,
+                source_grid=self.source_grid,
+                stars=mc.PointMassField(
+                    [0.0, 0.1],
+                    [0.0, -0.1],
+                    [0.3, 0.2],
+                    velocity_x_uas_per_day=velocity_x,
+                    velocity_y_uas_per_day=velocity_y,
+                ),
+                duration_days=10.0,
+                runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+            )
+
+        with self.assertWarnsRegex(
+            mc.IncompleteKinematicsWarning, "stellar velocity dispersion"
+        ):
+            system([0.1, 0.1], [-0.2, -0.2]).realize()
+        with self.assertWarnsRegex(mc.IncompleteKinematicsWarning, "bulk motion"):
+            system([0.1, -0.1], [-0.2, 0.2]).realize()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", mc.IncompleteKinematicsWarning)
+            system([0.11, 0.09], [-0.18, -0.22]).realize()
+
+    def test_complete_sky_kinematics_emits_no_dynamic_warning(self) -> None:
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            source_grid=self.source_grid,
+            stellar_population=mc.StellarPopulation.salpeter(
+                count=8,
+                kinematics=mc.SkyProjectedKinematics(
+                    ra_deg=340.126125,
+                    dec_deg=3.358611,
+                    stellar_dispersion_km_s=170.0,
+                    peculiar_velocity_dispersion_km_s=235.0,
+                    include_cmb_dipole=True,
+                    seed=0,
+                ),
+            ),
+            duration_days=10.0,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+            seed=0,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            system.realize()
 
     def test_circular_population_adds_bulk_motion_to_random_velocities(self) -> None:
         population = mc.StellarPopulation.salpeter(
@@ -1056,12 +1398,11 @@ class MicrolensingSystemTests(unittest.TestCase):
         # unrelated orientation.
         self.assertLess(float(map_fractional_nrmse), 0.1)
 
-        geometry = mc.SourceGeometry.from_angular(
-            self.distances,
+        geometry = mc.SourceGeometry(
             shape=source_grid.shape,
             field_of_view_uas=source_grid.field_of_view_uas,
-            bands={"optical": 6_000.0},
-        )
+            bands_angstrom={"optical": 6_000.0},
+        ).resolve(self.distances)
         sigma_m = float(self.distances.uas_to_source_length(0.25, dtype=torch.float64))
         sky_source = mc.GaussianSource(
             geometry,
@@ -1144,6 +1485,11 @@ class MicrolensingSystemTests(unittest.TestCase):
         self.assertEqual(metadata["star_count"], len(stars))
         self.assertEqual(metadata["integration_domain"], "full")
         self.assertEqual(metadata["source"], None)
+        self.assertFalse(metadata["stellar_motion"]["has_motion"])
+        self.assertEqual(
+            metadata["stellar_motion"]["coordinate_basis"],
+            "realization x/y",
+        )
 
     def test_integration_domain_changes_region_not_stellar_population(self) -> None:
         population = mc.StellarPopulation.salpeter(
@@ -1483,6 +1829,61 @@ class MicrolensingSystemTests(unittest.TestCase):
         self.assertEqual(updated.arrival_time_delays_days["B"], 4.25)
         self.assertEqual(multi.arrival_time_delays_days["B"], 3.5)
 
+    def test_multi_image_system_shares_physical_bulk_motion_seed(self) -> None:
+        population = mc.StellarPopulation.salpeter(
+            count=16,
+            kinematics=mc.SkyProjectedKinematics(
+                ra_deg=340.126125,
+                dec_deg=3.358611,
+            ),
+        )
+        multi = mc.MultiImageSystem(
+            images={
+                "A": mc.MacroLens(0.2, 0.08),
+                "B": mc.MacroLens(0.3, 0.12),
+            },
+            distances=self.distances,
+            source_grid=self.source_grid,
+            stellar_population=population,
+            duration_days=10.0,
+            seed=123,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+            caustic_grid_shape=32,
+        )
+        first = multi.image("A").realize()
+        second = multi.image("B").realize()
+        first_kinematics = first.stellar_population.kinematics
+        second_kinematics = second.stellar_population.kinematics
+        self.assertEqual(first_kinematics.seed, second_kinematics.seed)
+        self.assertEqual(
+            first_kinematics._peculiar_velocities(self.distances),
+            second_kinematics._peculiar_velocities(self.distances),
+        )
+        self.assertFalse(torch.equal(first.stars.x_uas, second.stars.x_uas))
+
+    def test_unseeded_multi_image_population_keeps_one_shared_bulk_draw(self) -> None:
+        population = mc.StellarPopulation.salpeter(
+            count=16,
+            kinematics=mc.SkyProjectedKinematics(ra_deg=1.0, dec_deg=2.0),
+        )
+        multi = mc.MultiImageSystem(
+            images={"A": self.macro, "B": self.macro},
+            distances=self.distances,
+            source_grid=self.source_grid,
+            stellar_population=population,
+            duration_days=10.0,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        first = multi.image("A").realize()
+        second = multi.image("B").realize()
+        self.assertIsNone(first.stellar_population.kinematics.seed)
+        self.assertIsNone(second.stellar_population.kinematics.seed)
+        self.assertEqual(
+            first.stellar_population.kinematics.mean_velocity_uas_per_day(self.distances),
+            second.stellar_population.kinematics.mean_velocity_uas_per_day(self.distances),
+        )
+        self.assertFalse(torch.equal(first.stars.x_uas, second.stars.x_uas))
+
     def test_multi_image_system_builds_directly_from_macro_solutions(self) -> None:
         solutions = (
             mc.MacroImageSolution(
@@ -1566,7 +1967,7 @@ class MicrolensingSystemTests(unittest.TestCase):
             band_names=("blue", "red"),
             total_flux=(2.0, 3.0),
             axis_ratio=0.6,
-            position_angle_rad=0.4,
+            position_angle_deg=math.degrees(0.4),
             center_m=(2.0e9, -1.0e9),
             grid=mc.SourceGridConfig(
                 shape=(31, 37),
@@ -1645,7 +2046,7 @@ class MicrolensingSystemTests(unittest.TestCase):
 
     def test_expanding_photosphere_geometry_defines_system_grid(self) -> None:
         source = mc.paper_type_ia_supernova_source(
-            redshift=0.8,
+            redshift=self.distances.source_redshift,
             wavelengths_angstrom=(4_800.0, 7_500.0),
             maximum_observer_time_days=30.0,
             band_names=("blue", "red"),
@@ -1661,7 +2062,8 @@ class MicrolensingSystemTests(unittest.TestCase):
             runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
         )
         realization = system.realize()
-        self.assertIs(realization.source, source)
+        self.assertIsNot(realization.source, source)
+        self.assertEqual(realization.source.geometry, source.geometry)
         expected_support = float(
             self.distances.source_length_to_uas(
                 source.maximum_photosphere_radius_m,
@@ -1675,7 +2077,7 @@ class MicrolensingSystemTests(unittest.TestCase):
         self.assertAlmostEqual(
             realization.source_grid.field_of_view_uas[0]
             / (2.0 * realization.source_support_radius_uas),
-            source.source_fov_margin,
+            source.source_margin,
         )
         self.assertEqual(realization.source_grid.shape, (24, 24))
         expected_m = 2.0 * source.maximum_photosphere_radius_m * 1.05
@@ -1722,8 +2124,9 @@ class MicrolensingSystemTests(unittest.TestCase):
             gauge_count=3,
             minimum_alignment_gauges=1,
         )
-        actual = system.light_curve_with_labels(
+        actual = system.light_curve(
             (0.0,),
+            include_labels=True,
             method=self.method,
             schedule=mc.DynamicConfig(
                 temporal_batch_size=1,
@@ -1733,8 +2136,8 @@ class MicrolensingSystemTests(unittest.TestCase):
             caustics=caustic_config,
             keep_maps_at_days=(0.0,),
         )
-        self.assertEqual(tuple(actual.maps), (0.0,))
-        self.assertIsInstance(actual.maps[0.0], mc.MagnificationMap)
+        self.assertEqual(actual.map_times_days.tolist(), [0.0])
+        self.assertIsInstance(actual.maps[0], mc.MagnificationMap)
         realization = system.realize()
         expected = realization.simulation.light_curve_with_labels(
             realization.lens_region,
@@ -1752,12 +2155,12 @@ class MicrolensingSystemTests(unittest.TestCase):
             caustic_config=caustic_config,
         )
         torch.testing.assert_close(
-            actual.light_curve.flux,
+            actual.flux,
             expected.light_curve.flux,
             rtol=0.0,
             atol=0.0,
         )
-        torch.testing.assert_close(actual.crossing_labels, expected.crossing_labels)
+        torch.testing.assert_close(actual.labels.crossing_labels, expected.crossing_labels)
 
     def test_high_level_multirate_light_curve_matches_low_level_pipeline(self) -> None:
         pixel_scale_m = self.distances.uas_to_source_length(
@@ -1788,9 +2191,9 @@ class MicrolensingSystemTests(unittest.TestCase):
             fused_temporal_ipm=False,
             scout_refresh_frames=1,
         )
-        actual = system.multirate_light_curve(
+        actual = system.light_curve(
             (0.0, 1.0),
-            (0.0, 0.5, 1.0),
+            flux_times_days=(0.0, 0.5, 1.0),
             method=self.method,
             schedule=schedule,
         )

@@ -90,7 +90,7 @@ Every tuned map or caustic field records:
 - the selected temporal and spatial sizes.
 - total and accepted candidate counts.
 - the memory budget.
-- tuning time excluded from production timing. And
+- tuning time excluded from production timing.
 - whether the decision came from the process cache.
 
 For explicit experiments, `mc.autotune_dynamic_maps`,

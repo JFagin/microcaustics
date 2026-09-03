@@ -5,6 +5,20 @@ calculations behind one physical source. Define the shared source, redshifts,
 stellar-population prescription, and numerical settings once. Each named
 `MacroLens` then generates its own seeded star field and dynamic map sequence.
 
+Light-curve calls accept the same plain `rays`, `temporal_batch_size`,
+`scout_refresh_frames`, and optional `label_batch_size` controls as a single
+system. These override advanced configurations. Invalid controls or time axes
+raise before numerical setup rather than silently selecting a default.
+
+An optional driving signal belongs to the shared source, not to this system.
+Attach it with `KerrDiskModel(driving_signal=driver, ...)` for thermal
+reprocessing or with an explicit `ModulatedSource` for brightness modulation.
+One intrinsic realization is shared across macroimages with their respective
+arrival delays. Omit the driver for a steady source or an independently evolving
+supernova. `apply_driving_signal=True` raises if the source has no driver,
+while `False` disables only driver fluctuations. A replacement source uses its
+own driver and does not inherit one from the previous source.
+
 ```python
 images = {
     "A": mc.MacroLens(convergence=0.39, shear=0.40, shear_angle_deg=120.32),
@@ -12,6 +26,14 @@ images = {
     "C": mc.MacroLens(convergence=0.74, shear=0.73, shear_angle_deg=51.57),
     "D": mc.MacroLens(convergence=0.64, shear=0.62, shear_angle_deg=80.21),
 }
+
+kinematics = mc.SkyProjectedKinematics(
+    ra_deg=340.126125,
+    dec_deg=3.358611,
+    stellar_dispersion_km_s=170,
+    peculiar_velocity_dispersion_km_s=235,
+    include_cmb_dipole=True,
+)
 
 system = mc.MultiImageSystem(
     lens_redshift=0.0395,
@@ -29,7 +51,7 @@ system = mc.MultiImageSystem(
     integration_domain="scout",
     light_loss=0.01,
     safety_scale=1.5,
-    seed=1001,
+    seed=0,
 )
 
 result = system.light_curves(observation_times_days, include_labels=True)
@@ -56,7 +78,10 @@ Each resolved image owns its own:
 
 The source object, source-plane distances, and band definitions are shared.
 This keeps intrinsic variability coherent while allowing independent
-microlensing patterns and bulk velocities.
+microlensing patterns. A shared `SkyProjectedKinematics` prescription also
+shares the lens, source, and CMB bulk motion. The individual stars still have
+independent dispersion draws in each image. Explicit per-image velocities
+or kinematic seeds remain available for controlled comparisons.
 
 Bands remain arbitrary because the interface accepts any `PixelatedSource`.
 There is no built-in assumption of LSST `ugrizy`.
@@ -122,7 +147,7 @@ system = mc.MultiImageSystem.from_macroimage_solutions(
     source=source,
     stellar_population=stellar_population,
     duration_days=3650,
-    seed=1001,
+    seed=0,
 )
 ```
 
@@ -163,7 +188,7 @@ system = mc.MultiImageSystem.from_macroimage_solutions(
     source=source,
     stellar_population=stellar_population,
     duration_days=3650,
-    seed=1001,
+    seed=0,
 )
 ```
 
@@ -183,9 +208,10 @@ break. This choice belongs to the source model. Any custom `DrivingSignal` can
 be substituted without changing the multi-image or microlensing calculation.
 
 ```python
-curves = system.multirate_light_curves(
-    map_times_days=range(0, 3651, 25),
-    flux_times_days=range(0, 3651),
+curves = system.light_curves(
+    duration_days=3650,
+    map_cadence_days=25,
+    source_cadence_days=1,
     source=reprocessing_source,
     include_labels=True,
 )
@@ -193,7 +219,7 @@ curves = system.multirate_light_curves(
 
 The implementation retains at most two maps and never materializes daily
 interpolated maps. Caustic labels are returned only at the sparse map epochs,
-available through each image's `label_times_days`. At observer time `t`, image `i` evaluates the source at
+available through each image's `labels.times_days`. At observer time `t`, image `i` evaluates the source at
 `t - arrival_time_delay_days[i]`, while maps and source trajectories stay at
 observer time `t`.
 
@@ -215,11 +241,11 @@ For Rubin data, use an OpSim cadence and the standard random-plus-systematic
 magnitude uncertainty:
 
 ```python
-cadence = mc.sample_random_rubin_wfd_cadence("baseline.db", seed=7)
+cadence = mc.sample_random_rubin_wfd_cadence("baseline.db", seed=0)
 observations = mc.observe_multi_image_light_curves(
     curves,
     cadence,
-    seed=11,
+    seed=0,
 )
 ```
 

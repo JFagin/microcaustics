@@ -7,8 +7,10 @@ response arrays. This is preferred when a complete map cube is not a product.
 ## Retaining selected epochs
 
 High-level light-curve methods accept `keep_maps_at_days`. The returned
-`LightCurve.maps` mapping then contains only those requested epochs. This is
-the simplest choice for a small gallery or checkpoint set.
+`LightCurve.maps` tuple contains only requested epochs that were evaluated.
+Use `result.maps[0]` for the first retained map and `result.map_times_days` for
+their chronologically ordered times. Unavailable epochs warn and are omitted.
+This is the simplest choice for a small gallery or checkpoint set.
 
 ## Map observers
 
@@ -32,6 +34,16 @@ provenance.
 `load_light_curve` provide compact compressed-NPZ round trips for the two most
 common products. FITS integrates with astronomy tools. Chunked HDF5 or Zarr is
 preferable for long sequences. Serialization is always explicit.
+
+Light-curve archives preserve physical Jy fluxes and, when requested, the
+source-center labels, crossing flags, distances, censoring flags, and separate
+label epochs. After loading, use `result.labels.times_days` for that time axis.
+It need not match the finer photometry cadence in `result.times_days`.
+
+Full caustic geometry and retained magnification maps are not included in the
+compact light-curve archive. Loaded labels have `caustics=None`. Save retained
+maps separately with `save_magnification_map`. Older photometry-only archives
+remain readable and return `labels=None`.
 
 See `examples/notebooks/workflows/03_streaming_and_exporting_results.ipynb` for
 selective retention, portable NPZ round trips, and optional FITS export.

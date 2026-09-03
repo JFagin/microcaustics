@@ -19,6 +19,20 @@ from .trajectories import LinearTrajectory, SourceTrajectory
 AB_ZERO_POINT_JY = 3631.0
 
 
+def mag_to_flux(magnitude) -> torch.Tensor:
+    """Convert apparent AB magnitudes to physical flux densities in Jy.
+
+    Positive infinite magnitude maps to zero flux. NaN remains NaN. For
+    simulated curves use ``result.flux`` to retain the original values
+    without a magnitude round trip.
+    """
+
+    values = torch.as_tensor(magnitude)
+    if not values.is_floating_point():
+        values = values.to(torch.get_default_dtype())
+    return values.new_tensor(AB_ZERO_POINT_JY) * torch.pow(10.0, -0.4 * values)
+
+
 def flux_to_magnitude(flux_jy) -> torch.Tensor:
     """Convert physical flux density in Jy to AB magnitude.
 
@@ -44,10 +58,12 @@ class LightCurveRequest:
     scales, band names, and coverage policies. Compatible source array shapes
     are sampled together on an accelerator. Incompatible shapes are grouped
     automatically without changing their numerical result.
+    ``distances=None`` inherits geometry from a high-level system. Low-level
+    simulation calls must supply distances because they contain no cosmology.
     """
 
     source: PixelatedSource
-    distances: LensingDistances
+    distances: LensingDistances | None = None
     trajectory: SourceTrajectory | None = None
     strict_coverage: bool = True
     name: str | None = None
@@ -135,6 +151,60 @@ def _sample_map_batch(
         align_corners=False,
     )
     return sampled[:, 0]
+
+
+def _source_is_map_aligned(
+    source: PixelatedSource,
+    distances: LensingDistances,
+    trajectory: SourceTrajectory | None,
+    source_grid: PlaneGrid,
+) -> bool:
+    """Whether source pixels coincide exactly with the map pixel centers.
+
+    A centered, stationary source with the map's shape and angular field needs
+    no interpolation.  This check uses scalar geometry only, so enabling the
+    zero-copy path does not introduce an accelerator synchronization.
+    """
+
+    resolved_trajectory = LinearTrajectory() if trajectory is None else trajectory
+    if not isinstance(resolved_trajectory, LinearTrajectory):
+        return False
+    if tuple(float(value) for value in resolved_trajectory.initial_position_uas) != (
+        0.0,
+        0.0,
+    ) or tuple(float(value) for value in resolved_trajectory.velocity_uas_per_day) != (
+        0.0,
+        0.0,
+    ):
+        return False
+    if source.geometry.shape != source_grid.shape:
+        return False
+    source_fov_m = tuple(
+        scale * pixels
+        for scale, pixels in zip(
+            source.geometry.pixel_scale_m,
+            source.geometry.shape,
+            strict=True,
+        )
+    )
+    radians_to_uas = 180.0 / torch.pi * 3600.0 * 1.0e6
+    source_fov_uas = tuple(
+        length / distances.source_m * float(radians_to_uas) for length in source_fov_m
+    )
+    scale = max(*source_fov_uas, *source_grid.field_of_view_uas, 1.0)
+    tolerance = 16.0 * torch.finfo(torch.float32).eps * scale
+    return (
+        max(
+            abs(actual - expected)
+            for actual, expected in zip(
+                source_fov_uas,
+                source_grid.field_of_view_uas,
+                strict=True,
+            )
+        )
+        <= tolerance
+        and max(abs(value) for value in source_grid.center_uas) <= tolerance
+    )
 
 
 @torch.no_grad()
@@ -415,11 +485,15 @@ def multirate_streaming_light_curve(
         )
         fractions = torch.zeros_like(flux_times_device)
     else:
-        interval_indices = torch.searchsorted(
-            map_times_device,
-            flux_times_device,
-            right=True,
-        ).sub(1).clamp(0, map_times.numel() - 2)
+        interval_indices = (
+            torch.searchsorted(
+                map_times_device,
+                flux_times_device,
+                right=True,
+            )
+            .sub(1)
+            .clamp(0, map_times.numel() - 2)
+        )
         left_times = map_times_device[interval_indices]
         right_times = map_times_device[interval_indices + 1]
         fractions = (flux_times_device - left_times) / (right_times - left_times)
@@ -483,9 +557,7 @@ def multirate_streaming_light_curve(
     left_map = next_map(0)
     interval_count = max(1, int(map_times.numel()) - 1)
     for interval in range(interval_count):
-        right_map = (
-            left_map if map_times.numel() == 1 else next_map(interval + 1)
-        )
+        right_map = left_map if map_times.numel() == 1 else next_map(interval + 1)
         selected = torch.nonzero(interval_indices == interval).reshape(-1)
         if selected.numel() > 0:
             runtime.synchronize()
@@ -528,8 +600,7 @@ def multirate_streaming_light_curve(
                 selected_flux = selected_flux * amplitudes
                 selected_unlensed = selected_unlensed * amplitudes
             pixel_area_m2 = float(
-                source.geometry.pixel_scale_m[0]
-                * source.geometry.pixel_scale_m[1]
+                source.geometry.pixel_scale_m[0] * source.geometry.pixel_scale_m[1]
             )
             selected_flux = selected_flux * pixel_area_m2
             selected_unlensed = selected_unlensed * pixel_area_m2
@@ -577,7 +648,9 @@ def multirate_streaming_light_curve(
                 "dynamic_maps": map_seconds,
                 "source_brightness": source_seconds,
                 "map_source_contractions": convolution_seconds,
-            } if runtime.profiling.value == "detailed" else {},
+            }
+            if runtime.profiling.value == "detailed"
+            else {},
         ),
     )
 
@@ -593,6 +666,7 @@ def streaming_light_curves(
     method: IRSConfig | IPMConfig,
     schedule: DynamicConfig | None = None,
     map_observer: Callable[[int, MagnificationMap], None] | None = None,
+    flux_times_days: torch.Tensor | Sequence[float] | None = None,
     _map_iterator=None,
 ) -> tuple[LightCurve, ...]:
     """Generate several light curves from one streamed map sequence.
@@ -605,6 +679,8 @@ def streaming_light_curves(
     This API batches photometry for sources behind the same macroimage and
     point-mass realization. It does not claim fused map generation across
     different :class:`~microcaustics.MicrolensingSimulation` objects.
+    Optional ``flux_times_days`` samples every source on a finer or irregular
+    grid using the two bracketing maps. No interpolated map cube is built.
     """
 
     requests = tuple(requests)
@@ -612,18 +688,37 @@ def streaming_light_curves(
         raise ValueError("at least one light-curve request is required")
     if not all(isinstance(item, LightCurveRequest) for item in requests):
         raise TypeError("requests must contain LightCurveRequest instances")
+    if any(item.distances is None for item in requests):
+        raise ValueError(
+            "low-level requests require distances; use system.light_curves to inherit them"
+        )
     resolved_schedule = DynamicConfig() if schedule is None else schedule
-    times = torch.as_tensor(times_days).reshape(-1)
-    if not times.is_floating_point():
-        times = times.to(torch.get_default_dtype())
-    if times.numel() < 1:
-        raise ValueError("at least one light-curve time is required")
+    map_times = _increasing_times(times_days, name="times_days").cpu()
+    times = (
+        map_times
+        if flux_times_days is None
+        else _increasing_times(flux_times_days, name="flux_times_days").cpu()
+    )
+    if map_times.numel() > 1 and (times[0] < map_times[0] or times[-1] > map_times[-1]):
+        raise ValueError("flux_times_days must lie within the dynamic map cadence")
+    # Plan brackets on the CPU once. CUDA work below never synchronizes just
+    # to decide which dynamic frame a photometry epoch needs.
+    if map_times.numel() == 1:
+        right_indices = [0] * times.numel()
+        fractions = [0.0] * times.numel()
+    else:
+        right = torch.searchsorted(map_times, times).clamp(1, map_times.numel() - 1)
+        right_indices = right.tolist()
+        fractions = (
+            (times - map_times[right - 1]) / (map_times[right] - map_times[right - 1])
+        ).tolist()
     runtime = simulation.runtime
     device, dtype = runtime.device, runtime.dtype
     times_device = times.to(device=device, dtype=dtype)
 
     centers: list[torch.Tensor] = []
     offsets: list[tuple[torch.Tensor, torch.Tensor]] = []
+    map_aligned: list[bool] = []
     groups: dict[tuple[tuple[int, int], int, bool], list[int]] = {}
     for request_index, request in enumerate(requests):
         trajectory = (
@@ -637,6 +732,14 @@ def streaming_light_curves(
         if position.shape != (times.numel(), 2):
             raise ValueError("trajectory positions must have shape [time, 2]")
         centers.append(position)
+        map_aligned.append(
+            _source_is_map_aligned(
+                request.source,
+                request.distances,
+                request.trajectory,
+                source_grid,
+            )
+        )
         offsets.append(
             _source_offsets_uas(
                 request.source,
@@ -665,7 +768,7 @@ def streaming_light_curves(
         simulation.dynamic_maps(
             lens_region,
             source_grid,
-            times.tolist(),
+            map_times.tolist(),
             method=method,
             schedule=resolved_schedule,
         )
@@ -702,79 +805,92 @@ def streaming_light_curves(
     runtime.synchronize()
     source_seconds += perf_counter() - factorized_started
 
+    left_map = right_map = None
+    map_index = -1
+
+    def advance_map():
+        nonlocal left_map, right_map, map_index, map_seconds, dynamic_metadata
+        left_map, right_map = right_map, next(map_iterator)
+        map_index += 1
+        map_seconds += right_map.timing.delivered_seconds
+        map_methods.add(right_map.method)
+        dynamic_metadata = {
+            key: value
+            for key, value in right_map.metadata.items()
+            if key.startswith("dynamic_") or key.startswith("dual_scout_")
+        }
+        if map_observer is not None:
+            map_observer(map_index, right_map)
+
+    def sample_frame(frame, active, frame_index):
+        if all(map_aligned[index] for index in active):
+            return frame.values.unsqueeze(0).expand(len(active), -1, -1)
+        x_batch = torch.stack(
+            [offsets[index][0] + centers[index][frame_index, 0] for index in active]
+        )
+        y_batch = torch.stack(
+            [offsets[index][1] + centers[index][frame_index, 1] for index in active]
+        )
+        return _sample_map_batch(
+            frame, x_batch, y_batch, strict_coverage=requests[active[0]].strict_coverage
+        )
+
     for batch_start in range(0, int(times.numel()), temporal_batch):
         batch_stop = min(int(times.numel()), batch_start + temporal_batch)
         runtime.synchronize()
         source_started = perf_counter()
         brightness = [
-            (
-                request.source.brightness(
-                    times_device[batch_start:batch_stop],
-                    device=device,
-                    dtype=dtype,
-                )
-                if factorized_bases[index] is None
-                else None
+            request.source.brightness(
+                times_device[batch_start:batch_stop], device=device, dtype=dtype
             )
+            if factorized_bases[index] is None
+            else None
             for index, request in enumerate(requests)
         ]
         runtime.synchronize()
         source_seconds += perf_counter() - source_started
-
         for local, frame_index in enumerate(range(batch_start, batch_stop)):
-            magnification_map = next(map_iterator)
-            map_seconds += magnification_map.timing.delivered_seconds
-            map_methods.add(magnification_map.method)
-            dynamic_metadata = {
-                key: value
-                for key, value in magnification_map.metadata.items()
-                if key.startswith("dynamic_") or key.startswith("dual_scout_")
-            }
+            while map_index < right_indices[frame_index]:
+                advance_map()
+            weight = fractions[frame_index]
             for group_indices in groups.values():
                 for group_start in range(0, len(group_indices), curve_batch):
                     active = group_indices[group_start : group_start + curve_batch]
-                    x_batch = torch.stack(
-                        [
-                            offsets[index][0] + centers[index][frame_index, 0]
-                            for index in active
-                        ]
-                    )
-                    y_batch = torch.stack(
-                        [
-                            offsets[index][1] + centers[index][frame_index, 1]
-                            for index in active
-                        ]
-                    )
                     runtime.synchronize()
                     convolution_started = perf_counter()
-                    samples = _sample_map_batch(
-                        magnification_map,
-                        x_batch,
-                        y_batch,
-                        strict_coverage=requests[active[0]].strict_coverage,
+                    if left_map is None or weight == 1.0:
+                        samples = sample_frame(right_map, active, frame_index)
+                    else:
+                        samples = sample_frame(left_map, active, frame_index)
+                        if weight != 0.0:
+                            other = sample_frame(right_map, active, frame_index)
+                            samples = samples + weight * (other - samples)
+                    source_frames = torch.stack(
+                        [
+                            (
+                                factorized_bases[index]
+                                if factorized_bases[index] is not None
+                                else brightness[index][local]
+                            )
+                            for index in active
+                        ]
                     )
-                    source_frames = torch.stack([
-                        (
-                            factorized_bases[index]
-                            if factorized_bases[index] is not None
-                            else brightness[index][local]
-                        )
-                        for index in active
-                    ])
                     lensed = (source_frames * samples[..., None]).sum(dim=(1, 2))
                     unlensed = source_frames.sum(dim=(1, 2))
-                    modulation = torch.stack([
-                        (
-                            factorized_amplitudes[index][frame_index]
-                            if factorized_amplitudes[index] is not None
-                            else torch.ones(
-                                len(requests[index].source.geometry.band_names),
-                                device=device,
-                                dtype=dtype,
+                    modulation = torch.stack(
+                        [
+                            (
+                                factorized_amplitudes[index][frame_index]
+                                if factorized_amplitudes[index] is not None
+                                else torch.ones(
+                                    len(requests[index].source.geometry.band_names),
+                                    device=device,
+                                    dtype=dtype,
+                                )
                             )
-                        )
-                        for index in active
-                    ])
+                            for index in active
+                        ]
+                    )
                     lensed = lensed * modulation
                     unlensed = unlensed * modulation
                     runtime.synchronize()
@@ -782,9 +898,8 @@ def streaming_light_curves(
                     for row, index in enumerate(active):
                         flux_rows[index].append(lensed[row])
                         unlensed_rows[index].append(unlensed[row])
-            if map_observer is not None:
-                map_observer(frame_index, magnification_map)
-
+    while map_index < map_times.numel() - 1:
+        advance_map()
     try:
         next(map_iterator)
     except StopIteration:
@@ -804,7 +919,9 @@ def streaming_light_curves(
                 0.0,
                 elapsed - map_seconds - source_seconds - convolution_seconds,
             ),
-        } if runtime.profiling.value == "detailed" else {},
+        }
+        if runtime.profiling.value == "detailed"
+        else {},
     )
     results = []
     for index, request in enumerate(requests):
@@ -828,9 +945,13 @@ def streaming_light_curves(
                     "source_batch_size": temporal_batch,
                     "light_curve_batch_size": curve_batch,
                     "shared_map_request_count": len(requests),
-                    "coherent_source_factorized": (
-                        factorized_bases[index] is not None
-                    ),
+                    "map_epochs": int(map_times.numel()),
+                    "flux_epochs": int(times.numel()),
+                    "map_interpolation": "linear"
+                    if flux_times_days is not None
+                    else "none",
+                    "coherent_source_factorized": (factorized_bases[index] is not None),
+                    "map_aligned_source_fast_path": map_aligned[index],
                     **dynamic_metadata,
                 },
                 timing=timing,

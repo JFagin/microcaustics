@@ -297,19 +297,39 @@ class DocumentationIntegrityTests(unittest.TestCase):
         }
         self.assertEqual(required - names, set())
 
-    def test_training_notebooks_locate_repository_examples_headlessly(self) -> None:
-        """Training tutorials must not assume the repository is their CWD."""
+    def test_training_notebook_is_self_contained(self) -> None:
+        """Generate datasets directly and reserve worker scripts for optional use."""
 
         name = "workflows/04_simulation_datasets.ipynb"
-        text = (PACKAGE_ROOT / "examples" / "notebooks" / name).read_text(
-            encoding="utf-8"
+        notebook = json.loads(
+            (PACKAGE_ROOT / "examples" / "notebooks" / name).read_text(
+                encoding="utf-8"
+            )
         )
+        code = "\n".join(
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if cell["cell_type"] == "code"
+        )
+        markdown = "\n".join(
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if cell["cell_type"] == "markdown"
+        )
+        for call in (
+            "mc.MicrolensingSystem(",
+            ".light_curve(",
+            "mc.batched_system_light_curves(",
+        ):
+            self.assertIn(call, code)
+        for dependency in ("subprocess", "training_set_support", "__file__"):
+            self.assertNotIn(dependency, code)
         for script in (
             "generate_q2237_training_set.py",
             "generate_random_training_set.py",
         ):
-            self.assertIn("Path(mcp.__file__).resolve().parents[3]", text)
-            self.assertIn(script, text)
+            self.assertNotIn(script, code)
+            self.assertIn(script, markdown)
 
 
 if __name__ == "__main__":

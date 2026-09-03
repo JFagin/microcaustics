@@ -13,6 +13,17 @@ Timing-only accelerator synchronization is disabled by default. Set
 This makes accessing `result.timing` free of hidden profiling work during an
 ordinary production calculation.
 
+`system.warmup_light_curve(include_labels=True, temporal_batch_size=30)`
+uses the same configuration resolver as `system.light_curve`. No explicit
+Torch time array is needed. Warmup is optional because the first ordinary
+call also populates compatible compiled kernels.
+
+Independent-curve batching collects no wall time by default. Set
+`profile=True` on `batched_system_light_curves` to populate `wall_seconds` and
+`seconds_per_curve`. Otherwise both are `None`. Necessary CUDA stream
+dependencies remain in place regardless of profiling. Explicit concurrency
+tuning measures runtime and is therefore always profiled.
+
 Component timings and peak device memory are stored in `TimingBreakdown`.
 Examples and benchmarks must never combine compile time with steady-state time
 without labeling the combined quantity explicitly.

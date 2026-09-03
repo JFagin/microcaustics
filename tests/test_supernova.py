@@ -26,7 +26,7 @@ def simple_evolution() -> mc.PowerLawExponentialPhotosphere:
 class SupernovaSourceTests(unittest.TestCase):
     def test_band_mapping_replaces_parallel_name_and_wavelength_inputs(self) -> None:
         source = mc.ExpandingPhotosphereSource(
-            redshift=0.5,
+            source_redshift=0.5,
             bands_angstrom={"blue": 4_500.0, "red": 7_500.0},
             maximum_observer_time_days=100.0,
             evolution=simple_evolution(),
@@ -38,7 +38,7 @@ class SupernovaSourceTests(unittest.TestCase):
 
     def test_vectorized_brightness_and_exact_zero_before_explosion(self) -> None:
         source = mc.ExpandingPhotosphereSource(
-            redshift=0.5,
+            source_redshift=0.5,
             wavelengths_angstrom=(4_500.0, 7_500.0),
             band_names=("blue", "red"),
             maximum_observer_time_days=100.0,
@@ -58,7 +58,7 @@ class SupernovaSourceTests(unittest.TestCase):
 
     def test_default_float32_does_not_underflow_at_cosmological_distance(self) -> None:
         source = mc.ExpandingPhotosphereSource(
-            redshift=0.65,
+            source_redshift=0.65,
             wavelengths_angstrom=(7_500.0,),
             maximum_observer_time_days=100.0,
             evolution=simple_evolution(),
@@ -71,12 +71,12 @@ class SupernovaSourceTests(unittest.TestCase):
 
     def test_fixed_field_contains_maximum_radius_with_requested_margin(self) -> None:
         source = mc.ExpandingPhotosphereSource(
-            redshift=0.2,
+            source_redshift=0.2,
             wavelengths_angstrom=(6_000.0,),
             maximum_observer_time_days=80.0,
             evolution=simple_evolution(),
             source_grid_shape=40,
-            source_fov_margin=1.1,
+            source_margin=1.1,
             luminosity_distance_m=1.0e25,
         )
         field_half_width = (
@@ -90,7 +90,7 @@ class SupernovaSourceTests(unittest.TestCase):
 
     def test_custom_profile_and_spectral_modifier_are_supported(self) -> None:
         kwargs = dict(
-            redshift=0.3,
+            source_redshift=0.3,
             wavelengths_angstrom=(5_000.0, 8_000.0),
             maximum_observer_time_days=60.0,
             evolution=simple_evolution(),

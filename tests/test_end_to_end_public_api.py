@@ -216,6 +216,62 @@ class PublicWorkflowTests(unittest.TestCase):
         self.assertEqual(streamed.band_names, ("blue", "red"))
         self.assertFalse(streamed.metadata["maps_retained"])
 
+    def test_aligned_source_uses_exact_map_pixels(self) -> None:
+        """The production geometry skips a redundant bilinear resampling."""
+
+        simulation = _moving_simulation()
+        method = _method()
+        schedule = mc.DynamicConfig(
+            temporal_batch_size=2,
+            fused_temporal_ipm=True,
+            scout_refresh_frames=1,
+        )
+        dy_uas, dx_uas = self.source_grid.pixel_scale_uas
+        dy_m, dx_m = self.distances.uas_to_source_length(
+            torch.tensor((dy_uas, dx_uas)),
+            dtype=torch.float64,
+        ).tolist()
+        geometry = mc.SourceGeometry(
+            shape=self.source_grid.shape,
+            pixel_scale_m=(dy_m, dx_m),
+            wavelengths_angstrom=(6_000.0,),
+            band_names=("band",),
+        )
+        source = mc.StaticSource(
+            torch.linspace(
+                0.5,
+                1.5,
+                self.source_grid.shape[0] * self.source_grid.shape[1],
+            ).reshape(*self.source_grid.shape, 1),
+            geometry,
+        )
+        maps = tuple(
+            simulation.dynamic_maps(
+                self.lens_region,
+                self.source_grid,
+                self.times,
+                method=method,
+                schedule=schedule,
+            )
+        )
+        explicit = simulation.light_curve_from_maps(
+            maps,
+            source,
+            self.times,
+            self.distances,
+        )
+        streamed = simulation.light_curve(
+            self.lens_region,
+            self.source_grid,
+            self.times,
+            source,
+            self.distances,
+            method=method,
+            schedule=schedule,
+        )
+        torch.testing.assert_close(streamed.flux, explicit.flux)
+        self.assertTrue(streamed.metadata["map_aligned_source_fast_path"])
+
     def test_spatial_chunk_and_temporal_batch_do_not_change_maps(self) -> None:
         simulation = _moving_simulation()
         outputs = []

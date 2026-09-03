@@ -21,7 +21,9 @@ if triton is not None:
         center_x_ptr,
         center_y_ptr,
         selected_ptr,
-        n_cells,
+        total_cells,
+        CELLS_PER_FRAME: tl.constexpr,
+        VERTICES_PER_FRAME: tl.constexpr,
         COLUMNS: tl.constexpr,
         XMIN: tl.constexpr,
         XMAX: tl.constexpr,
@@ -31,11 +33,13 @@ if triton is not None:
         BLOCK: tl.constexpr,
     ):
         linear = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        valid = linear < n_cells
-        row = linear // COLUMNS
-        column = linear - row * COLUMNS
+        valid = linear < total_cells
+        frame = linear // CELLS_PER_FRAME
+        cell = linear - frame * CELLS_PER_FRAME
+        row = cell // COLUMNS
+        column = cell - row * COLUMNS
         vertex_columns = COLUMNS + 1
-        index00 = row * vertex_columns + column
+        index00 = frame * VERTICES_PER_FRAME + row * vertex_columns + column
         index01 = index00 + 1
         index10 = index00 + vertex_columns
         index11 = index10 + 1
@@ -96,16 +100,19 @@ if triton is not None:
     def _dilate_selection_kernel(
         input_ptr,
         output_ptr,
-        n_cells,
+        total_cells,
+        CELLS_PER_FRAME: tl.constexpr,
         ROWS: tl.constexpr,
         COLUMNS: tl.constexpr,
         RADIUS: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         linear = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        valid = linear < n_cells
-        row = linear // COLUMNS
-        column = linear - row * COLUMNS
+        valid = linear < total_cells
+        frame = linear // CELLS_PER_FRAME
+        cell = linear - frame * CELLS_PER_FRAME
+        row = cell // COLUMNS
+        column = cell - row * COLUMNS
         retained = tl.zeros((BLOCK,), tl.int1)
         for row_offset in range(-RADIUS, RADIUS + 1):
             neighbor_row = row + row_offset
@@ -118,7 +125,11 @@ if triton is not None:
                     & (neighbor_column >= 0)
                     & (neighbor_column < COLUMNS)
                 )
-                neighbor = neighbor_row * COLUMNS + neighbor_column
+                neighbor = (
+                    frame * CELLS_PER_FRAME
+                    + neighbor_row * COLUMNS
+                    + neighbor_column
+                )
                 retained |= tl.load(
                     input_ptr + neighbor,
                     mask=neighbor_valid,
@@ -145,20 +156,27 @@ def select_source_tiles_triton(
 
     if not triton_scout_available():
         raise RuntimeError("Triton source scouting is unavailable")
-    if corner_x.shape != corner_y.shape or corner_x.ndim != 2:
-        raise ValueError("corner arrays must share shape [rows+1, columns+1]")
+    if corner_x.shape != corner_y.shape or corner_x.ndim not in (2, 3):
+        raise ValueError(
+            "corner arrays must share shape [rows+1, columns+1] or "
+            "[frames, rows+1, columns+1]"
+        )
     if corner_x.device.type != "cuda" or corner_x.dtype != torch.float32:
         raise ValueError("Triton source scouting requires CUDA float32")
     has_center = center_x is not None or center_y is not None
     if has_center and (center_x is None or center_y is None):
         raise ValueError("both center arrays must be supplied together")
-    rows = int(corner_x.shape[0]) - 1
-    columns = int(corner_x.shape[1]) - 1
+    temporal = corner_x.ndim == 3
+    frames = int(corner_x.shape[0]) if temporal else 1
+    rows = int(corner_x.shape[-2]) - 1
+    columns = int(corner_x.shape[-1]) - 1
     if rows < 1 or columns < 1:
         raise ValueError("corner arrays must describe at least one cell")
     if has_center and (
-        center_x.shape != (rows, columns)
-        or center_y.shape != (rows, columns)
+        center_x.shape
+        != ((frames, rows, columns) if temporal else (rows, columns))
+        or center_y.shape
+        != ((frames, rows, columns) if temporal else (rows, columns))
     ):
         raise ValueError("center arrays must have shape [rows, columns]")
     corner_x = corner_x.contiguous()
@@ -170,8 +188,13 @@ def select_source_tiles_triton(
     else:
         center_x = placeholder
         center_y = placeholder
-    selected = torch.empty((rows, columns), device=corner_x.device, dtype=torch.bool)
-    count = rows * columns
+    selected_shape = (
+        (frames, rows, columns) if temporal else (rows, columns)
+    )
+    selected = torch.empty(selected_shape, device=corner_x.device, dtype=torch.bool)
+    cells_per_frame = rows * columns
+    vertices_per_frame = (rows + 1) * (columns + 1)
+    count = frames * cells_per_frame
     block = 256
     xmin, xmax, ymin, ymax = (float(value) for value in bounds)
     _source_box_selection_kernel[(triton.cdiv(count, block),)](
@@ -181,6 +204,8 @@ def select_source_tiles_triton(
         center_y,
         selected,
         count,
+        CELLS_PER_FRAME=cells_per_frame,
+        VERTICES_PER_FRAME=vertices_per_frame,
         COLUMNS=columns,
         XMIN=xmin,
         XMAX=xmax,
@@ -201,16 +226,24 @@ def dilate_source_tiles_triton(mask: torch.Tensor, cells: int) -> torch.Tensor:
         return mask
     if cells > 8:
         raise ValueError("the fused Triton dilation supports at most eight cells")
-    if mask.device.type != "cuda" or mask.dtype != torch.bool or mask.ndim != 2:
-        raise ValueError("mask must be a 2D CUDA boolean tensor")
-    rows, columns = (int(value) for value in mask.shape)
+    if (
+        mask.device.type != "cuda"
+        or mask.dtype != torch.bool
+        or mask.ndim not in (2, 3)
+    ):
+        raise ValueError("mask must be a 2D or batched 3D CUDA boolean tensor")
+    temporal = mask.ndim == 3
+    frames = int(mask.shape[0]) if temporal else 1
+    rows, columns = (int(value) for value in mask.shape[-2:])
     result = torch.empty_like(mask)
-    count = rows * columns
+    cells_per_frame = rows * columns
+    count = frames * cells_per_frame
     block = 256
     _dilate_selection_kernel[(triton.cdiv(count, block),)](
         mask,
         result,
         count,
+        CELLS_PER_FRAME=cells_per_frame,
         ROWS=rows,
         COLUMNS=columns,
         RADIUS=cells,

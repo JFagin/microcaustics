@@ -7,6 +7,20 @@ import torch
 
 import microcaustics as mc
 
+distances = mc.LensingDistances(1.0e25, 2.0e25, 1.0e25)
+kinematics = mc.SkyProjectedKinematics(
+    ra_deg=340.126125,
+    dec_deg=3.358611,
+    stellar_dispersion_km_s=170.0,
+    peculiar_velocity_dispersion_km_s=235.0,
+    include_cmb_dipole=True,
+    lens_redshift=0.08,
+    source_redshift=0.18,
+    seed=0,
+)
+bulk_x, bulk_y = kinematics.mean_velocity_uas_per_day(distances)
+dispersion = kinematics.component_dispersion_uas_per_day(distances)
+
 
 def stars(offset: float) -> mc.PointMassField:
     """Return a small moving field for one illustrative macroimage."""
@@ -15,8 +29,8 @@ def stars(offset: float) -> mc.PointMassField:
         torch.tensor([-0.4 + offset, 0.45 + offset]),
         torch.tensor([0.3, -0.2]),
         mass_solar=torch.tensor([0.001791, 0.002579]),
-        velocity_x_uas_per_day=torch.tensor([0.001, -0.0008]),
-        velocity_y_uas_per_day=torch.tensor([-0.0004, 0.0006]),
+        velocity_x_uas_per_day=bulk_x + dispersion * torch.tensor([0.7, -0.6]),
+        velocity_y_uas_per_day=bulk_y + dispersion * torch.tensor([-0.4, 0.5]),
     )
 
 
@@ -33,7 +47,7 @@ driver = mc.broken_power_law_driving_signal(
     alpha_L=1.0,
     alpha_R=3.0,
     standard_deviation=0.1,
-    seed=8,
+    seed=0,
     extrapolation="hold",
 )
 source = mc.ModulatedSource(base_source, driver)
@@ -49,7 +63,7 @@ system = mc.MultiImageSystem(
         "A": mc.MacroLens(convergence=0.2, shear=0.12),
         "B": mc.MacroLens(convergence=0.2, shear=0.18),
     },
-    distances=mc.LensingDistances(1.0e25, 2.0e25, 1.0e25),
+    distances=distances,
     source=source,
     stars={"A": stars(0.0), "B": stars(0.1)},
     arrival_time_delays_days={"A": 0.0, "B": 7.4},
@@ -58,9 +72,10 @@ system = mc.MultiImageSystem(
     duration_days=50.0,
 )
 
-curves = system.multirate_light_curves(
-    map_times_days=[0.0, 25.0, 50.0],
-    flux_times_days=torch.arange(0.0, 51.0).tolist(),
+curves = system.light_curves(
+    duration_days=50,
+    map_cadence_days=25,
+    source_cadence_days=1,
 )
 cadence = mc.SurveyCadence(
     time_days=np.array([3.0, 12.0, 26.0, 41.0, 49.0]),
@@ -70,7 +85,7 @@ cadence = mc.SurveyCadence(
 observations = mc.observe_multi_image_light_curves(
     curves,
     cadence,
-    seed=4,
+    seed=0,
 )
 print("truth", curves.flux_tensor().shape)
 print("observations", observations.magnitude.shape)

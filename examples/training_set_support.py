@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from time import perf_counter
 
@@ -21,134 +21,6 @@ import microcaustics as mc
 
 WAVELENGTHS_ANGSTROM = (3671.0, 4827.0, 6223.0, 7546.0, 8691.0, 9712.0)
 BAND_NAMES = ("u", "g", "r", "i", "z", "y")
-
-
-def plot_training_light_curves(
-    records,
-    output_path: str | Path,
-    *,
-    annotations: list[str] | None = None,
-):
-    """Plot training curves and their three source-center diagnostics.
-
-    This presentation helper keeps the generation notebooks focused on the
-    physical systems and priors. Stored fluxes remain in Jy; conversion to AB
-    magnitudes uses the public package conversion.
-    """
-
-    import matplotlib.pyplot as plt
-
-    from microcaustics import plotting as mcp
-
-    records = list(records)
-    annotations = [""] * len(records) if annotations is None else annotations
-    if len(annotations) != len(records):
-        raise ValueError("annotations must match the number of records")
-    figure = plt.figure(figsize=(14.2, 2.28 * len(records)))
-    layout = figure.add_gridspec(
-        len(records), 4,
-        width_ratios=(5.4, 1.45, 1.15, 1.55), hspace=0.10, wspace=0.32,
-    )
-    for index, (record, annotation) in enumerate(zip(records, annotations, strict=True)):
-        time = record["times_days"]
-        map_time = record["map_times_days"] if "map_times_days" in record.files else time
-        names = record["band_names"].astype(str).tolist()
-        band = names.index("i")
-        total_mag = mc.flux_to_magnitude(torch.as_tensor(record["flux"][:, band])).numpy()
-        micro_mag = mc.flux_to_magnitude(
-            torch.as_tensor(record["flux_microlensing_only"][:, band])
-        ).numpy()
-        diagnostics = (
-            np.log10(np.clip(record["center_magnification"], 1.0e-12, None)),
-            record["crossing_events"].astype(float),
-            record["center_distance_uas"],
-        )
-
-        axis = figure.add_subplot(layout[index, 0])
-        axis.plot(time, micro_mag, color="black", lw=1.35, label="Microlensing only")
-        axis.plot(
-            time, total_mag, color="darkorange", lw=1.15,
-            label="Microlensing + intrinsic variability",
-        )
-        axis.invert_yaxis()
-        axis.set_ylabel(f"LC {index + 1}\nbrightness [mag]")
-        if annotation:
-            axis.text(0.012, 0.08, annotation, transform=axis.transAxes, fontsize=8.5)
-        if index == 0:
-            axis.legend(loc="upper right", frameon=True, fontsize=9)
-        if index < len(records) - 1:
-            axis.tick_params(labelbottom=False)
-        else:
-            axis.set_xlabel("time [days]")
-        mcp.finish_axis(axis)
-
-        labels = (r"$\log_{10}\mu$", "crossing", r"$d_{\rm caustic}$ [$\mu$as]")
-        for column, (values, label) in enumerate(
-            zip(diagnostics, labels, strict=True), start=1
-        ):
-            axis = figure.add_subplot(layout[index, column])
-            if column == 2:
-                axis.step(map_time, values, where="pre", color="black", lw=1.05)
-                axis.set_ylim(-0.05, 1.05)
-                axis.set_yticks((0, 1))
-            else:
-                axis.plot(map_time, values, color="black", lw=1.05)
-            axis.set_xlim(float(time[0]), float(time[-1]))
-            axis.set_ylabel(label, fontsize=9, labelpad=2)
-            if index == 0 and column == 2:
-                axis.set_title("Labels at source center", fontsize=10)
-            if index < len(records) - 1:
-                axis.tick_params(labelbottom=False)
-            else:
-                axis.set_xlabel("time [days]", fontsize=9)
-            mcp.finish_axis(axis)
-    figure.align_ylabels()
-    figure.subplots_adjust(left=0.075, right=0.99, bottom=0.065, top=0.98)
-    figure.savefig(Path(output_path), bbox_inches="tight")
-    return figure
-
-
-def plot_training_map_gallery(
-    frames,
-    output_path: str | Path,
-    *,
-    source_widths_uas=None,
-):
-    """Plot one consistently normalized labeled map per training realization."""
-
-    import matplotlib.pyplot as plt
-
-    from microcaustics import plotting as mcp
-
-    frames = list(frames)
-    widths = [None] * len(frames) if source_widths_uas is None else source_widths_uas
-    logs = [
-        np.log10(np.clip(frame.magnification_map.numpy(), 1.0e-12, None))
-        for frame in frames
-    ]
-    finite = np.concatenate([values[np.isfinite(values)] for values in logs])
-    vmin, vmax = np.percentile(finite, (0.25, 99.75))
-    figure = plt.figure(figsize=(2.96 * len(frames), 3.15))
-    layout = figure.add_gridspec(
-        1, len(frames) + 1,
-        width_ratios=(*([1] * len(frames)), 0.045), wspace=0.06,
-    )
-    axes = [figure.add_subplot(layout[0, index]) for index in range(len(frames))]
-    colorbar_axis = figure.add_subplot(layout[0, -1])
-    for index, (axis, frame, width) in enumerate(zip(axes, frames, widths, strict=True)):
-        scale_bar = 2.0 if width is None or float(width) >= 4.0 else 0.5
-        mcp.plot_magnification_map(
-            frame.magnification_map, ax=axis, caustics=frame.caustics.caustics,
-            log10=True, vmin=float(vmin), vmax=float(vmax), colorbar=False,
-            scale_bar_uas=scale_bar, show_axes=False,
-            title=rf"LC {index + 1}, $t=0$ days",
-        )
-    colorbar = figure.colorbar(axes[-1].images[-1], cax=colorbar_axis)
-    colorbar.set_label(r"$\log_{10}\mu$")
-    colorbar.ax.tick_params(direction="in")
-    figure.subplots_adjust(left=0.015, right=0.985, bottom=0.03, top=0.88)
-    figure.savefig(Path(output_path), bbox_inches="tight")
-    return figure
 
 
 @dataclass(frozen=True)
@@ -218,7 +90,6 @@ def runtime_for_device(device: str) -> mc.RuntimeConfig:
 
 
 def _thin_disk(
-    distances: mc.LensingDistances,
     *,
     source_redshift: float,
     black_hole_mass_solar: float,
@@ -229,7 +100,7 @@ def _thin_disk(
     times_days: torch.Tensor,
     driver_seed: int,
     source_resolution: int,
-) -> mc.PixelatedSource:
+) -> mc.ModulatedSource:
     """Construct a multiband disk with a reproducible broken-PSD driver."""
 
     model = mc.ThinDiskModel(
@@ -247,7 +118,6 @@ def _thin_disk(
         enclosed_flux_fraction=0.999,
         source_margin=1.05,
     )
-    disk = model.pixelate(distances)
     driver = mc.broken_power_law_driving_signal(
         times_days,
         break_timescale_days=200.0,
@@ -257,7 +127,7 @@ def _thin_disk(
         seed=int(driver_seed),
         extrapolation="hold",
     )
-    return mc.ModulatedSource(disk, driver, name="variable_thin_disk")
+    return mc.ModulatedSource(model, driver, name="variable_thin_disk")
 
 
 def q2237_b_system(
@@ -272,7 +142,6 @@ def q2237_b_system(
     """Build one Q2237 image-B-like realization from public package objects."""
 
     lens_redshift, source_redshift = 0.0395, 1.695
-    distances = mc.LensingDistances.from_redshifts(lens_redshift, source_redshift)
     macro = mc.MacroLens(
         convergence=0.391,
         shear=0.391,
@@ -282,13 +151,12 @@ def q2237_b_system(
     black_hole_mass_solar = 10.0**9.08
     spin = 0.74
     source = _thin_disk(
-        distances,
         source_redshift=source_redshift,
         black_hole_mass_solar=black_hole_mass_solar,
         eddington_ratio=0.34,
         spin=spin,
         inclination_deg=10.0,
-        position_angle_deg=175.0,
+        position_angle_deg=0.0,
         times_days=times_days,
         driver_seed=driver_seed,
         source_resolution=source_resolution,
@@ -296,7 +164,14 @@ def q2237_b_system(
     population = mc.StellarPopulation.salpeter(
         mean_mass_solar=0.3,
         mass_ratio=100.0,
-        kinematics=mc.IsotropicKinematics(dispersion_km_s=180.0),
+        kinematics=mc.SkyProjectedKinematics(
+            ra_deg=340.126125,
+            dec_deg=3.358611,
+            stellar_dispersion_km_s=170.0,
+            peculiar_velocity_dispersion_km_s=235.0,
+            include_cmb_dipole=True,
+            seed=int(seed),
+        ),
     )
     system = mc.MicrolensingSystem(
         lens_redshift=lens_redshift,
@@ -320,6 +195,9 @@ def q2237_b_system(
             "seed": int(seed),
             "driver_seed": int(driver_seed),
             "star_count": len(realization.stars),
+            "kinematics": realization.stellar_population.metadata(
+                system.distances
+            )["kinematics"],
             "source_fov_uas": realization.source_grid.field_of_view_uas[0],
             "lens_fov_uas": realization.lens_region.field_of_view_uas[0],
             "kappa": macro.convergence,
@@ -360,7 +238,8 @@ def random_system(
     # obscuration physics absent from this compact thin-disk demonstration.
     inclination = float(np.degrees(np.arccos(rng.uniform(0.5, 1.0))))
     disk_angle = float(rng.uniform(0.0, 180.0))
-    distances = mc.LensingDistances.from_redshifts(lens_redshift, source_redshift)
+    ra_deg = float(rng.uniform(0.0, 360.0))
+    dec_deg = float(np.degrees(np.arcsin(rng.uniform(-1.0, 1.0))))
     macro = mc.MacroLens(
         convergence=kappa,
         shear=gamma,
@@ -369,7 +248,6 @@ def random_system(
     )
     black_hole_mass_solar = 10.0**log_mass
     source = _thin_disk(
-        distances,
         source_redshift=source_redshift,
         black_hole_mass_solar=black_hole_mass_solar,
         eddington_ratio=eddington_ratio,
@@ -383,7 +261,14 @@ def random_system(
     population = mc.StellarPopulation.salpeter(
         mean_mass_solar=0.3,
         mass_ratio=100.0,
-        kinematics=mc.IsotropicKinematics(dispersion_km_s=180.0),
+        kinematics=mc.SkyProjectedKinematics(
+            ra_deg=ra_deg,
+            dec_deg=dec_deg,
+            stellar_dispersion_km_s=170.0,
+            peculiar_velocity_dispersion_km_s=235.0,
+            include_cmb_dipole=True,
+            seed=int(seed + 300_000),
+        ),
     )
     system = mc.MicrolensingSystem(
         lens_redshift=lens_redshift,
@@ -414,6 +299,11 @@ def random_system(
             "spin": spin,
             "inclination_deg": inclination,
             "disk_position_angle_deg": disk_angle,
+            "ra_deg": ra_deg,
+            "dec_deg": dec_deg,
+            "kinematics": realization.stellar_population.metadata(
+                system.distances
+            )["kinematics"],
             "source_fov_uas": realization.source_grid.field_of_view_uas[0],
             "lens_fov_uas": realization.lens_region.field_of_view_uas[0],
             "star_count": len(realization.stars),
@@ -427,10 +317,11 @@ def generate_labeled_example(
     flux_times_days: torch.Tensor,
     *,
     rays: int,
-) -> tuple[mc.MultirateLabeledLightCurve, np.ndarray, float]:
+) -> tuple[mc.LightCurve, np.ndarray, float]:
     """Generate sparse dynamic maps/labels and a fine-cadence light curve."""
 
     method = mc.production_ipm_config(rays=int(rays))
+    schedule = mc.production_dynamic_config(temporal_batch_size=30)
     caustics = mc.CausticConfig(
         far_field_approx=method.far_field_approx,
         jacobian_chunk_size=1_048_576,
@@ -450,10 +341,12 @@ def generate_labeled_example(
 
     system.simulation.runtime.synchronize()
     start = perf_counter()
-    result = system.system.multirate_light_curve_with_labels(
+    result = system.system.light_curve(
         map_times_days,
-        flux_times_days,
+        flux_times_days=flux_times_days,
+        include_labels=True,
         method=method,
+        schedule=schedule,
         caustics=caustics,
         map_observer=retain_center_magnification,
     )
@@ -461,6 +354,14 @@ def generate_labeled_example(
     elapsed = perf_counter() - start
     center_series = (
         torch.stack(center_magnifications).cpu().numpy().astype(np.float32, copy=False)
+    )
+    result = replace(
+        result,
+        metadata={
+            **result.metadata,
+            "training_method": asdict(method),
+            "training_dynamic_schedule": asdict(schedule),
+        },
     )
     return result, center_series, elapsed
 
@@ -496,7 +397,7 @@ def generate_labeled_examples(
     rays: int,
     curves_per_batch: int,
 ) -> tuple[
-    tuple[tuple[mc.MultirateLabeledLightCurve, np.ndarray, float], ...],
+    tuple[tuple[mc.LightCurve, np.ndarray, float], ...],
     mc.IndependentLightCurveBatch,
 ]:
     """Generate independent labeled systems concurrently on one device."""
@@ -505,6 +406,7 @@ def generate_labeled_examples(
     if not systems:
         raise ValueError("at least one training system is required")
     method = mc.production_ipm_config(rays=int(rays))
+    schedule = mc.production_dynamic_config(temporal_batch_size=30)
     caustics = mc.CausticConfig(
         far_field_approx=method.far_field_approx,
         jacobian_chunk_size=1_048_576,
@@ -519,13 +421,26 @@ def generate_labeled_examples(
         curves_per_batch=int(curves_per_batch),
         include_labels=True,
         method=method,
+        schedule=schedule,
         caustics=caustics,
         map_observers=collectors,
         oom_backoff=True,
+        profile=True,
     )
     amortized = batch.seconds_per_curve
     generated = tuple(
-        (result, collector.numpy(), amortized)
+        (
+            replace(
+                result,
+                metadata={
+                    **result.metadata,
+                    "training_method": asdict(method),
+                    "training_dynamic_schedule": asdict(schedule),
+                },
+            ),
+            collector.numpy(),
+            amortized,
+        )
         for result, collector in zip(batch.light_curves, collectors, strict=True)
     )
     return generated, batch
@@ -534,7 +449,7 @@ def generate_labeled_examples(
 def save_example(
     output_dir: Path,
     index: int,
-    result: mc.LabeledLightCurve | mc.MultirateLabeledLightCurve,
+    result: mc.LightCurve,
     center_magnifications: np.ndarray,
     source: mc.PixelatedSource,
     metadata: Mapping[str, object],
@@ -546,7 +461,12 @@ def save_example(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = output_dir / f"light_curve_{int(index):05d}"
-    curve = result.light_curve
+    curve = result
+    labels = result.labels
+    if labels is None:
+        raise ValueError("training examples require include_labels=True")
+    if curve.unlensed_flux is None:
+        raise ValueError("training examples require the unlensed_flux data product")
     if isinstance(source, mc.ModulatedSource):
         amplitudes = source.signal.amplitudes(
             curve.times_days,
@@ -558,17 +478,16 @@ def save_example(
         amplitudes = torch.ones_like(curve.flux)
     microlensing_only_flux = curve.flux / amplitudes
     static_unlensed_flux = curve.unlensed_flux / amplitudes
-    center_distances = np.asarray(
-        [frame.labels.center_distance_uas for frame in result.caustics],
-        dtype=np.float32,
+    center_distances = (
+        labels.center_distances_uas.detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32, copy=False)
     )
     # The public label product caps no-in-field-caustic cases at the inscribed
     # source radius and records explicitly that they are right-censored.
     center_distance_cap_uas = 0.5 * float(metadata["source_fov_uas"])
-    center_distance_censored = np.asarray(
-        [frame.labels.center_distance_censored for frame in result.caustics],
-        dtype=bool,
-    )
+    center_distance_censored = labels.center_distance_censored.detach().cpu().numpy()
     center_distances_capped = np.where(
         np.isfinite(center_distances),
         np.minimum(center_distances, center_distance_cap_uas),
@@ -577,11 +496,7 @@ def save_example(
     np.savez_compressed(
         stem.with_suffix(".npz"),
         times_days=curve.times_days.detach().cpu().numpy(),
-        map_times_days=(
-            result.map_times_days.detach().cpu().numpy()
-            if isinstance(result, mc.MultirateLabeledLightCurve)
-            else curve.times_days.detach().cpu().numpy()
-        ),
+        map_times_days=labels.times_days.detach().cpu().numpy(),
         flux=curve.flux.detach().cpu().numpy(),
         unlensed_flux=curve.unlensed_flux.detach().cpu().numpy(),
         flux_microlensing_only=microlensing_only_flux.detach().cpu().numpy(),
@@ -592,8 +507,8 @@ def save_example(
         center_distance_capped_uas=center_distances_capped,
         center_distance_censored=center_distance_censored,
         center_distance_cap_uas=np.asarray(center_distance_cap_uas, dtype=np.float32),
-        crossing_labels=result.crossing_labels.numpy(),
-        crossing_events=result.crossing_events.numpy(),
+        crossing_labels=labels.crossing_labels.detach().cpu().numpy(),
+        crossing_events=labels.crossing_events.detach().cpu().numpy(),
         band_names=np.asarray(curve.band_names),
     )
     payload = {
@@ -601,12 +516,11 @@ def save_example(
         "index": int(index),
         "worker": int(worker),
         "runtime_seconds": float(runtime_seconds),
-        "map_epochs": int(len(result.caustics)),
+        "map_epochs": int(labels.times_days.numel()),
         "flux_epochs": int(curve.times_days.numel()),
         "map_cadence_days": (
-            float(result.map_times_days[1] - result.map_times_days[0])
-            if isinstance(result, mc.MultirateLabeledLightCurve)
-            and result.map_times_days.numel() > 1
+            float(labels.times_days[1] - labels.times_days[0])
+            if labels.times_days.numel() > 1
             else None
         ),
         "source_cadence_days": (
@@ -614,12 +528,14 @@ def save_example(
             if curve.times_days.numel() > 1
             else None
         ),
-        "timing_components_seconds": dict(curve.timing.component_seconds),
-        "steady_seconds": float(curve.timing.steady_seconds),
-        "method": asdict(mc.production_ipm_config()),
-        "dynamic_schedule": asdict(
-            mc.production_dynamic_config(temporal_batch_size=30)
+        "timing_components_seconds": (
+            dict(curve.timing.component_seconds) if curve.timing.collected else {}
         ),
+        "steady_seconds": (
+            float(curve.timing.steady_seconds) if curve.timing.collected else None
+        ),
+        "method": curve.metadata.get("training_method"),
+        "dynamic_schedule": curve.metadata.get("training_dynamic_schedule"),
     }
     # Convert enum-like values and nested tensors only through JSON's explicit
     # string fallback. Numerical arrays stay in the NPZ rather than metadata.

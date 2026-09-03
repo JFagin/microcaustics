@@ -152,12 +152,11 @@ class FoundationTests(unittest.TestCase):
 
     def test_source_geometry_from_angular_field(self) -> None:
         distances = LensingDistances(8.0e24, 1.6e25, 9.0e24)
-        geometry = SourceGeometry.from_angular(
-            distances,
+        geometry = SourceGeometry(
             shape=(20, 40),
             field_of_view_uas=(2.0, 8.0),
-            bands={"g": 4800.0, "i": 7600.0},
-        )
+            bands_angstrom={"g": 4800.0, "i": 7600.0},
+        ).resolve(distances)
         field_m = distances.uas_to_source_length(
             torch.tensor((2.0, 8.0)), dtype=torch.float32
         )
@@ -165,6 +164,14 @@ class FoundationTests(unittest.TestCase):
         self.assertAlmostEqual(geometry.pixel_scale_m[0], float(field_m[0]) / 20)
         self.assertAlmostEqual(geometry.pixel_scale_m[1], float(field_m[1]) / 40)
         self.assertEqual(geometry.band_names, ("g", "i"))
+        self.assertEqual(geometry.wavelengths_angstrom, (4800.0, 7600.0))
+
+    def test_source_geometry_from_angular_requires_named_wavelengths(self) -> None:
+        """Reject empty wavelength mappings with the public argument name."""
+        with self.assertRaisesRegex(ValueError, "bands_angstrom"):
+            SourceGeometry(
+                shape=4, field_of_view_uas=2.0, bands_angstrom={}
+            )
 
     def test_backend_falls_back_without_triton(self) -> None:
         capabilities = RuntimeCapabilities(

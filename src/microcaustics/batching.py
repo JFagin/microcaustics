@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -33,13 +34,17 @@ class IndependentLightCurveBatch:
     requested_curves_per_batch: int
     executed_batch_sizes: tuple[int, ...]
     oom_reductions: int
-    wall_seconds: float
+    wall_seconds: float | None
 
     @property
-    def seconds_per_curve(self) -> float:
+    def seconds_per_curve(self) -> float | None:
         """Return the amortized wall time per independent light curve."""
 
-        return self.wall_seconds / max(len(self.light_curves), 1)
+        return (
+            None
+            if self.wall_seconds is None
+            else self.wall_seconds / max(len(self.light_curves), 1)
+        )
 
 
 @dataclass(frozen=True)
@@ -194,9 +199,7 @@ def _calculate_compatible_batch(
                 "temporal_reuse": False,
             },
         )
-        for index, (request, output) in enumerate(
-            zip(requests, outputs, strict=True)
-        )
+        for index, (request, output) in enumerate(zip(requests, outputs, strict=True))
     )
 
 
@@ -245,6 +248,7 @@ def batched_system_maps(
     method: IPMConfig | None = None,
     batch_size: int | None = None,
     time_days: float = 0.0,
+    **solver_options,
 ) -> tuple[MagnificationMap, ...]:
     """Generate compatible independent maps from high-level systems.
 
@@ -254,10 +258,21 @@ def batched_system_maps(
     compatible numerical work and applies no temporal or shared-field
     approximation. Automatic OOM recovery is inherited from
     :func:`batched_magnification_maps`.
+    Plain ``rays``, ``refinement``, ``virtual_refinement``, ``scout_ratio`` and
+    ``far_field`` overrides match ``system.magnification_map``. An advanced
+    IPM configuration remains optional.
     """
 
     from .config import _production_static_ipm_config
-    from .system import MicrolensingRealization
+    from .system import MicrolensingRealization, _with_method_options
+
+    options = _with_method_options(dict(method=method, **solver_options), dynamic=False)
+    unknown = set(options) - {"method"}
+    if unknown:
+        raise TypeError(f"unsupported static-map options {sorted(unknown)}")
+    method = options["method"]
+    if method is not None and not isinstance(method, IPMConfig):
+        raise ValueError("independent fused static-map batching requires an IPM method")
 
     resolved = []
     for item in systems:
@@ -277,9 +292,7 @@ def batched_system_maps(
     resolved = tuple(resolved)
     if not resolved:
         raise ValueError("at least one microlensing system is required")
-    requested_method = (
-        _production_static_ipm_config() if method is None else method
-    )
+    requested_method = _production_static_ipm_config() if method is None else method
     methods = tuple(item._method_for_domain(requested_method) for item in resolved)
     if any(candidate != methods[0] for candidate in methods[1:]):
         raise ValueError("batched systems must use the same integration domain")
@@ -315,7 +328,7 @@ def _curve_flux(result: object) -> torch.Tensor:
 
 
 def _curve_labels(result: object) -> torch.Tensor | None:
-    labels = getattr(result, "crossing_labels", None)
+    labels = getattr(getattr(result, "labels", result), "crossing_labels", None)
     return None if labels is None else torch.as_tensor(labels)
 
 
@@ -342,19 +355,15 @@ def _run_independent_curve(
         kwargs["caustics"] = caustics
 
     def calculate() -> object:
-        if flux_times_days is None:
-            function = (
-                realization.light_curve_with_labels
-                if include_labels
-                else realization.light_curve
-            )
-            return function(map_times_days, **kwargs)
-        function = (
-            realization.multirate_light_curve_with_labels
-            if include_labels
-            else realization.multirate_light_curve
+        from .system import _evaluate_light_curve
+
+        return _evaluate_light_curve(
+            realization,
+            map_times_days,
+            flux_times_days,
+            include_labels=include_labels,
+            **kwargs,
         )
-        return function(map_times_days, flux_times_days, **kwargs)
 
     if stream is None:
         return calculate()
@@ -392,11 +401,11 @@ def _run_independent_group(
                 map_observer=observer,
                 stream=None,
             )
-            for realization, observer in zip(
-                realizations, map_observers, strict=True
-            )
+            for realization, observer in zip(realizations, map_observers, strict=True)
         )
     streams = tuple(torch.cuda.Stream(device=device) for _ in realizations)
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream(device))
     with ThreadPoolExecutor(max_workers=len(realizations)) as executor:
         futures = tuple(
             executor.submit(
@@ -420,16 +429,24 @@ def _run_independent_group(
 
 def batched_system_light_curves(
     systems: Sequence[MicrolensingSystem | MicrolensingRealization],
-    map_times_days: Sequence[float],
+    map_times_days: Sequence[float] | None = None,
     flux_times_days: Sequence[float] | None = None,
     *,
     curves_per_batch: int = 1,
+    duration_days: float | None = None,
+    map_cadence_days: float | None = None,
+    source_cadence_days: float | None = None,
+    start_day: float = 0.0,
     include_labels: bool = False,
+    apply_driving_signal: bool | None = None,
     method: IPMConfig | IRSConfig | None = None,
     schedule: DynamicConfig | None = None,
     caustics: CausticConfig | None = None,
     map_observers: Sequence[object | None] | None = None,
     oom_backoff: bool = True,
+    keep_maps_at_days: Sequence[float] | None = None,
+    profile: bool = False,
+    **solver_options,
 ) -> IndependentLightCurveBatch:
     """Generate independent systems concurrently on one CUDA device.
 
@@ -443,30 +460,69 @@ def batched_system_light_curves(
     depends on stellar count, map geometry, labels and accelerator memory.
     """
 
+    from .sources.variability import _validate_source_driver
+    from .system import (
+        _light_curve_options,
+        _light_curve_times,
+        _retaining_map_observer,
+    )
+
+    map_times_days, flux_times_days = _light_curve_times(
+        map_times_days,
+        duration_days=duration_days,
+        map_cadence_days=map_cadence_days,
+        source_cadence_days=source_cadence_days,
+        flux_times_days=flux_times_days,
+        start_day=start_day,
+    )
+    options = _light_curve_options(
+        dict(method=method, schedule=schedule, caustics=caustics, **solver_options),
+        include_labels=include_labels,
+    )
+    method, schedule, caustics = (
+        options.get("method"),
+        options["schedule"],
+        options.get("caustics"),
+    )
     systems = tuple(systems)
     if not systems:
         raise ValueError("at least one microlensing system is required")
     requested = int(curves_per_batch)
     if requested < 1:
         raise ValueError("curves_per_batch must be positive")
-    realizations = tuple(
-        item if hasattr(item, "simulation") else item.realize() for item in systems
-    )
     observers = (
-        (None,) * len(realizations)
-        if map_observers is None
-        else tuple(map_observers)
+        (None,) * len(systems) if map_observers is None else tuple(map_observers)
     )
-    if len(observers) != len(realizations):
+    if len(observers) != len(systems):
         raise ValueError("map_observers must match the number of systems")
+    retained = []
+    if keep_maps_at_days is not None:
+        composed = []
+        for observer in observers:
+            combined, maps = _retaining_map_observer(
+                map_times_days, keep_maps_at_days, observer
+            )
+            composed.append(combined)
+            retained.append(maps)
+        observers = tuple(composed)
+    for item in systems:
+        _validate_source_driver(item.source, apply_driving_signal)
+    realizations = tuple(
+        item if hasattr(item, "simulation") else item._realize_for_times(map_times_days)
+        for item in systems
+    )
+    if apply_driving_signal is False:
+        realizations = tuple(
+            replace(item, source=item._mean_source) for item in realizations
+        )
     device = realizations[0].simulation.runtime.device
     for realization in realizations[1:]:
         if realization.simulation.runtime.device != device:
             raise ValueError("one independent batch must use a single device")
 
-    if device.type == "cuda":
+    if profile and device.type == "cuda":
         torch.cuda.synchronize(device)
-    start_time = perf_counter()
+    start_time = perf_counter() if profile else None
     outputs: list[object] = []
     executed: list[int] = []
     oom_reductions = 0
@@ -500,23 +556,34 @@ def batched_system_light_curves(
                 if callable(reset):
                     reset()
             current = max(1, count // 2)
+            warnings.warn(
+                f"CUDA memory was insufficient for {count} concurrent light curves. "
+                f"Retrying with curves_per_batch={current}; numerical settings are unchanged",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
                 torch.cuda.empty_cache()
-    if device.type == "cuda":
+    if profile and device.type == "cuda":
         torch.cuda.synchronize(device)
+    if retained:
+        outputs = [
+            replace(item, maps=maps)
+            for item, maps in zip(outputs, retained, strict=True)
+        ]
     return IndependentLightCurveBatch(
         light_curves=tuple(outputs),
         requested_curves_per_batch=requested,
         executed_batch_sizes=tuple(executed),
         oom_reductions=oom_reductions,
-        wall_seconds=perf_counter() - start_time,
+        wall_seconds=None if start_time is None else perf_counter() - start_time,
     )
 
 
 def tune_system_light_curve_batch(
     systems: Sequence[MicrolensingSystem | MicrolensingRealization],
-    map_times_days: Sequence[float],
+    map_times_days: Sequence[float] | None = None,
     flux_times_days: Sequence[float] | None = None,
     *,
     candidates: Sequence[int] = (1, 2, 3, 4),
@@ -527,14 +594,32 @@ def tune_system_light_curve_batch(
     verify_numerics: bool = True,
     rtol: float = 5.0e-5,
     atol: float = 5.0e-6,
+    duration_days: float | None = None,
+    map_cadence_days: float | None = None,
+    source_cadence_days: float | None = None,
+    start_day: float = 0.0,
+    apply_driving_signal: bool | None = None,
+    **solver_options,
 ) -> IndependentBatchTuningResult:
     """Benchmark independent-curve concurrency on representative systems.
 
     The systems should resemble the intended workload. The function reports
     rejected OOM candidates and verifies fluxes and labels against sequential
     execution by default. Tuning is never run implicitly by production calls.
+    Duration, cadence and plain solver controls match
+    :func:`batched_system_light_curves`.
     """
 
+    from .system import _light_curve_times
+
+    map_times_days, flux_times_days = _light_curve_times(
+        map_times_days,
+        duration_days=duration_days,
+        map_cadence_days=map_cadence_days,
+        source_cadence_days=source_cadence_days,
+        flux_times_days=flux_times_days,
+        start_day=start_day,
+    )
     systems = tuple(systems)
     values = tuple(dict.fromkeys(int(value) for value in candidates))
     if not values or any(value < 1 for value in values):
@@ -545,6 +630,9 @@ def tune_system_light_curve_batch(
         schedule=schedule,
         caustics=caustics,
         oom_backoff=False,
+        profile=True,
+        apply_driving_signal=apply_driving_signal,
+        **solver_options,
     )
     # Pay first-call compilation before collecting the sequential reference.
     batched_system_light_curves(

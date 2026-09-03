@@ -4,13 +4,15 @@ For ordinary physical systems, describe the population rather than its
 already sampled tensors:
 
 ```python
+kinematics = mc.SkyProjectedKinematics(
+    ra_deg=340.126125,
+    dec_deg=3.358611,
+    stellar_dispersion_km_s=170,
+    peculiar_velocity_dispersion_km_s=235,
+    include_cmb_dipole=True,
+)
 population = mc.StellarPopulation.salpeter(
-    mean_mass_solar=0.3,
-    mass_ratio=100,
-    kinematics=mc.IsotropicKinematics(
-        dispersion_km_s=180,
-        bulk_velocity_km_s=(0, 0),
-    ),
+    mean_mass_solar=0.3, mass_ratio=100, kinematics=kinematics,
 )
 system = mc.MicrolensingSystem(
     macro=macro,
@@ -20,32 +22,36 @@ system = mc.MicrolensingSystem(
     duration_days=3650,
     light_loss=0.01,
     safety_scale=1.5,
-    seed=1001,
+    seed=0,
 )
 ```
 
-For the complete observer-frame velocity construction, include the sky
-position and lens/source peculiar motions:
+The sampled lens and source velocities inherit the system seed. Set `seed`
+inside `SkyProjectedKinematics` only when that physical velocity realization
+must remain fixed while the stellar realization changes.
 
-```python
-kinematics = mc.SkyProjectedKinematics(
-    ra_deg=340.126125,
-    dec_deg=3.358611,
-    peculiar_velocity_dispersion_km_s=235,
-    stellar_dispersion_km_s=170,
-    seed=2001,
-)
-population = mc.StellarPopulation.salpeter(
-    mean_mass_solar=0.3,
-    mass_ratio=100,
-    kinematics=kinematics,
-)
-```
+With no seed on either object, the first velocity query draws from PyTorch's
+existing random stream without reseeding it. The draw is retained by the
+kinematic object so that subsequent epochs and geometry calculations use
+the same bulk motion. Construct a new kinematic object for a fresh unseeded
+bulk-motion realization. Shared macroimage populations deliberately share
+this motion, while their stars have independent positions and dispersions.
+`system.metadata()` records the realized lens, source, CMB, and combined bulk
+velocities, as well as the coordinate basis and stellar dispersion.
 
-This projects the CMB dipole onto the local east/north axes and combines it
-with lens and source peculiar velocities. Supplying the two peculiar-velocity
-pairs directly avoids sampling them. The stellar dispersion still generates
-an independent proper motion for every compact object.
+The sky position projects the CMB dipole. The sampled peculiar-velocity model
+adds independent lens and source terms, while the stellar dispersion supplies
+an independent proper motion for every compact object. Supply explicit lens
+and source velocity pairs instead when they are measured.
+
+The source peculiar velocity is already included in the effective stellar
+drift. Do not add that same motion again through a source trajectory.
+An additional trajectory should describe a separate relative displacement.
+
+`IsotropicKinematics` remains available for controlled calculations that use
+one already-combined bulk velocity. Dynamic systems warn when this reduced
+model, stationary kinematics, zero stellar dispersion, or an omitted CMB,
+lens, or source term is used.
 
 This path samples the complete circular stellar field. Its aperture is derived
 from the source support, the full macro-lens matrix including shear angle, the
@@ -82,13 +88,19 @@ macro = mc.MacroLens(
     smooth_matter_fraction=0.2,
 )
 lens_region = mc.PlaneRegion((800.0, 800.0))
+motion = system.realize().stellar_population.kinematics  # bound system seed
 stars = mc.PointMassField.sample_uniform(
     lens_region,
     macro,
     distances,
     mc.kroupa_mass_function(0.08, 10.0),
-    seed=1001,
-    velocity_dispersion_uas_per_day=(2.0e-4, 2.0e-4),
+    seed=0,
+    velocity_dispersion_uas_per_day=(
+        motion.component_dispersion_uas_per_day(distances),
+    ) * 2,
+    velocity_mean_uas_per_day=(
+        motion.mean_velocity_uas_per_day(distances)
+    ),
 )
 print(mc.compact_convergence(stars, lens_region))
 ```

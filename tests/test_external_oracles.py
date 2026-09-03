@@ -228,6 +228,31 @@ class SciPyOracleTests(unittest.TestCase):
 
 @unittest.skipUnless(ASTROPY_AVAILABLE, "Astropy validation dependency is unavailable")
 class AstropyOracleTests(unittest.TestCase):
+    def test_cmb_velocity_projection_matches_astropy_coordinates(self) -> None:
+        import astropy.units as units
+        from astropy.coordinates import SkyCoord
+
+        for ra, dec in ((340.126125, 3.358611), (0.0, 0.0), (71.0, -54.0), (5.0, 90.0)):
+            with self.subTest(ra=ra, dec=dec):
+                motion = mc.SkyProjectedKinematics(ra_deg=ra, dec_deg=dec)
+                dipole = SkyCoord(
+                    l=motion.cmb_galactic_longitude_deg * units.deg,
+                    b=motion.cmb_galactic_latitude_deg * units.deg,
+                    frame="galactic",
+                ).icrs.cartesian.xyz.value * motion.cmb_speed_km_s
+                longitude, latitude = np.deg2rad([ra, dec])
+                east = np.array([-np.sin(longitude), np.cos(longitude), 0.0])
+                north = np.array([
+                    -np.sin(latitude) * np.cos(longitude),
+                    -np.sin(latitude) * np.sin(longitude),
+                    np.cos(latitude),
+                ])
+                np.testing.assert_allclose(
+                    motion._cmb_transverse_km_s(),
+                    [dipole @ east, dipole @ north],
+                    rtol=0.0, atol=5e-5,  # rounded ICRS/Galactic rotation matrix
+                )
+
     def test_ab_magnitude_matches_astropy_photometric_units(self) -> None:
         import astropy.units as units
 

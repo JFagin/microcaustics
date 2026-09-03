@@ -22,6 +22,7 @@ from .populations import (
     sample_uniform_point_masses,
 )
 from .stellar import (
+    IncompleteKinematicsWarning,
     IsotropicKinematics,
     SkyProjectedKinematics,
     StaticKinematics,
@@ -41,6 +42,7 @@ __all__ = [
     "einstein_units_to_uas",
     "uas_to_einstein_units",
     "PowerLawMassFunction",
+    "IncompleteKinematicsWarning",
     "IsotropicKinematics",
     "SkyProjectedKinematics",
     "StaticKinematics",

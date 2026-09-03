@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import cached_property
 
 import numpy as np
 import torch
@@ -62,9 +63,30 @@ class MagnificationMap:
         return self.values.detach().cpu().numpy()
 
 
+class _RetainedMaps(tuple):
+    """Chronologically ordered maps with an actionable empty-access error."""
+
+    def __getitem__(self, index):
+        try:
+            return super().__getitem__(index)
+        except IndexError as error:
+            raise IndexError(
+                f"retained map index {index} is out of range for {len(self)} maps. "
+                "Request evaluated epochs with keep_maps_at_days and inspect "
+                "result.map_times_days before indexing result.maps"
+            ) from error
+
+
 @dataclass(frozen=True)
 class LightCurve:
-    """Lensed and optional unlensed multiband flux densities in Jy."""
+    """Physical multiband photometry and optional retained maps and labels.
+
+    ``magnitude`` gives apparent AB magnitudes and ``flux`` preserves the
+    original flux density in Jy. Both have shape ``[time, band]``. Retained
+    maps are indexed by integer, with aligned epochs in ``map_times_days``.
+    Optional center labels have their own, potentially coarser, time axis.
+    Accessing an output never repeats the simulation.
+    """
 
     times_days: torch.Tensor
     flux: torch.Tensor
@@ -72,7 +94,8 @@ class LightCurve:
     unlensed_flux: torch.Tensor | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     timing: TimingBreakdown = field(default_factory=TimingBreakdown)
-    maps: Mapping[float, MagnificationMap] = field(default_factory=dict)
+    maps: tuple[MagnificationMap, ...] = ()
+    labels: LightCurveLabels | None = None
 
     def __post_init__(self) -> None:
         times = torch.as_tensor(self.times_days)
@@ -88,7 +111,29 @@ class LightCurve:
             object.__setattr__(self, "unlensed_flux", unlensed)
         object.__setattr__(self, "times_days", times)
         object.__setattr__(self, "flux", flux)
-        object.__setattr__(self, "maps", dict(self.maps))
+        maps = self.maps.values() if isinstance(self.maps, Mapping) else self.maps
+        maps = _RetainedMaps(sorted(maps, key=lambda item: item.time_days))
+        if any(
+            a.time_days >= b.time_days for a, b in zip(maps, maps[1:], strict=False)
+        ):
+            raise ValueError("retained maps must have unique finite epochs")
+        if any(not math.isfinite(item.time_days) for item in maps):
+            raise ValueError("retained maps must have unique finite epochs")
+        object.__setattr__(self, "maps", maps)
+
+    @property
+    def magnitude(self) -> torch.Tensor:
+        """Apparent AB magnitudes, with NaN for invalid or nonpositive flux."""
+
+        from .photometry import flux_to_magnitude
+
+        return flux_to_magnitude(self.flux)
+
+    @property
+    def map_times_days(self) -> torch.Tensor:
+        """Epochs aligned with the retained maps, empty when none were requested."""
+
+        return torch.tensor([item.time_days for item in self.maps], dtype=torch.float64)
 
 
 @dataclass(frozen=True)
@@ -161,8 +206,10 @@ class TransferFunction:
         edges = torch.as_tensor(self.delay_edges_days)
         values = torch.as_tensor(self.values)
         means = torch.as_tensor(self.mean_delays_days)
-        if edges.ndim != 1 or edges.numel() < 2 or not bool(
-            torch.all(edges[1:] > edges[:-1])
+        if (
+            edges.ndim != 1
+            or edges.numel() < 2
+            or not bool(torch.all(edges[1:] > edges[:-1]))
         ):
             raise ValueError("delay_edges_days must be strictly increasing")
         expected = (edges.numel() - 1, len(self.band_names))
@@ -578,11 +625,14 @@ class AnchorGaugeLabels:
         anchors = torch.as_tensor(self.anchor_points_uas)
         gauges = torch.as_tensor(self.gauge_points_uas)
         gauge_count = int(gauge_labels.numel())
-        if any(int(value.numel()) != gauge_count for value in (
-            gauge_distances,
-            gauge_votes,
-            gauge_valid,
-        )):
+        if any(
+            int(value.numel()) != gauge_count
+            for value in (
+                gauge_distances,
+                gauge_votes,
+                gauge_valid,
+            )
+        ):
             raise ValueError("all gauge diagnostics must have one value per gauge")
         if anchors.ndim != 2 or anchors.shape[-1] != 2:
             raise ValueError("anchor_points_uas must have shape [anchor, 2]")
@@ -664,188 +714,194 @@ def _cap_center_distances(
 
 
 @dataclass(frozen=True)
-class LabeledLightCurve:
-    """A streamed finite-source light curve and its per-epoch labels."""
+class LightCurveLabels:
+    """Source-center label arrays on their own observer-time axis.
 
-    light_curve: LightCurve
-    caustics: tuple[LabeledCausticFrame, ...]
+    All arrays have shape [label epoch]. Distances are in microarcseconds and
+    retain the source-radius censoring flag. Optional full caustic frames are
+    available in memory but are not part of a compact light-curve archive.
+    """
 
-    @property
-    def maps(self) -> Mapping[float, MagnificationMap]:
-        """Selected magnification maps retained with the light curve."""
-
-        return self.light_curve.maps
+    times_days: torch.Tensor
+    crossing_labels: torch.Tensor
+    crossing_events: torch.Tensor
+    center_distances_uas: torch.Tensor
+    center_distance_censored: torch.Tensor
+    caustics: tuple[LabeledCausticFrame, ...] | None = None
 
     def __post_init__(self) -> None:
-        if len(self.caustics) != int(self.light_curve.times_days.numel()):
-            raise ValueError("caustic frames must match the light-curve time axis")
-        for time_days, frame in zip(
-            self.light_curve.times_days.detach().cpu().tolist(),
-            self.caustics,
-            strict=True,
+        arrays = {
+            "times_days": torch.as_tensor(self.times_days),
+            "crossing_labels": torch.as_tensor(self.crossing_labels),
+            "crossing_events": torch.as_tensor(self.crossing_events),
+            "center_distances_uas": torch.as_tensor(self.center_distances_uas),
+            "center_distance_censored": torch.as_tensor(self.center_distance_censored),
+        }
+        times = arrays["times_days"]
+        if times.ndim != 1 or any(
+            value.shape != times.shape for value in arrays.values()
         ):
-            if abs(float(time_days) - frame.time_days) > 1.0e-4:
-                raise ValueError("caustic and light-curve epochs must match")
+            raise ValueError("label arrays must share a one-dimensional time axis")
+        if not bool(torch.all(torch.isfinite(times))) or not bool(
+            torch.all(times[1:] > times[:-1])
+        ):
+            raise ValueError("label epochs must be finite and strictly increasing")
+        labels = arrays["crossing_labels"]
+        if not bool(torch.all((labels == 0) | (labels == 1))):
+            raise ValueError("crossing_labels must contain binary values")
+        if not bool(torch.all(arrays["center_distances_uas"] >= 0)):
+            raise ValueError("center distances must be non-negative")
+        for name, dtype in (
+            ("crossing_labels", torch.int8),
+            ("crossing_events", torch.bool),
+            ("center_distance_censored", torch.bool),
+        ):
+            arrays[name] = arrays[name].to(dtype=dtype)
+        for name, value in arrays.items():
+            object.__setattr__(self, name, value)
+        if self.caustics is not None:
+            frames = tuple(self.caustics)
+            if len(frames) != times.numel() or any(
+                abs(frame.time_days - time) > 1e-4
+                for frame, time in zip(
+                    frames, times.detach().cpu().tolist(), strict=True
+                )
+            ):
+                raise ValueError("caustic frames must match label epochs")
+            object.__setattr__(self, "caustics", frames)
 
-    @property
-    def crossing_labels(self) -> torch.Tensor:
-        """Temporally aligned binary label at the source center."""
+    @classmethod
+    def from_caustics(cls, frames) -> LightCurveLabels:
+        """Extract the center series once without copying diagnostic geometry."""
 
-        return torch.tensor(
-            [frame.labels.center_label for frame in self.caustics],
-            dtype=torch.int8,
+        frames = tuple(frames)
+        return cls(
+            times_days=torch.tensor(
+                [frame.time_days for frame in frames], dtype=torch.float64
+            ),
+            crossing_labels=torch.tensor(
+                [frame.labels.center_label for frame in frames], dtype=torch.int8
+            ),
+            crossing_events=torch.tensor(
+                [frame.labels.center_crossing for frame in frames], dtype=torch.bool
+            ),
+            center_distances_uas=torch.tensor(
+                [frame.labels.center_distance_uas for frame in frames],
+                dtype=torch.float64,
+            ),
+            center_distance_censored=torch.tensor(
+                [frame.labels.center_distance_censored for frame in frames],
+                dtype=torch.bool,
+            ),
+            caustics=frames,
         )
 
-    @property
-    def crossing_events(self) -> torch.Tensor:
-        """Boolean caustic-crossing transition flags."""
-
-        return torch.tensor(
-            [frame.labels.center_crossing for frame in self.caustics],
-            dtype=torch.bool,
-        )
-
-    @property
-    def center_distances_uas(self) -> torch.Tensor:
-        """Finite, source-radius-capped center-to-caustic distances."""
-
-        return torch.tensor(
-            [frame.labels.center_distance_uas for frame in self.caustics],
-            dtype=torch.float64,
-        )
-
-    @property
-    def center_distance_censored(self) -> torch.Tensor:
-        """True where the nearest caustic lies outside the source-radius cap."""
-
-        return torch.tensor(
-            [frame.labels.center_distance_censored for frame in self.caustics],
-            dtype=torch.bool,
-        )
-
-    def capped_center_distances_uas(
-        self,
-        maximum_distance_uas: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return finite center distances and their right-censoring mask."""
+    def capped_center_distances_uas(self, maximum_distance_uas: float):
+        """Return distances with an additional cap and the combined censoring mask."""
 
         distances, censored = _cap_center_distances(
-            self.center_distances_uas,
-            maximum_distance_uas,
+            self.center_distances_uas, maximum_distance_uas
         )
         return distances, censored | self.center_distance_censored
 
 
-@dataclass(frozen=True)
-class MultirateLabeledLightCurve:
-    """Fine-cadence light curve with labels at its sparse map epochs.
+def _unified_light_curve(result) -> LightCurve:
+    """Expose the common result without changing the numerical schedulers."""
 
-    ``light_curve`` may be sampled more finely than ``caustics``. Each
-    caustic frame is aligned to one dynamic magnification-map epoch, while the
-    light curve is obtained by interpolating the two bracketing map--source
-    contractions. This preserves the production multirate calculation without
-    pretending that caustics were recomputed at every fine source epoch.
+    return (
+        result
+        if isinstance(result, LightCurve)
+        else replace(result.light_curve, labels=result.labels)
+    )
+
+
+class _LabeledCurveProperties:
+    """Common views for internal equal-cadence and multirate scheduler outputs."""
+
+    @cached_property
+    def labels(self) -> LightCurveLabels:
+        """The center series extracted once from the retained caustic frames."""
+
+        return LightCurveLabels.from_caustics(self.caustics)
+
+    @property
+    def maps(self) -> tuple[MagnificationMap, ...]:
+        """Selected magnification maps retained with the light curve."""
+
+        return self.light_curve.maps
+
+    @property
+    def crossing_labels(self) -> torch.Tensor:
+        """Binary source-center labels at the caustic epochs."""
+
+        return self.labels.crossing_labels
+
+    @property
+    def crossing_events(self) -> torch.Tensor:
+        """Center-label transitions between successive caustic epochs."""
+
+        return self.labels.crossing_events
+
+    @property
+    def center_distances_uas(self) -> torch.Tensor:
+        """Source-radius-capped center distances in microarcseconds."""
+
+        return self.labels.center_distances_uas
+
+    @property
+    def center_distance_censored(self) -> torch.Tensor:
+        """Whether each distance is a lower bound at the source-radius cap."""
+
+        return self.labels.center_distance_censored
+
+    def capped_center_distances_uas(self, maximum_distance_uas: float):
+        """Return distances with an additional cap and combined censoring mask."""
+
+        return self.labels.capped_center_distances_uas(maximum_distance_uas)
+
+
+@dataclass(frozen=True)
+class LabeledLightCurve(_LabeledCurveProperties):
+    """A streamed finite-source light curve and its equal-cadence labels."""
+
+    light_curve: LightCurve
+    caustics: tuple[LabeledCausticFrame, ...]
+
+    def __post_init__(self) -> None:
+        times = self.light_curve.times_days.detach().cpu()
+        if times.numel() != self.labels.times_days.numel() or not torch.allclose(
+            times.to(torch.float64), self.labels.times_days, rtol=0, atol=1e-4
+        ):
+            raise ValueError("caustic and light-curve epochs must match")
+
+
+@dataclass(frozen=True)
+class MultirateLabeledLightCurve(_LabeledCurveProperties):
+    """Fine-cadence photometry with labels only at the sparse map epochs.
+
+    Fluxes interpolate bracketing map/source contractions. Caustics are not
+    recomputed at each fine photometry epoch.
     """
 
     light_curve: LightCurve
     caustics: tuple[LabeledCausticFrame, ...]
 
-    @property
-    def maps(self) -> Mapping[float, MagnificationMap]:
-        """Selected magnification maps retained with the light curve."""
-
-        return self.light_curve.maps
-
     def __post_init__(self) -> None:
         if not self.caustics:
             raise ValueError("at least one labeled map epoch is required")
-        times = torch.as_tensor(self.light_curve.times_days).detach().cpu()
-        caustic_times = torch.tensor(
-            [frame.time_days for frame in self.caustics], dtype=torch.float64
-        )
-        if caustic_times.numel() > 1 and not bool(
-            torch.all(caustic_times[1:] > caustic_times[:-1])
-        ):
-            raise ValueError("caustic map epochs must be strictly increasing")
-        tolerance = 1.0e-4
+        times = self.light_curve.times_days.detach().cpu()
+        caustic_times = self.labels.times_days
         if (
-            float(caustic_times[0]) < float(times[0]) - tolerance
-            or float(caustic_times[-1]) > float(times[-1]) + tolerance
+            float(caustic_times[0]) < float(times[0]) - 1e-4
+            or float(caustic_times[-1]) > float(times[-1]) + 1e-4
         ):
             raise ValueError("caustic map epochs must lie within the light curve")
 
     @property
     def map_times_days(self) -> torch.Tensor:
-        """Times of the dynamic maps and corresponding caustic labels."""
+        """Times of all evaluated maps and their corresponding labels."""
 
-        return torch.tensor(
-            [frame.time_days for frame in self.caustics], dtype=torch.float64
-        )
-
-    @property
-    def crossing_labels(self) -> torch.Tensor:
-        """Temporally aligned binary labels at the source center."""
-
-        return torch.tensor(
-            [frame.labels.center_label for frame in self.caustics],
-            dtype=torch.int8,
-        )
-
-    @property
-    def crossing_events(self) -> torch.Tensor:
-        """Boolean center-label transitions at the sparse map epochs."""
-
-        return torch.tensor(
-            [frame.labels.center_crossing for frame in self.caustics],
-            dtype=torch.bool,
-        )
-
-    @property
-    def center_distances_uas(self) -> torch.Tensor:
-        """Finite, source-radius-capped center-to-caustic distances."""
-
-        return torch.tensor(
-            [frame.labels.center_distance_uas for frame in self.caustics],
-            dtype=torch.float64,
-        )
-
-    @property
-    def center_distance_censored(self) -> torch.Tensor:
-        """True where the nearest caustic lies outside the source-radius cap."""
-
-        return torch.tensor(
-            [frame.labels.center_distance_censored for frame in self.caustics],
-            dtype=torch.bool,
-        )
-
-    def capped_center_distances_uas(
-        self,
-        maximum_distance_uas: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return finite center distances and their right-censoring mask.
-
-        Parameters
-        ----------
-        maximum_distance_uas:
-            Largest resolved distance. For a finite rectangular source field,
-            half its smaller field-of-view dimension is a conservative choice:
-            it is the radius of the largest centered circle contained in the
-            field.
-
-        Returns
-        -------
-        distances, censored:
-            ``distances`` is ``min(raw_distance, maximum_distance_uas)`` and
-            ``censored`` is true wherever the raw value is non-finite or lies
-            beyond the cap. The cap therefore denotes a lower bound rather than
-            a claimed caustic location.
-        """
-
-        distances, censored = _cap_center_distances(
-            self.center_distances_uas,
-            maximum_distance_uas,
-        )
-        return distances, censored | self.center_distance_censored
+        return self.labels.times_days
 
 
 @dataclass(frozen=True)
@@ -875,6 +931,54 @@ class MacroImageLightCurve:
     light_curve: LightCurve
     caustics: tuple[LabeledCausticFrame, ...] | None = None
 
+    @property
+    def flux(self) -> torch.Tensor:
+        """Physical flux density in Jy, shaped [time, band]."""
+
+        return self.light_curve.flux
+
+    @property
+    def magnitude(self) -> torch.Tensor:
+        """Apparent AB magnitude, shaped [time, band]."""
+
+        return self.light_curve.magnitude
+
+    @property
+    def times_days(self) -> torch.Tensor:
+        """Observer epochs of the photometry."""
+
+        return self.light_curve.times_days
+
+    @property
+    def band_names(self) -> tuple[str, ...]:
+        """Band names aligned with the photometry columns."""
+
+        return self.light_curve.band_names
+
+    @property
+    def maps(self) -> tuple[MagnificationMap, ...]:
+        """Integer-indexed retained maps for this image."""
+
+        return self.light_curve.maps
+
+    @property
+    def map_times_days(self) -> torch.Tensor:
+        """Observer epochs of the retained maps."""
+
+        return self.light_curve.map_times_days
+
+    @property
+    def labels(self) -> LightCurveLabels | None:
+        """Optional source-center labels with their own time axis."""
+
+        return self.light_curve.labels
+
+    @property
+    def timing(self) -> TimingBreakdown:
+        """Previously collected timing, without running any calculation."""
+
+        return self.light_curve.timing
+
     def __post_init__(self) -> None:
         if not isinstance(self.image_name, str) or not self.image_name:
             raise ValueError("image_name must be a non-empty string")
@@ -883,42 +987,29 @@ class MacroImageLightCurve:
         if self.caustics is not None:
             caustics = tuple(self.caustics)
             if len(caustics) == int(self.light_curve.times_days.numel()):
-                LabeledLightCurve(self.light_curve, caustics)
+                labeled = LabeledLightCurve(self.light_curve, caustics)
             else:
-                MultirateLabeledLightCurve(self.light_curve, caustics)
+                labeled = MultirateLabeledLightCurve(self.light_curve, caustics)
             object.__setattr__(self, "caustics", caustics)
+            object.__setattr__(self, "light_curve", _unified_light_curve(labeled))
 
     @property
     def label_times_days(self) -> torch.Tensor | None:
         """Return sparse map epochs associated with optional labels."""
 
-        if self.caustics is None:
-            return None
-        return torch.tensor(
-            [frame.time_days for frame in self.caustics], dtype=torch.float64
-        )
+        return None if self.labels is None else self.labels.times_days
 
     @property
     def crossing_labels(self) -> torch.Tensor | None:
         """Return aligned center labels when caustics were requested."""
 
-        if self.caustics is None:
-            return None
-        return torch.tensor(
-            [frame.labels.center_label for frame in self.caustics],
-            dtype=torch.int8,
-        )
+        return None if self.labels is None else self.labels.crossing_labels
 
     @property
     def crossing_events(self) -> torch.Tensor | None:
         """Return center-label transitions when caustics were requested."""
 
-        if self.caustics is None:
-            return None
-        return torch.tensor(
-            [frame.labels.center_crossing for frame in self.caustics],
-            dtype=torch.bool,
-        )
+        return None if self.labels is None else self.labels.crossing_events
 
 
 @dataclass(frozen=True)

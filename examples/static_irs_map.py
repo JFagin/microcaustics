@@ -32,4 +32,4 @@ magnification = system.magnification_map(
 
 print(magnification.values.shape)
 print(magnification.metadata)
-print(f"steady-state time: {magnification.timing.steady_seconds:.3f} s")
+# Timing is opt-in. See docs/timing.md for first-call and warmed measurements.

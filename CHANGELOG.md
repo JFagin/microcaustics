@@ -10,4 +10,4 @@ First stable release of `microcaustics`.
 - Caustic, critical-curve, source-center label, label-map, distance-map, and winding-map products.
 - Quasar, relativistic thin-disk, reverberation, supernova, and custom-source interfaces.
 - Multi-image simulations, intrinsic variability, observational cadence, and macro-image rendering.
-- Twenty executable scientific tutorials and validation against independent analytic and external implementations.
+- Eighteen executable scientific tutorials and validation against independent analytic and external implementations.
