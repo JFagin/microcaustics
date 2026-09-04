@@ -119,6 +119,73 @@ def _small_caustic_config():
 class TritonTaylorTests(unittest.TestCase):
     """Compare fused float32 kernels with the readable eager implementation."""
 
+    def test_dense_temporal_marching_matches_scalar(self):
+        from microcaustics.caustics.triton_caustics import (
+            batched_dense_marching_squares_zero_triton,
+            marching_squares_zero_triton,
+        )
+
+        grid = mc.PlaneGrid((37, 43), (3.0, 4.0))
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        fields = torch.randn((3, *grid.shape), device="cuda", generator=generator)
+        fields[0].fill_(1)
+        actual = batched_dense_marching_squares_zero_triton(fields, grid)
+        for field, row in zip(fields, actual, strict=True):
+            expected = marching_squares_zero_triton(field, grid)
+
+            # The sparse marcher reverses the endpoints of ambiguous cells.
+            def canonical(segments):
+                a, b = segments.unbind(dim=1)
+                swap = (a[:, 0] > b[:, 0]) | (
+                    (a[:, 0] == b[:, 0]) & (a[:, 1] > b[:, 1])
+                )
+                return torch.stack(
+                    (
+                        torch.where(swap[:, None], b, a),
+                        torch.where(swap[:, None], a, b),
+                    ),
+                    dim=1,
+                )
+
+            torch.testing.assert_close(
+                canonical(row), canonical(expected), atol=2e-6, rtol=2e-6
+            )
+
+    def test_dense_temporal_caustics_batch_endpoint_queries(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+
+        from microcaustics.caustics.production import caustic_fields_from_far_fields
+
+        system = _small_cuda_system(backend="triton")
+        simulation = system.realize().simulation
+        grid = mc.PlaneGrid((129, 128), (3.0, 3.0))
+        config = _small_caustic_config()
+        times = (0.0, 1.0)
+        original = BatchedTaylorFarFieldApproximation.raytrace_ragged
+        with patch.object(
+            BatchedTaylorFarFieldApproximation,
+            "raytrace_ragged",
+            autospec=True,
+            side_effect=original,
+        ) as query:
+            actual = caustic_fields_from_far_fields(simulation, grid, times, config)
+        self.assertEqual(query.call_count, 1)
+        expected = tuple(
+            caustic_fields_from_far_fields(
+                simulation, grid, (time,), replace(config, temporal_batch_size=1)
+            )[0]
+            for time in times
+        )
+        for a, b in zip(actual, expected, strict=True):
+            torch.testing.assert_close(
+                a.critical_segments_uas, b.critical_segments_uas, atol=3e-6, rtol=3e-6
+            )
+            torch.testing.assert_close(
+                a.caustic_segments_uas, b.caustic_segments_uas, atol=3e-6, rtol=3e-6
+            )
+            torch.testing.assert_close(a.invalid_segment_mask, b.invalid_segment_mask)
+
     def test_compact_caustic_kernels_match_portable_predicates(self) -> None:
         """Exercise all marching cases and the shared-vertex crossing rule."""
 
@@ -861,6 +928,76 @@ class TritonTaylorTests(unittest.TestCase):
             rtol=0.0,
             atol=2.0e-6,
         )
+
+    @unittest.skipUnless(triton_ipm_available(), "CUDA Triton IPM is unavailable")
+    def test_all_cell_controls_batch_maps_not_only_far_field(self) -> None:
+        """Square and rectangular all-cell controls fuse the actual IPM maps."""
+        stars = mc.PointMassField._from_einstein_radii(
+            torch.tensor([-0.6, 0.5]),
+            torch.tensor([0.4, -0.3]),
+            einstein_radius_uas=torch.tensor([0.18, 0.16]),
+            velocity_x_uas_per_day=torch.tensor([0.01, -0.015]),
+            velocity_y_uas_per_day=torch.tensor([-0.01, 0.005]),
+        )
+        macro = mc.MacroLens(0.1, 0.05)
+        grid = mc.PlaneGrid((8, 9), (1.5, 1.6))
+        method = mc.IPMConfig(
+            rays=144,
+            refinement=2,
+            virtual_refinement=4,
+            tiled=False,
+            cell_chunk_size=32,
+            far_field_approx=mc.FarFieldApproxConfig(
+                cells_per_axis=4,
+                nodes_per_cell_axis=8,
+            ),
+        )
+        for size in ((3.0, 3.0), (3.0, 2.0)):
+            with self.subTest(lens_region=size):
+                region = mc.PlaneRegion(size)
+                results = []
+                for backend, batch in (
+                    ("triton", 2),
+                    ("triton", 1),
+                    ("torch-eager", 2),
+                ):
+                    simulation = mc.MicrolensingSimulation.create(
+                        macro,
+                        stars,
+                        runtime=mc.RuntimeConfig(
+                            device="cuda", backend=backend, strict_backend=True
+                        ),
+                    )
+                    maps = list(
+                        simulation.dynamic_maps(
+                            region,
+                            grid,
+                            [0.0, 1.0, 2.0],
+                            method=method,
+                            schedule=mc.DynamicConfig(
+                                temporal_batch_size=batch, fused_temporal_ipm=True
+                            ),
+                        )
+                    )
+                    if backend == "triton":
+                        self.assertTrue(
+                            all(
+                                item.metadata["dynamic_temporal_solver_fused"]
+                                for item in maps
+                            )
+                        )
+                        if batch > 1:
+                            self.assertTrue(
+                                maps[0].metadata["temporal_far_field_query_fused"]
+                            )
+                    results.append(torch.stack([item.values for item in maps]))
+                for comparison in results[1:]:
+                    torch.testing.assert_close(
+                        results[0], comparison, rtol=3e-4, atol=3e-5
+                    )
+                self.assertGreater(
+                    float((results[0][0] - results[0][-1]).abs().max()), 1e-4
+                )
 
     @unittest.skipUnless(triton_ipm_available(), "CUDA Triton IPM is unavailable")
     def test_full_field_triton_ipm_supports_general_refinement(self) -> None:

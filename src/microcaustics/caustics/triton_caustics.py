@@ -17,6 +17,42 @@ except Exception:  # pragma: no cover - optional backend
 if triton is not None:
 
     @triton.jit
+    def _dense_active_cells(
+        field,
+        counts,
+        offsets,
+        output,
+        nx,
+        ny,
+        total,
+        WRITE: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Compact mixed-sign cells without a dense per-cell prefix array."""
+        block = tl.program_id(0)
+        cell = block.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        cells = (nx - 1) * (ny - 1)
+        frame, local = cell // cells, cell % cells
+        row, col = local // (nx - 1), local % (nx - 1)
+        index = frame * nx * ny + row * nx + col
+        a = tl.load(field + index, cell < total, other=0)
+        b = tl.load(field + index + 1, cell < total, other=0)
+        c = tl.load(field + index + nx + 1, cell < total, other=0)
+        d = tl.load(field + index + nx, cell < total, other=0)
+        positives = (
+            (a > 0).to(tl.int32)
+            + (b > 0).to(tl.int32)
+            + (c > 0).to(tl.int32)
+            + (d > 0).to(tl.int32)
+        )
+        active = (cell < total) & (positives > 0) & (positives < 4)
+        if WRITE:
+            destination = tl.load(offsets + block) + tl.cumsum(active.to(tl.int32)) - 1
+            tl.store(output + destination, cell, active)
+        else:
+            tl.store(counts + block, tl.sum(active.to(tl.int32)))
+
+    @triton.jit
     def _regular_grid_winding_updates_kernel(
         segments,
         y_axis,
@@ -131,7 +167,6 @@ if triton is not None:
         output = (frame * n_points + point) * n_anchors + anchor
         tl.atomic_add(counts + output, partial)
 
-
     @triton.jit
     def _distance_kernel(
         segments,
@@ -173,7 +208,6 @@ if triton is not None:
         partial = tl.min(candidate, axis=0)
         tl.atomic_min(distance2 + frame * n_points + point, partial)
 
-
     @triton.jit
     def _marching_counts(field, counts, ny, nx, cells_x, BLOCK: tl.constexpr):
         cell = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -197,7 +231,6 @@ if triton is not None:
             tl.where((case == 5) | (case == 10), 2, 1),
         )
         tl.store(counts + cell, count, mask=active)
-
 
     @triton.jit
     def _marching_write(
@@ -262,15 +295,27 @@ if triton is not None:
             edge_b = tl.where(case5_positive, tl.load(case5_positive_b + pair), edge_b)
             edge_a = tl.where(case5_negative, tl.load(case5_negative_a + pair), edge_a)
             edge_b = tl.where(case5_negative, tl.load(case5_negative_b + pair), edge_b)
-            edge_a = tl.where(case10_positive, tl.load(case10_positive_a + pair), edge_a)
-            edge_b = tl.where(case10_positive, tl.load(case10_positive_b + pair), edge_b)
-            edge_a = tl.where(case10_negative, tl.load(case10_negative_a + pair), edge_a)
-            edge_b = tl.where(case10_negative, tl.load(case10_negative_b + pair), edge_b)
+            edge_a = tl.where(
+                case10_positive, tl.load(case10_positive_a + pair), edge_a
+            )
+            edge_b = tl.where(
+                case10_positive, tl.load(case10_positive_b + pair), edge_b
+            )
+            edge_a = tl.where(
+                case10_negative, tl.load(case10_negative_a + pair), edge_a
+            )
+            edge_b = tl.where(
+                case10_negative, tl.load(case10_negative_b + pair), edge_b
+            )
             output = output_start + pair
             for endpoint in tl.static_range(2):
                 edge = tl.where(endpoint == 0, edge_a, edge_b)
-                af = tl.where(edge == 0, f0, tl.where(edge == 1, f1, tl.where(edge == 2, f2, f3)))
-                bf = tl.where(edge == 0, f1, tl.where(edge == 1, f2, tl.where(edge == 2, f3, f0)))
+                af = tl.where(
+                    edge == 0, f0, tl.where(edge == 1, f1, tl.where(edge == 2, f2, f3))
+                )
+                bf = tl.where(
+                    edge == 0, f1, tl.where(edge == 1, f2, tl.where(edge == 2, f3, f0))
+                )
                 ax = tl.where((edge == 0) | (edge == 3), x0, x1)
                 ay = tl.where((edge == 0) | (edge == 1), y0, y1)
                 bx = tl.where((edge == 0) | (edge == 1), x1, x0)
@@ -280,13 +325,12 @@ if triton is not None:
                 fraction = af / safe
                 base = output * 4 + endpoint * 2
                 tl.store(segments + base, ax + fraction * (bx - ax), mask=valid_pair)
-                tl.store(segments + base + 1, ay + fraction * (by - ay), mask=valid_pair)
-
+                tl.store(
+                    segments + base + 1, ay + fraction * (by - ay), mask=valid_pair
+                )
 
     @triton.jit
-    def _sparse_marching_counts(
-        f0, f1, f2, f3, counts, n_cells, BLOCK: tl.constexpr
-    ):
+    def _sparse_marching_counts(f0, f1, f2, f3, counts, n_cells, BLOCK: tl.constexpr):
         cell = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         active = cell < n_cells
         value0 = tl.load(f0 + cell, mask=active, other=0.0)
@@ -305,7 +349,6 @@ if triton is not None:
             tl.where((case == 5) | (case == 10), 2, 1),
         )
         tl.store(counts + cell, count, mask=active)
-
 
     @triton.jit
     def _sparse_marching_write(
@@ -352,9 +395,7 @@ if triton is not None:
             0,
             tl.where((case == 5) | (case == 10), 2, 1),
         )
-        output_start = tl.load(offsets_ptr + cell, mask=active, other=0).to(
-            tl.int64
-        )
+        output_start = tl.load(offsets_ptr + cell, mask=active, other=0).to(tl.int64)
         center_positive = 0.25 * (f0 + f1 + f2 + f3) > 0.0
         use_positive = ((case == 5) & center_positive) | (
             (case == 10) & ~center_positive
@@ -369,12 +410,8 @@ if triton is not None:
         for pair in tl.static_range(2):
             valid_pair = active & (pair < count)
             table = case * 2 + pair
-            edge_a = tl.load(pair_a_ptr + table, mask=active, other=0).to(
-                tl.int32
-            )
-            edge_b = tl.load(pair_b_ptr + table, mask=active, other=0).to(
-                tl.int32
-            )
+            edge_a = tl.load(pair_a_ptr + table, mask=active, other=0).to(tl.int32)
+            edge_b = tl.load(pair_b_ptr + table, mask=active, other=0).to(tl.int32)
             edge_a = tl.where(
                 use_positive,
                 tl.load(positive_a_ptr + pair),
@@ -503,8 +540,12 @@ def batched_caustic_crossings_distances_triton(
     segments = segments.contiguous()
     valid = valid.to(device=segments.device, dtype=torch.bool).contiguous()
     anchors = anchors.to(device=segments.device, dtype=segments.dtype).contiguous()
-    crossing_points = crossing_points.to(device=segments.device, dtype=segments.dtype).contiguous()
-    distance_points = distance_points.to(device=segments.device, dtype=segments.dtype).contiguous()
+    crossing_points = crossing_points.to(
+        device=segments.device, dtype=segments.dtype
+    ).contiguous()
+    distance_points = distance_points.to(
+        device=segments.device, dtype=segments.dtype
+    ).contiguous()
     frames, segment_count = map(int, segments.shape[:2])
     anchor_count = int(anchors.shape[0])
     point_count = int(crossing_points.shape[0])
@@ -600,12 +641,40 @@ def caustic_distances_triton(
 
 
 _PAIR_A = (
-    (0, 0), (3, 0), (0, 0), (3, 0), (1, 0), (0, 2), (0, 0), (3, 0),
-    (2, 0), (2, 0), (0, 1), (2, 0), (1, 0), (1, 0), (0, 0), (0, 0),
+    (0, 0),
+    (3, 0),
+    (0, 0),
+    (3, 0),
+    (1, 0),
+    (0, 2),
+    (0, 0),
+    (3, 0),
+    (2, 0),
+    (2, 0),
+    (0, 1),
+    (2, 0),
+    (1, 0),
+    (1, 0),
+    (0, 0),
+    (0, 0),
 )
 _PAIR_B = (
-    (0, 0), (0, 0), (1, 0), (1, 0), (2, 0), (1, 3), (2, 0), (2, 0),
-    (3, 0), (0, 0), (3, 2), (1, 0), (3, 0), (0, 0), (3, 0), (0, 0),
+    (0, 0),
+    (0, 0),
+    (1, 0),
+    (1, 0),
+    (2, 0),
+    (1, 3),
+    (2, 0),
+    (2, 0),
+    (3, 0),
+    (0, 0),
+    (3, 2),
+    (1, 0),
+    (3, 0),
+    (0, 0),
+    (3, 0),
+    (0, 0),
 )
 
 _MARCHING_TABLE_CACHE: dict[tuple[str, int | None], tuple[torch.Tensor, ...]] = {}
@@ -631,6 +700,77 @@ def _marching_tables(device: torch.device) -> tuple[torch.Tensor, ...]:
         )
         _MARCHING_TABLE_CACHE[key] = cached
     return cached
+
+
+def batched_dense_marching_squares_zero_triton(field: torch.Tensor, grid):
+    """March dense temporal grids with bounded compaction buffers.
+
+    A blockwise count/write pass retains only cells with mixed vertex signs.
+    The same compact interpolation kernel used by sparse caustics processes
+    all retained cells together. Returned rows preserve frame-local cell order.
+    """
+    if not triton_caustics_available() or field.device.type != "cuda":
+        raise RuntimeError("Triton dense temporal marching is unavailable")
+    if field.dtype != torch.float32 or field.ndim != 3:
+        raise ValueError("dense temporal marching requires float32 [frames,y,x]")
+    field = field.contiguous()
+    frames, ny, nx = field.shape
+    if (ny, nx) != grid.shape:
+        raise ValueError("determinant shape must match the lens grid")
+    if nx < 2 or ny < 2:
+        return tuple(field.new_empty((0, 2, 2)) for _ in range(frames))
+    cells = (nx - 1) * (ny - 1)
+    total = frames * cells
+    if total == 0:
+        return ()
+    block = 512
+    counts = torch.empty(
+        triton.cdiv(total, block), device=field.device, dtype=torch.int32
+    )
+    _dense_active_cells[(counts.numel(),)](
+        field, counts, counts, counts, nx, ny, total, WRITE=False, BLOCK=block
+    )
+    offsets = torch.cumsum(counts, dim=0, dtype=torch.int64) - counts
+    size = int((offsets[-1] + counts[-1]).item())
+    active = torch.empty(size, device=field.device, dtype=torch.int64)
+    _dense_active_cells[(counts.numel(),)](
+        field, counts, offsets, active, nx, ny, total, WRITE=True, BLOCK=block
+    )
+    frame = active // cells
+    local = active % cells
+    row, col = local // (nx - 1), local % (nx - 1)
+    index = frame * ny * nx + row * nx + col
+    flat = field.reshape(-1)
+    f0, f1, f2, f3 = (flat[index + delta] for delta in (0, 1, nx + 1, nx))
+    dy, dx = grid.pixel_scale_uas
+    xmin, _, ymin, _ = grid.bounds_uas
+    x0 = float(xmin + 0.5 * dx) + col.to(field.dtype) * float(dx)
+    y0 = float(ymin + 0.5 * dy) + row.to(field.dtype) * float(dy)
+    boundary = torch.zeros((4, size), device=field.device, dtype=torch.bool)
+    segments, _ = sparse_marching_squares_zero_triton(
+        f0,
+        f1,
+        f2,
+        f3,
+        x0,
+        x0 + dx,
+        y0,
+        y0 + dy,
+        boundary,
+    )
+    case = (
+        (f0 > 0).long()
+        + 2 * (f1 > 0).long()
+        + 4 * (f2 > 0).long()
+        + 8 * (f3 > 0).long()
+    )
+    segment_counts = (
+        torch.ones(size, device=field.device, dtype=torch.int64)
+        + ((case == 5) | (case == 10)).long()
+    )
+    lengths = torch.zeros(frames, device=field.device, dtype=torch.int64)
+    lengths.scatter_add_(0, frame, segment_counts)
+    return tuple(segments.split(lengths.cpu().tolist()))
 
 
 def marching_squares_zero_triton(field: torch.Tensor, grid) -> torch.Tensor:
@@ -724,9 +864,7 @@ def sparse_marching_squares_zero_triton(
         raise ValueError("Triton sparse marching squares requires float32")
     values = tuple(item.contiguous() for item in (f0, f1, f2, f3))
     coordinates = tuple(item.contiguous() for item in (x0, x1, y0, y1))
-    edge_boundary = edge_boundary.to(
-        device=f0.device, dtype=torch.bool
-    ).contiguous()
+    edge_boundary = edge_boundary.to(device=f0.device, dtype=torch.bool).contiguous()
     cells = int(f0.numel())
     counts = torch.empty(cells, device=f0.device, dtype=torch.int32)
     block = 256

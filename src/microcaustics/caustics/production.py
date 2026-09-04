@@ -33,7 +33,9 @@ if TYPE_CHECKING:
     from ..simulation import MicrolensingSimulation
 
 
-def _marching_segments(field: torch.Tensor, grid: PlaneGrid) -> tuple[torch.Tensor, str]:
+def _marching_segments(
+    field: torch.Tensor, grid: PlaneGrid
+) -> tuple[torch.Tensor, str]:
     """Use compact Triton marching when available, else the portable reference."""
 
     if field.device.type == "cuda" and field.dtype == torch.float32:
@@ -75,7 +77,9 @@ def _boundary_component_mask(
     sampled_ymin = ymin + 0.5 * dy
     sampled_ymax = ymax - 0.5 * dy
     tolerance = max(min(dx, dy) * 1.0e-5, 1.0e-12)
-    points = critical_segments.detach().to(device="cpu", dtype=torch.float64).reshape(-1, 2)
+    points = (
+        critical_segments.detach().to(device="cpu", dtype=torch.float64).reshape(-1, 2)
+    )
     on_boundary = (
         ((points[:, 0] - sampled_xmin).abs() <= tolerance)
         | ((points[:, 0] - sampled_xmax).abs() <= tolerance)
@@ -229,16 +233,11 @@ def _sparse_determinant_layout(
     maximum_rows = max(1, (output_ny + fine_ny - 1) // fine_ny + 1)
     maximum_columns = max(1, (output_nx + fine_nx - 1) // fine_nx + 1)
     row_offsets = torch.arange(maximum_rows, device=device, dtype=torch.int64)
-    column_offsets = torch.arange(
-        maximum_columns, device=device, dtype=torch.int64
-    )
+    column_offsets = torch.arange(maximum_columns, device=device, dtype=torch.int64)
     expanded_rows = row_start[:, None, None] + row_offsets[None, :, None]
-    expanded_columns = (
-        column_start[:, None, None] + column_offsets[None, None, :]
-    )
-    valid = (
-        (expanded_rows < row_stop[:, None, None])
-        & (expanded_columns < column_stop[:, None, None])
+    expanded_columns = column_start[:, None, None] + column_offsets[None, None, :]
+    valid = (expanded_rows < row_stop[:, None, None]) & (
+        expanded_columns < column_stop[:, None, None]
     )
     active_flat = (
         expanded_rows.expand(-1, maximum_rows, maximum_columns) * output_nx
@@ -332,8 +331,10 @@ def _sparse_marching_segments(
         neighbor_flat = neighbor_row * (nx - 1) + neighbor_column
         locations = torch.searchsorted(active_flat, neighbor_flat)
         safe_locations = locations.clamp_max(max(int(active_flat.numel()) - 1, 0))
-        return valid & (locations < active_flat.numel()) & (
-            active_flat[safe_locations] == neighbor_flat
+        return (
+            valid
+            & (locations < active_flat.numel())
+            & (active_flat[safe_locations] == neighbor_flat)
         )
 
     edge_boundary = (
@@ -369,31 +370,51 @@ def _sparse_marching_segments(
             warn_backend_fallback("Triton sparse marching squares", error)
     pair_a = torch.tensor(
         (
-            (0, 0), (3, 0), (0, 0), (3, 0),
-            (1, 0), (0, 2), (0, 0), (3, 0),
-            (2, 0), (2, 0), (0, 1), (2, 0),
-            (1, 0), (1, 0), (0, 0), (0, 0),
+            (0, 0),
+            (3, 0),
+            (0, 0),
+            (3, 0),
+            (1, 0),
+            (0, 2),
+            (0, 0),
+            (3, 0),
+            (2, 0),
+            (2, 0),
+            (0, 1),
+            (2, 0),
+            (1, 0),
+            (1, 0),
+            (0, 0),
+            (0, 0),
         ),
         device=case.device,
         dtype=torch.int64,
     )[case.to(torch.int64)]
     pair_b = torch.tensor(
         (
-            (0, 0), (0, 0), (1, 0), (1, 0),
-            (2, 0), (1, 3), (2, 0), (2, 0),
-            (3, 0), (0, 0), (3, 2), (1, 0),
-            (3, 0), (0, 0), (3, 0), (0, 0),
+            (0, 0),
+            (0, 0),
+            (1, 0),
+            (1, 0),
+            (2, 0),
+            (1, 3),
+            (2, 0),
+            (2, 0),
+            (3, 0),
+            (0, 0),
+            (3, 2),
+            (1, 0),
+            (3, 0),
+            (0, 0),
+            (3, 0),
+            (0, 0),
         ),
         device=case.device,
         dtype=torch.int64,
     )[case.to(torch.int64)]
     center_positive = 0.25 * (f0 + f1 + f2 + f3) > 0
-    use_positive = ((case == 5) & center_positive) | (
-        (case == 10) & ~center_positive
-    )
-    use_negative = ((case == 5) & ~center_positive) | (
-        (case == 10) & center_positive
-    )
+    use_positive = ((case == 5) & center_positive) | ((case == 10) & ~center_positive)
+    use_negative = ((case == 5) & ~center_positive) | ((case == 10) & center_positive)
     positive_a = torch.tensor((0, 2), device=case.device)[None]
     positive_b = torch.tensor((1, 3), device=case.device)[None]
     negative_a = torch.tensor((0, 1), device=case.device)[None]
@@ -410,12 +431,8 @@ def _sparse_marching_segments(
     valid_pairs = torch.arange(2, device=case.device)[None] < counts[:, None]
     edge_points = torch.stack(edges, dim=1)
     gather_shape = (-1, -1, 2)
-    first = edge_points.gather(
-        1, pair_a[..., None].expand(*gather_shape)
-    )
-    second = edge_points.gather(
-        1, pair_b[..., None].expand(*gather_shape)
-    )
+    first = edge_points.gather(1, pair_a[..., None].expand(*gather_shape))
+    second = edge_points.gather(1, pair_b[..., None].expand(*gather_shape))
     segments = torch.stack((first, second), dim=2)[valid_pairs]
     boundary_values = torch.stack(edge_boundary, dim=1)
     first_boundary = boundary_values.gather(1, pair_a)
@@ -470,11 +487,11 @@ def _batched_sparse_marching_segments(
         def neighbor_active(neighbor_row, neighbor_column, valid):
             neighbor_flat = neighbor_row * (nx - 1) + neighbor_column
             locations = torch.searchsorted(active_flat, neighbor_flat)
-            locations_safe = locations.clamp_max(
-                max(int(active_flat.numel()) - 1, 0)
-            )
-            return valid & (locations < active_flat.numel()) & (
-                active_flat[locations_safe] == neighbor_flat
+            locations_safe = locations.clamp_max(max(int(active_flat.numel()) - 1, 0))
+            return (
+                valid
+                & (locations < active_flat.numel())
+                & (active_flat[locations_safe] == neighbor_flat)
             )
 
         edge_boundary = torch.stack(
@@ -545,7 +562,9 @@ def _sparse_boundary_component_mask(
     if not has_threatening_seed:
         return torch.zeros(count, device=critical_segments.device, dtype=torch.bool)
 
-    points = critical_segments.detach().to(device="cpu", dtype=torch.float64).reshape(-1, 2)
+    points = (
+        critical_segments.detach().to(device="cpu", dtype=torch.float64).reshape(-1, 2)
+    )
     tolerance = max(min(lens_grid.pixel_scale_uas) * 1.0e-5, 1.0e-12)
     parent = list(range(2 * count))
 
@@ -664,9 +683,7 @@ def caustic_fields_from_far_fields(
             row = vertex_indices[start:stop, 0]
             column = vertex_indices[start:stop, 1]
         else:
-            linear = torch.arange(
-                start, stop, device=runtime.device, dtype=torch.int64
-            )
+            linear = torch.arange(start, stop, device=runtime.device, dtype=torch.int64)
             row = torch.div(linear, nx, rounding_mode="floor")
             column = linear - row * nx
         x = xmin + (column.to(runtime.dtype) + 0.5) * dx
@@ -708,12 +725,55 @@ def caustic_fields_from_far_fields(
         if sparse_marching_batch is not None
         else 0.0
     )
+    dense_marching_batch = None
+    dense_cleanup_seconds = 0.0
+    dense_marching_seconds = 0.0
+    if (
+        not sparse
+        and len(times) > 1
+        and runtime.device.type == "cuda"
+        and runtime.dtype == torch.float32
+    ):
+        from .triton_caustics import (
+            batched_dense_marching_squares_zero_triton,
+            triton_caustics_available,
+        )
+
+        if triton_caustics_available():
+            phase_started = perf_counter()
+            if config.minimum_determinant_sign_pixels > 0:
+                for frame in range(len(times)):
+                    determinant[frame] = _clean_small_sign_islands(
+                        determinant[frame],
+                        config.minimum_determinant_sign_pixels,
+                    )
+            runtime.synchronize()
+            dense_cleanup_seconds = perf_counter() - phase_started
+            phase_started = perf_counter()
+            dense_marching_batch = batched_dense_marching_squares_zero_triton(
+                determinant, lens_grid
+            )
+            runtime.synchronize()
+            dense_marching_seconds = perf_counter() - phase_started
     ragged_caustics = None
     ragged_boundary_threats = None
     flat_source_filtered = False
     critical_rows = None
     boundary_rows = None
     ragged_endpoint_started = None
+    if dense_marching_batch is not None and batched is not None:
+        runtime.synchronize()
+        ragged_endpoint_started = perf_counter()
+        mapped_x, mapped_y = batched.raytrace_ragged(
+            tuple(row[..., 0].reshape(-1) for row in dense_marching_batch),
+            tuple(row[..., 1].reshape(-1) for row in dense_marching_batch),
+        )
+        ragged_caustics = tuple(
+            torch.stack((x, y), dim=-1).reshape_as(critical)
+            for critical, x, y in zip(
+                dense_marching_batch, mapped_x, mapped_y, strict=True
+            )
+        )
     if sparse_marching_batch is not None and batched is not None:
         # Marching squares produces a different endpoint count in every
         # frame. Trace the compact queues together instead of launching and
@@ -739,9 +799,12 @@ def caustic_fields_from_far_fields(
                 flat_boundary = flat_boundary[keep]
                 flat_frames = flat_frames[keep]
                 flat_caustic = flat_caustic[keep]
-                kept_lengths = torch.bincount(
-                    flat_frames.to(torch.int64), minlength=len(times)
-                ).detach().cpu().tolist()
+                kept_lengths = (
+                    torch.bincount(flat_frames.to(torch.int64), minlength=len(times))
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
                 flat_source_filtered = True
             else:
                 kept_lengths = lengths
@@ -760,12 +823,9 @@ def caustic_fields_from_far_fields(
                 threat_counts = torch.zeros(
                     len(times), device=runtime.device, dtype=torch.int32
                 )
-                threat_counts.scatter_add_(
-                    0, flat_frames.to(torch.int64), threatening
-                )
+                threat_counts.scatter_add_(0, flat_frames.to(torch.int64), threatening)
                 ragged_boundary_threats = tuple(
-                    bool(value)
-                    for value in (threat_counts > 0).detach().cpu().tolist()
+                    bool(value) for value in (threat_counts > 0).detach().cpu().tolist()
                 )
         else:
             mapped_x, mapped_y = batched.raytrace_ragged(
@@ -798,11 +858,18 @@ def caustic_fields_from_far_fields(
                             strict=True,
                         )
                     )
-                ).detach().cpu().tolist()
+                )
+                .detach()
+                .cpu()
+                .tolist()
             )
+    ragged_endpoint_seconds = 0.0
+    if ragged_endpoint_started is not None:
+        runtime.synchronize()
+        ragged_endpoint_seconds = perf_counter() - ragged_endpoint_started
     fields = []
-    cleanup_seconds = 0.0
-    marching_seconds = sparse_batch_marching_seconds
+    cleanup_seconds = dense_cleanup_seconds
+    marching_seconds = sparse_batch_marching_seconds + dense_marching_seconds
     endpoint_seconds = 0.0
     rasterizers = []
     boundary_count_tensors = []
@@ -811,13 +878,11 @@ def caustic_fields_from_far_fields(
         sparse_boundary = None
         if sparse:
             if sparse_marching_batch is None:
-                critical, sparse_boundary, rasterizer = (
-                    _sparse_marching_segments(
-                        determinant[frame],
-                        active_indices,
-                        vertex_indices,
-                        lens_grid,
-                    )
+                critical, sparse_boundary, rasterizer = _sparse_marching_segments(
+                    determinant[frame],
+                    active_indices,
+                    vertex_indices,
+                    lens_grid,
                 )
             else:
                 critical = (
@@ -831,6 +896,10 @@ def caustic_fields_from_far_fields(
                     else boundary_rows[frame]
                 )
                 rasterizer = "triton_sparse_temporal_compact"
+        elif dense_marching_batch is not None:
+            critical = dense_marching_batch[frame]
+            rasterizer = "triton_dense_temporal_compact"
+            invalid_segments = _boundary_component_mask(critical, lens_grid)
         else:
             det_frame = determinant[frame]
             if config.minimum_determinant_sign_pixels > 0:
@@ -899,15 +968,12 @@ def caustic_fields_from_far_fields(
                 metadata={
                     "method": "production_analytic_far_field",
                     "determinant_grid_shape": list(lens_grid.shape),
-                    "requested_determinant_grid_shape": list(
-                        requested_lens_grid.shape
-                    ),
+                    "requested_determinant_grid_shape": list(requested_lens_grid.shape),
                     "scout_sparse_determinant": bool(sparse),
                     "determinant_grid_fraction": float(
                         1.0
                         if not sparse
-                        else int(active_indices.shape[0])
-                        / max((ny - 1) * (nx - 1), 1)
+                        else int(active_indices.shape[0]) / max((ny - 1) * (nx - 1), 1)
                     ),
                     "sparse_active_cells": (
                         None if not sparse else int(active_indices.shape[0])
@@ -933,9 +999,7 @@ def caustic_fields_from_far_fields(
                 },
             )
         )
-    if ragged_endpoint_started is not None:
-        runtime.synchronize()
-        endpoint_seconds = perf_counter() - ragged_endpoint_started
+    endpoint_seconds += ragged_endpoint_seconds
     boundary_counts = (
         torch.stack(boundary_count_tensors).detach().cpu().tolist()
         if boundary_count_tensors
@@ -973,7 +1037,8 @@ def caustic_fields_from_far_fields(
                 ),
                 peak_device_memory_bytes=(
                     int(torch.cuda.max_memory_allocated(runtime.device))
-                    if runtime.profiling.value == "detailed" and runtime.device.type == "cuda"
+                    if runtime.profiling.value == "detailed"
+                    and runtime.device.type == "cuda"
                     else None
                 ),
             ),
@@ -1018,7 +1083,9 @@ def dynamic_labeled_caustics(
     if config.temporal_batch_size is not None:
         batch_size = min(len(times), int(config.temporal_batch_size))
     else:
-        batch_size = min(len(times), 40 if simulation.runtime.device.type == "cuda" else 1)
+        batch_size = min(
+            len(times), 40 if simulation.runtime.device.type == "cuda" else 1
+        )
         if simulation.runtime.device.type == "cuda":
             free_bytes, _ = torch.cuda.mem_get_info(simulation.runtime.device)
             determinant_bytes = (
