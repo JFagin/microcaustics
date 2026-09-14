@@ -14,7 +14,8 @@ python examples/static_ipm_map.py
 ## Maps and dynamic calculations
 
 - `static_ipm_map.py` generates an independent IPM magnification map.
-- `static_irs_map.py` generates an independent uniform-grid IRS map.
+- `static_irs_map.py` generates an independent Cartesian IRS map and shows how
+  to select random IRS instead.
 - `dynamic_finite_source.py` combines moving maps with a finite source.
 - `dynamic_labels.py` adds source-center caustic labels to a dynamic sequence.
 - `automatic_tuning.py` selects safe temporal and spatial batch sizes.

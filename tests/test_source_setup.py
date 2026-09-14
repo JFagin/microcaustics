@@ -191,18 +191,22 @@ def test_modulated_physical_disk_matches_explicit_pixelization():
         resolved.brightness([0, 1, 2]), direct.brightness([0, 1, 2])
     )
     common = dict(
-        macro=mc.MacroLens(0.3, 0.2), distances=distances,
-        stellar_population=mc.StellarPopulation.salpeter(count=8), seed=0,
+        macro=mc.MacroLens(0.3, 0.2),
+        distances=distances,
+        stellar_population=mc.StellarPopulation.salpeter(count=8),
+        seed=0,
         runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
     )
     first = mc.MicrolensingSystem(source=deferred, **common).realize()
     second = mc.MicrolensingSystem(source=direct, **common).realize()
-    assert first.stellar_aperture.radius_uas == pytest.approx(second.stellar_aperture.radius_uas)
+    assert first.stellar_aperture.radius_uas == pytest.approx(
+        second.stellar_aperture.radius_uas
+    )
     torch.testing.assert_close(first.stars.x_uas, second.stars.x_uas)
     torch.testing.assert_close(first.stars.y_uas, second.stars.y_uas)
 
 
-def test_custom_source_works_in_independent_and_multi_image_light_curves():
+def test_custom_source_works_in_independent_and_multi_image_light_curves(tmp_path):
     source = mc.CallableSource(
         uniform_brightness,
         source_grid_shape=8,
@@ -218,9 +222,33 @@ def test_custom_source_works_in_independent_and_multi_image_light_curves():
     multi = mc.MultiImageSystem(images={"A": systems[0], "B": systems[0].with_seed(1)})
     result = multi.light_curves(**settings)
     torch.testing.assert_close(result["A"].flux, direct[0].flux)
+    mixed = mc.batched_system_light_curves(
+        [systems[1], multi], curves_per_batch=2, **settings
+    )
+    assert mixed.completed_systems == 2
+    assert mixed.completed_light_curves == 3
+    assert mixed.executed_batch_sizes == (2, 1)
+    assert mixed.light_curves[1].image_names == ("A", "B")
+    torch.testing.assert_close(mixed.light_curves[0].flux, direct[1].flux)
+    torch.testing.assert_close(mixed.light_curves[1]["A"].flux, result["A"].flux)
+    torch.testing.assert_close(mixed.light_curves[1]["B"].flux, result["B"].flux)
+    stored = mc.batched_system_light_curves(
+        [systems[1], multi],
+        curves_per_batch=2,
+        output_path=tmp_path / "mixed.npz",
+        **settings,
+    )
+    assert stored.light_curves == ()
+    assert stored.stored_systems[1].image_names == ("A", "B")
+    loaded = stored.load_system(1)
+    assert loaded.image_names == ("A", "B")
+    torch.testing.assert_close(loaded["A"].flux, result["A"].flux)
+    torch.testing.assert_close(loaded["B"].flux, result["B"].flux)
     requests = [mc.LightCurveRequest(source, systems[0].distances)]
     shared = systems[0].light_curves(
-        [0, 1, 2], requests, rays=64,
+        [0, 1, 2],
+        requests,
+        rays=64,
         schedule=mc.production_dynamic_config(temporal_batch_size=2),
     )
     torch.testing.assert_close(shared[0].flux, direct[0].flux)

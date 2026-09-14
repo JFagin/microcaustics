@@ -25,12 +25,79 @@ _LABEL_ARRAYS = (
     "center_distances_uas",
     "center_distance_censored",
 )
+_LIGHT_CURVE_SCHEMA_VERSION = 1
 
 
 def _json_text(metadata) -> str:
     """Return deterministic JSON while tolerating descriptive custom values."""
 
     return json.dumps(dict(metadata), sort_keys=True, default=str)
+
+
+def _light_curve_payload(light_curve: LightCurve) -> dict[str, np.ndarray]:
+    """Convert one light curve to portable arrays used by every writer."""
+
+    # NPZ cannot represent optional arrays without object/pickle storage. Keep
+    # the archive portable by pairing an empty numeric sentinel with a flag.
+    unlensed = (
+        np.asarray([], dtype=np.float32)
+        if light_curve.unlensed_flux is None
+        else light_curve.unlensed_flux.detach().cpu().numpy()
+    )
+    payload = {
+        "schema_version": np.asarray(_LIGHT_CURVE_SCHEMA_VERSION),
+        "has_labels": np.asarray(light_curve.labels is not None),
+        "times_days": light_curve.times_days.detach().cpu().numpy(),
+        "flux": light_curve.flux.detach().cpu().numpy(),
+        "unlensed_flux": unlensed,
+        "has_unlensed": np.asarray(light_curve.unlensed_flux is not None),
+        "band_names": np.asarray(light_curve.band_names),
+        "metadata_json": np.asarray(_json_text(light_curve.metadata)),
+    }
+    if light_curve.labels is not None:
+        payload.update(
+            {
+                f"labels_{name}": getattr(light_curve.labels, name)
+                .detach()
+                .cpu()
+                .numpy()
+                for name in _LABEL_ARRAYS
+            }
+        )
+    return payload
+
+
+def _light_curve_from_payload(
+    payload: dict[str, np.ndarray],
+    *,
+    device: str | torch.device = "cpu",
+) -> LightCurve:
+    """Reconstruct one light curve from arrays produced by the shared writer."""
+
+    if int(payload.get("schema_version", -1)) != _LIGHT_CURVE_SCHEMA_VERSION:
+        raise ValueError("unsupported light-curve archive schema_version")
+    labels = None
+    if bool(payload.get("has_labels", False)):
+        missing = [name for name in _LABEL_ARRAYS if f"labels_{name}" not in payload]
+        if missing:
+            raise ValueError(f"light-curve archive is missing label arrays {missing}")
+        labels = LightCurveLabels(
+            **{
+                name: torch.from_numpy(payload[f"labels_{name}"].copy()).to(device)
+                for name in _LABEL_ARRAYS
+            }
+        )
+    unlensed = None
+    if bool(payload["has_unlensed"]):
+        unlensed = torch.from_numpy(payload["unlensed_flux"].copy()).to(device)
+    return LightCurve(
+        times_days=torch.from_numpy(payload["times_days"].copy()).to(device),
+        flux=torch.from_numpy(payload["flux"].copy()).to(device),
+        band_names=tuple(str(value) for value in payload["band_names"]),
+        unlensed_flux=unlensed,
+        metadata=json.loads(str(payload["metadata_json"])),
+        labels=labels,
+    )
 
 
 def save_magnification_map(
@@ -87,33 +154,7 @@ def save_light_curve(light_curve: LightCurve, path: str | Path) -> Path:
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    unlensed = (
-        np.asarray([], dtype=np.float32)
-        if light_curve.unlensed_flux is None
-        else light_curve.unlensed_flux.detach().cpu().numpy()
-    )
-    np.savez_compressed(
-        destination,
-        schema_version=np.asarray(2),
-        has_labels=np.asarray(light_curve.labels is not None),
-        times_days=light_curve.times_days.detach().cpu().numpy(),
-        flux=light_curve.flux.detach().cpu().numpy(),
-        unlensed_flux=unlensed,
-        has_unlensed=np.asarray(light_curve.unlensed_flux is not None),
-        band_names=np.asarray(light_curve.band_names),
-        metadata_json=np.asarray(_json_text(light_curve.metadata)),
-        **(
-            {
-                f"labels_{name}": getattr(light_curve.labels, name)
-                .detach()
-                .cpu()
-                .numpy()
-                for name in _LABEL_ARRAYS
-            }
-            if light_curve.labels is not None
-            else {}
-        ),
-    )
+    np.savez_compressed(destination, **_light_curve_payload(light_curve))
     return destination
 
 
@@ -122,34 +163,10 @@ def load_light_curve(
 ) -> LightCurve:
     """Load photometry and optional center labels onto the requested device.
 
-    Older photometry-only archives remain readable. Retained maps and full
-    caustic geometry are separate products, not reconstructed from label arrays.
+    Retained maps and full caustic geometry are separate products, not
+    reconstructed from label arrays.
     """
 
     with np.load(Path(path), allow_pickle=False) as stored:
-        if int(stored.get("schema_version", 1)) not in (1, 2):
-            raise ValueError("unsupported light-curve archive schema_version")
-        labels = None
-        if bool(stored.get("has_labels", False)):
-            missing = [name for name in _LABEL_ARRAYS if f"labels_{name}" not in stored]
-            if missing:
-                raise ValueError(
-                    f"light-curve archive is missing label arrays {missing}"
-                )
-            labels = LightCurveLabels(
-                **{
-                    name: torch.from_numpy(stored[f"labels_{name}"].copy()).to(device)
-                    for name in _LABEL_ARRAYS
-                }
-            )
-        unlensed = None
-        if bool(stored["has_unlensed"]):
-            unlensed = torch.from_numpy(stored["unlensed_flux"].copy()).to(device)
-        return LightCurve(
-            times_days=torch.from_numpy(stored["times_days"].copy()).to(device),
-            flux=torch.from_numpy(stored["flux"].copy()).to(device),
-            band_names=tuple(str(value) for value in stored["band_names"]),
-            unlensed_flux=unlensed,
-            metadata=json.loads(str(stored["metadata_json"])),
-            labels=labels,
-        )
+        payload = {name: stored[name] for name in stored.files}
+    return _light_curve_from_payload(payload, device=device)

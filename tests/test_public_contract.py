@@ -96,7 +96,7 @@ class DTypeParityTests(unittest.TestCase):
                 mc.MacroLens(
                     0.31,
                     0.16,
-                    shear_angle_rad=0.23,
+                    shear_angle_deg=13.178029288008934,
                     smooth_matter_fraction=0.25,
                 ),
                 mc.PointMassField._from_einstein_radii(

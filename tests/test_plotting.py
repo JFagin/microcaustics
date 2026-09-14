@@ -94,6 +94,64 @@ class PlottingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mcp.enclosed_flux_contour_levels(np.zeros((4, 4)))
 
+    def test_mean_source_isophotes_streams_and_reports_area_radii(self) -> None:
+        geometry = mc.SourceGeometry(
+            (2, 3),
+            (1.0, 1.0),
+            (4000.0, 8000.0),
+            ("blue", "red"),
+        )
+
+        class VariableSource:
+            def __init__(self):
+                self.geometry = geometry
+                self.batch_sizes = []
+
+            def brightness(self, times_days, *, dtype=None, device=None):
+                times = torch.as_tensor(times_days, dtype=dtype, device=device)
+                self.batch_sizes.append(times.numel())
+                base = torch.tensor(
+                    [
+                        [[9.0, 1.0], [4.0, 2.0], [1.0, 3.0]],
+                        [[0.0, 4.0], [0.0, 5.0], [0.0, 6.0]],
+                    ],
+                    dtype=dtype,
+                    device=device,
+                )
+                return (1.0 + times[:, None, None, None]) * base
+
+        source = VariableSource()
+        result = mcp.mean_source_isophotes(
+            source,
+            [0.0, 1.0, 2.0],
+            mc.PlaneGrid((2, 3), (2.0, 3.0)),
+            fraction=0.8,
+            batch_size=2,
+        )
+        self.assertEqual(source.batch_sizes, [2, 1])
+        self.assertEqual(result.mean_brightness.shape, (2, 3, 2))
+        self.assertEqual(len(result.images), 2)
+        np.testing.assert_allclose(result.enclosed_fractions, [13 / 14, 18 / 21])
+        np.testing.assert_allclose(
+            result.area_equivalent_radii_uas,
+            np.sqrt(np.asarray([2.0, 4.0]) / np.pi),
+        )
+        np.testing.assert_allclose(result.x_uas, [-1.0, 0.0, 1.0])
+        np.testing.assert_allclose(result.y_uas, [-0.5, 0.5])
+        with self.assertRaises(ValueError):
+            mcp.mean_source_isophotes(
+                source,
+                [],
+                mc.PlaneGrid((2, 3), (2.0, 3.0)),
+            )
+        with self.assertRaises(ValueError):
+            mcp.mean_source_isophotes(
+                source,
+                [0.0],
+                mc.PlaneGrid((2, 3), (2.0, 3.0)),
+                fraction=1.0,
+            )
+
     def test_streaming_source_standardization_and_band_plot(self) -> None:
         geometry = mc.SourceGeometry(
             (3, 4),

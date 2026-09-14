@@ -10,6 +10,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ._system.scheduling import (
+    _light_curve_options,
+    _light_curve_times,
+    _production_dynamic_settings,
+    _retaining_map_observer,
+)
 from .config import (
     CausticConfig,
     DynamicConfig,
@@ -43,10 +49,6 @@ from .sources.variability import (
 from .system import (
     IntegrationDomain,
     MicrolensingSystem,
-    _light_curve_options,
-    _light_curve_times,
-    _production_dynamic_settings,
-    _retaining_map_observer,
 )
 from .trajectories import SourceTrajectory
 
@@ -235,7 +237,7 @@ class MultiImageSystem:
         if any(not name for name in images):
             raise ValueError("macroimage names must be non-empty")
         if not all(
-            isinstance(system, (MicrolensingSystem, MacroLens))
+            isinstance(system, MicrolensingSystem | MacroLens)
             for system in images.values()
         ):
             raise TypeError(
@@ -731,6 +733,8 @@ class MultiImageSystem:
         source: ThermalReprocessingSource | None = None,
         normalize: bool = True,
         map_observers=None,
+        response_batch_size: int | None = None,
+        response_spatial_chunk_size: int = 262_144,
         **solver_options,
     ):
         """Generate microlensed transfer functions for every macroimage."""
@@ -748,8 +752,6 @@ class MultiImageSystem:
             delay_edges_days,
             normalize=normalize,
             map_observers=map_observers,
+            response_batch_size=response_batch_size,
+            response_spatial_chunk_size=response_spatial_chunk_size,
         )
-
-
-# Import compatibility for code written before the shorter public name.
-MultiImageMicrolensingSystem = MultiImageSystem

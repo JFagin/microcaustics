@@ -97,12 +97,6 @@ def publication_style(*, font_size: float = 13.0) -> dict[str, object]:
         "savefig.bbox": "tight",
         "savefig.pad_inches": 0.03,
     }
-
-
-paper_style = publication_style
-"""Backward-compatible alias for :func:`publication_style`."""
-
-
 def finish_axis(ax, *, grid: bool = False) -> None:
     """Apply inward major/minor ticks and optional restrained grid lines."""
 

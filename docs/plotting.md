@@ -78,6 +78,47 @@ not change the source calculation or its normalization. The animation keeps
 the full source colormap and neutral annotation colors. Moving disk pixels
 are undithered, while the static colorbar is encoded only once.
 
+Use `mean_source_isophotes` to stream a variable source over time and measure
+one enclosed-flux boundary per band without retaining the full time cube:
+
+```python
+summary = mcp.mean_source_isophotes(
+    source,
+    daily_times,
+    source_plane_grid,
+    fraction=0.95,
+    batch_size=8,
+)
+for image, level, radius in zip(
+    summary.images,
+    summary.levels,
+    summary.area_equivalent_radii_uas,
+    strict=True,
+):
+    axis.contour(summary.x_uas, summary.y_uas, image, levels=[level])
+    print(f"area-equivalent R95 = {radius:.3f} microarcsec")
+```
+
+The contours retain the actual projected source shape. The reported radius is
+only the radius of a circle with the same enclosed pixel area.
+
+When several source models share one dynamic map sequence,
+`MicrolensingSystem.light_curves` can retain selected evaluated maps directly:
+
+```python
+variable, baseline = system.light_curves(
+    map_times,
+    requests=(variable_request, baseline_request),
+    flux_times_days=daily_times,
+    keep_maps_at_days=map_times,
+)
+maps = variable.maps
+assert maps[0] is baseline.maps[0]
+```
+
+Retention composes with `map_observer`; it does not trigger another map
+calculation.
+
 ## Timing accelerated calculations
 
 GPU work is asynchronous and compiled paths have two different timings worth
@@ -146,5 +187,6 @@ The survey notebooks accept a Rubin OpSim SQLite database through
 `MICROCAUSTICS_LSST_OPSIM`. Rubin documents the current baseline-data download
 workflow in the
 [rubin_sim data guide](https://rubin-sim.lsst.io/data-download.html). Once the
-database is local, `sample_random_rubin_wfd_cadence` selects a reproducible WFD
-field without requiring `rubin_sim` at simulation time.
+database is local, `RubinOpSimCadenceIndex` provides fast repeated WFD, DDF,
+and sky-position queries without requiring `rubin_sim` at simulation time.
+See [`observations.md`](observations.md).

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -11,8 +11,10 @@ import torch
 from ..relativity import (
     approximate_circular_disk_gfactor,
     kerr_isco_radius,
-    kerr_radiative_efficiency,
-    page_thorne_flux_factor,
+    novikov_thorne_flux_factor,
+    novikov_thorne_radiative_efficiency,
+    shakura_sunyaev_flux_factor,
+    shakura_sunyaev_radiative_efficiency,
 )
 from .base import SourceGeometry, _as_times
 
@@ -25,6 +27,23 @@ _M_SUN = 1.988409870698051e30
 _SIGMA_SB = 5.670374419e-8
 _SIGMA_T = 6.6524587321e-29
 
+# Custom profiles receive dimensionless radius, spin, and ISCO tensors. They
+# may close over any additional user parameters needed by another disk model.
+ViscousFluxProfile = (
+    str | Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+)
+RadiativeEfficiency = (
+    str
+    | float
+    | torch.Tensor
+    | Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+    | None
+)
+
+_NOVIKOV_THORNE = "novikov-thorne"
+_SHAKURA_SUNYAEV = "shakura-sunyaev"
+_BUILTIN_FLUX_PROFILES = {_NOVIKOV_THORNE, _SHAKURA_SUNYAEV}
+
 
 def _scalar_tensor(value, *, name: str, device, dtype) -> torch.Tensor:
     tensor = torch.as_tensor(value, device=device, dtype=dtype)
@@ -33,15 +52,138 @@ def _scalar_tensor(value, *, name: str, device, dtype) -> torch.Tensor:
     return tensor.reshape(())
 
 
+def _validate_viscous_prescriptions(
+    viscous_flux_profile: ViscousFluxProfile,
+    radiative_efficiency: RadiativeEfficiency,
+) -> None:
+    if isinstance(viscous_flux_profile, str):
+        if viscous_flux_profile not in _BUILTIN_FLUX_PROFILES:
+            raise ValueError(
+                "viscous_flux_profile must be 'novikov-thorne', "
+                "'shakura-sunyaev', or a callable"
+            )
+    elif not callable(viscous_flux_profile):
+        raise TypeError("viscous_flux_profile must be a string or callable")
+    elif radiative_efficiency is None:
+        raise ValueError("a custom viscous_flux_profile requires radiative_efficiency")
+
+    if isinstance(radiative_efficiency, str):
+        if radiative_efficiency not in _BUILTIN_FLUX_PROFILES:
+            raise ValueError(
+                "radiative_efficiency must be None, 'novikov-thorne', "
+                "'shakura-sunyaev', a positive scalar, or a callable"
+            )
+    elif radiative_efficiency is not None and not callable(radiative_efficiency):
+        value = torch.as_tensor(radiative_efficiency)
+        if (
+            value.numel() != 1
+            or not bool(torch.isfinite(value))
+            or bool(value <= 0)
+            or bool(value > 1)
+        ):
+            raise ValueError("radiative_efficiency must be one scalar in (0, 1]")
+
+
+def _prescription_name(value) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "profile-default"
+    if callable(value):
+        return getattr(
+            value,
+            "name",
+            getattr(value, "__name__", value.__class__.__name__),
+        )
+    return "fixed"
+
+
+def _prescription_metadata(value) -> dict[str, object]:
+    """Return optional reproducibility metadata exposed by a custom callable."""
+
+    metadata = getattr(value, "metadata", None)
+    if callable(metadata):
+        metadata = metadata()
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, Mapping):
+        raise TypeError("custom prescription metadata must be a mapping")
+    return dict(metadata)
+
+
+def _viscous_flux_factor(
+    radius: torch.Tensor,
+    spin: torch.Tensor,
+    isco: torch.Tensor,
+    profile: ViscousFluxProfile,
+) -> torch.Tensor:
+    if isinstance(profile, str):
+        if profile == _NOVIKOV_THORNE:
+            return novikov_thorne_flux_factor(radius, spin, isco)
+        if profile == _SHAKURA_SUNYAEV:
+            return shakura_sunyaev_flux_factor(radius, spin, isco)
+        raise ValueError(f"unknown viscous flux profile: {profile!r}")
+    value = torch.as_tensor(
+        profile(radius, spin, isco),
+        device=radius.device,
+        dtype=radius.dtype,
+    )
+    try:
+        value = torch.broadcast_to(value, radius.shape)
+    except RuntimeError as exc:
+        raise ValueError(
+            "custom viscous_flux_profile output must broadcast to radius_rg"
+        ) from exc
+    if bool(torch.any(~torch.isfinite(value))) or bool(torch.any(value < 0)):
+        raise ValueError(
+            "custom viscous_flux_profile must return finite non-negative values"
+        )
+    # The package consistently imposes the disk's inner boundary even when a
+    # custom callable returns nonzero values there.
+    return torch.where(radius > isco, value, torch.zeros_like(value))
+
+
+def _radiative_efficiency(
+    prescription: RadiativeEfficiency,
+    profile: ViscousFluxProfile,
+    spin: torch.Tensor,
+    isco: torch.Tensor,
+) -> torch.Tensor:
+    _validate_viscous_prescriptions(profile, prescription)
+    # None deliberately means "use the efficiency paired with the selected
+    # built-in profile"; custom profiles must make this choice explicitly.
+    resolved = profile if prescription is None else prescription
+    if isinstance(resolved, str):
+        if resolved == _NOVIKOV_THORNE:
+            value = novikov_thorne_radiative_efficiency(spin, isco)
+        elif resolved == _SHAKURA_SUNYAEV:
+            value = shakura_sunyaev_radiative_efficiency(spin, isco)
+        else:
+            raise ValueError(f"unknown radiative efficiency: {resolved!r}")
+    elif callable(resolved):
+        value = resolved(spin, isco)
+    else:
+        value = resolved
+    efficiency = torch.as_tensor(value, device=spin.device, dtype=spin.dtype)
+    if efficiency.numel() != 1 or not bool(torch.isfinite(efficiency)):
+        raise ValueError("radiative_efficiency must resolve to one finite scalar")
+    efficiency = efficiency.reshape(())
+    if bool(efficiency <= 0) or bool(efficiency > 1):
+        raise ValueError("radiative_efficiency must be in (0, 1]")
+    return efficiency
+
+
 def _thin_disk_temperature4_coefficient(
     black_hole_mass_solar,
     eddington_ratio,
     spin,
     *,
+    viscous_flux_profile: ViscousFluxProfile = _NOVIKOV_THORNE,
+    radiative_efficiency: RadiativeEfficiency = None,
     device,
     dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the common Page--Thorne and lamp-heating temperature scale."""
+    """Return the common viscous-disk and lamp-heating temperature scale."""
 
     mass_solar = _scalar_tensor(
         black_hole_mass_solar,
@@ -57,8 +199,16 @@ def _thin_disk_temperature4_coefficient(
     )
     spin = _scalar_tensor(spin, name="spin", device=device, dtype=dtype)
     isco = kerr_isco_radius(spin)
-    efficiency = kerr_radiative_efficiency(spin)
+    _validate_viscous_prescriptions(viscous_flux_profile, radiative_efficiency)
+    efficiency = _radiative_efficiency(
+        radiative_efficiency,
+        viscous_flux_profile,
+        spin,
+        isco,
+    )
     gravitational_radius = (_G * _M_SUN / _C**2) * mass_solar
+    # The Eddington ratio fixes luminosity, so the selected efficiency sets the
+    # corresponding mass accretion rate and therefore the temperature scale.
     eddington_rate = (
         4.0
         * math.pi
@@ -84,6 +234,8 @@ def thin_disk_temperature4(
     eddington_ratio,
     spin,
     temperature_slope_beta=0.75,
+    viscous_flux_profile: ViscousFluxProfile = _NOVIKOV_THORNE,
+    radiative_efficiency: RadiativeEfficiency = None,
     normalization_samples: int = 20_000,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return effective temperature to the fourth power and ISCO radius.
@@ -92,6 +244,12 @@ def thin_disk_temperature4(
     coordinate-area luminosity ``integral F(r) r dr``. The normalization uses
     the same logarithmic radial domain as the validated paper model and is
     therefore independent of an observer transfer's pixel sampling.
+
+    ``viscous_flux_profile`` may be ``"novikov-thorne"`` (the default),
+    ``"shakura-sunyaev"``, or a callable ``(radius_rg, spin, isco_rg)``.
+    ``radiative_efficiency=None`` selects the matching analytic efficiency for
+    a built-in profile. Custom profiles require a scalar or callable
+    efficiency, while either built-in efficiency may also be selected by name.
     """
 
     radius = torch.as_tensor(radius_rg)
@@ -111,10 +269,17 @@ def thin_disk_temperature4(
         black_hole_mass_solar,
         eddington_ratio,
         spin,
+        viscous_flux_profile=viscous_flux_profile,
+        radiative_efficiency=radiative_efficiency,
         device=device,
         dtype=dtype,
     )
-    temperature4 = coefficient * page_thorne_flux_factor(radius, spin, isco)
+    temperature4 = coefficient * _viscous_flux_factor(
+        radius,
+        spin,
+        isco,
+        viscous_flux_profile,
+    )
     radial_tilt = 3.0 - 4.0 * beta
     modifier = radius.clamp(1.0e-6, 1.0e6).pow(radial_tilt)
     physical = radius > isco
@@ -127,18 +292,19 @@ def thin_disk_temperature4(
         dtype=dtype,
     )
     widths = torch.empty_like(normalization_radius)
-    widths[1:-1] = 0.5 * (
-        normalization_radius[2:] - normalization_radius[:-2]
-    )
+    widths[1:-1] = 0.5 * (normalization_radius[2:] - normalization_radius[:-2])
     widths[0] = normalization_radius[1] - normalization_radius[0]
     widths[-1] = normalization_radius[-1] - normalization_radius[-2]
-    normalization_flux = page_thorne_flux_factor(
+    normalization_flux = _viscous_flux_factor(
         normalization_radius,
         spin,
         isco,
+        viscous_flux_profile,
     )
     normalization_physical = normalization_radius >= isco
     area_weight = normalization_radius * widths
+    # This ratio is C_beta: it preserves the bolometric viscous luminosity of
+    # the beta=3/4 profile while allowing a different radial temperature slope.
     baseline_power = torch.where(
         normalization_physical,
         normalization_flux * area_weight,
@@ -146,14 +312,10 @@ def thin_disk_temperature4(
     ).sum()
     modified_power = torch.where(
         normalization_physical,
-        normalization_flux
-        * normalization_radius.pow(radial_tilt)
-        * area_weight,
+        normalization_flux * normalization_radius.pow(radial_tilt) * area_weight,
         0.0,
     ).sum()
-    normalization = baseline_power / modified_power.clamp_min(
-        torch.finfo(dtype).tiny
-    )
+    normalization = baseline_power / modified_power.clamp_min(torch.finfo(dtype).tiny)
     value = torch.where(
         physical,
         temperature4 * modifier * normalization,
@@ -170,6 +332,8 @@ def thin_disk_flux_radius_rg(
     observed_wavelength_angstrom: float,
     source_redshift: float,
     temperature_slope_beta: float = 0.75,
+    viscous_flux_profile: ViscousFluxProfile = _NOVIKOV_THORNE,
+    radiative_efficiency: RadiativeEfficiency = None,
     color_correction: float = 1.0,
     lamp_fraction: float = 0.1,
     corona_height_above_isco_rg: float = 20.0,
@@ -183,7 +347,7 @@ def thin_disk_flux_radius_rg(
 
     The radius encloses ``flux_fraction`` of the face-on monochromatic flux at
     the supplied observed wavelength and then applies ``safety_factor``. The
-    calculation uses the same Page--Thorne dissipation, optional axis-lamp
+    calculation uses the selected viscous dissipation, optional axis-lamp
     heating, logarithmic radial domain, and annular integration convention as
     the validated production disk model. The reddest requested band is usually
     the appropriate input when one common field must contain every band.
@@ -224,12 +388,16 @@ def thin_disk_flux_radius_rg(
         eddington_ratio=eddington_ratio,
         spin=spin,
         temperature_slope_beta=temperature_slope_beta,
+        viscous_flux_profile=viscous_flux_profile,
+        radiative_efficiency=radiative_efficiency,
         normalization_samples=radial_samples,
     )
     coefficient, _ = _thin_disk_temperature4_coefficient(
         black_hole_mass_solar,
         eddington_ratio,
         spin,
+        viscous_flux_profile=viscous_flux_profile,
+        radiative_efficiency=radiative_efficiency,
         device=device,
         dtype=dtype,
     )
@@ -239,7 +407,13 @@ def thin_disk_flux_radius_rg(
         device=device,
         dtype=dtype,
     )
-    efficiency = kerr_radiative_efficiency(spin)
+    spin_tensor = _scalar_tensor(spin, name="spin", device=device, dtype=dtype)
+    efficiency = _radiative_efficiency(
+        radiative_efficiency,
+        viscous_flux_profile,
+        spin_tensor,
+        isco,
+    )
     height = isco + float(corona_height_above_isco_rg)
     lamp_temperature4 = (
         float(lamp_fraction)
@@ -256,19 +430,17 @@ def thin_disk_flux_radius_rg(
         torch.zeros_like(lamp_temperature4),
     )
     temperature = (
-        viscous_temperature4 + lamp_temperature4
-    ).clamp_min(torch.finfo(dtype).tiny).pow(0.25)
+        (viscous_temperature4 + lamp_temperature4)
+        .clamp_min(torch.finfo(dtype).tiny)
+        .pow(0.25)
+    )
     rest_wavelength_m = (
-        float(observed_wavelength_angstrom)
-        * 1.0e-10
-        / (1.0 + float(source_redshift))
+        float(observed_wavelength_angstrom) * 1.0e-10 / (1.0 + float(source_redshift))
     )
     hardening = float(color_correction)
-    exponent = (
-        _H
-        * _C
-        / (rest_wavelength_m * _K_B * hardening * temperature)
-    ).clamp(max=85.0)
+    exponent = (_H * _C / (rest_wavelength_m * _K_B * hardening * temperature)).clamp(
+        max=85.0
+    )
     intensity = torch.reciprocal(torch.expm1(exponent)) / hardening**4
     widths = torch.empty_like(radius)
     widths[1:-1] = 0.5 * (radius[2:] - radius[:-2])
@@ -281,16 +453,14 @@ def thin_disk_flux_radius_rg(
     )
     cumulative = torch.cumsum(annular_flux, dim=0)
     cumulative = cumulative / cumulative[-1].clamp_min(torch.finfo(dtype).tiny)
-    target = torch.as_tensor(
-        float(flux_fraction), device=device, dtype=dtype
-    )
+    target = torch.as_tensor(float(flux_fraction), device=device, dtype=dtype)
     index = torch.searchsorted(cumulative, target).clamp(max=radius.numel() - 1)
     return float((float(safety_factor) * radius[index]).detach().cpu())
 
 
 @dataclass(frozen=True)
 class ThinDiskSource:
-    """A static Novikov--Thorne/Page--Thorne continuum disk.
+    """A static thermal continuum disk.
 
     Pixels describe the projected source plane. The disk radius is deprojected
     using ``inclination_deg`` and rotated by ``position_angle_deg``. Returned
@@ -299,8 +469,8 @@ class ThinDiskSource:
     multiplies by each physical pixel area and therefore returns Jy.
 
     ``relativity='none'`` uses no photon frequency shift while retaining the
-    relativistic Page--Thorne radial dissipation profile. ``'approximate'``
-    adds the legacy straight-screen circular-orbit shift. Full light bending
+    selected radial dissipation profile. ``'approximate'``
+    adds the straight-screen circular-orbit shift. Full light bending
     is represented by a separate Kerr observer-transfer source and is not
     silently approximated by this class.
     """
@@ -315,12 +485,18 @@ class ThinDiskSource:
     luminosity_distance_m: float | torch.Tensor = 1.0e26
     color_correction: float | torch.Tensor = 1.0
     temperature_slope_beta: float | torch.Tensor = 0.75
+    viscous_flux_profile: ViscousFluxProfile = _NOVIKOV_THORNE
+    radiative_efficiency: RadiativeEfficiency = None
     outer_radius_m: float | torch.Tensor | None = None
     relativity: str = "none"
     name: str = "thin_disk"
     is_time_static: bool = True
 
     def __post_init__(self) -> None:
+        _validate_viscous_prescriptions(
+            self.viscous_flux_profile,
+            self.radiative_efficiency,
+        )
         if self.relativity not in {"none", "approximate"}:
             raise ValueError("relativity must be 'none' or 'approximate'")
         checks = {
@@ -444,9 +620,7 @@ class ThinDiskSource:
         sine = torch.sin(position_angle)
         disk_x = cosine * projected_x + sine * projected_y
         disk_y = -sine * projected_x + cosine * projected_y
-        disk_x = disk_x / torch.cos(inclination).clamp_min(
-            torch.finfo(dtype).tiny
-        )
+        disk_x = disk_x / torch.cos(inclination).clamp_min(torch.finfo(dtype).tiny)
         radius_m = torch.sqrt(disk_x.square() + disk_y.square())
         azimuth = torch.atan2(disk_y, disk_x)
 
@@ -461,6 +635,8 @@ class ThinDiskSource:
             eddington_ratio=eddington_ratio,
             spin=spin,
             temperature_slope_beta=beta,
+            viscous_flux_profile=self.viscous_flux_profile,
+            radiative_efficiency=self.radiative_efficiency,
         )
         temperature = temperature4.clamp_min(0.0).pow(0.25)
 
@@ -490,12 +666,16 @@ class ThinDiskSource:
             dtype=dtype,
         )
         rest_wavelength_m = wavelengths * 1.0e-10 / (1.0 + redshift)
-        exponent = _H * _C / (
-            rest_wavelength_m[None, None, :]
-            * gfactor[..., None]
-            * _K_B
-            * color_correction
-            * temperature[..., None].clamp_min(1.0e-12)
+        exponent = (
+            _H
+            * _C
+            / (
+                rest_wavelength_m[None, None, :]
+                * gfactor[..., None]
+                * _K_B
+                * color_correction
+                * temperature[..., None].clamp_min(1.0e-12)
+            )
         )
         exponent = exponent.clamp(max=85.0)
         intensity_nu = (
@@ -511,10 +691,7 @@ class ThinDiskSource:
         # conversion, even though the physical answer is representable.
         scaled_distance = luminosity_distance / 1.0e20
         brightness = (
-            intensity_nu
-            * (1.0 + redshift)
-            / scaled_distance.square()
-            * 1.0e-14
+            intensity_nu * (1.0 + redshift) / scaled_distance.square() * 1.0e-14
         )
         return torch.where(masked[..., None], 0.0, brightness)
 
@@ -551,8 +728,22 @@ class ThinDiskSource:
             "luminosity_distance_m": scalar(self.luminosity_distance_m),
             "color_correction": scalar(self.color_correction),
             "temperature_slope_beta": scalar(self.temperature_slope_beta),
+            "viscous_flux_profile": _prescription_name(self.viscous_flux_profile),
+            "viscous_flux_profile_metadata": _prescription_metadata(
+                self.viscous_flux_profile
+            ),
+            "radiative_efficiency": float(
+                _radiative_efficiency(
+                    self.radiative_efficiency,
+                    self.viscous_flux_profile,
+                    torch.as_tensor(self.spin, dtype=torch.float64),
+                    kerr_isco_radius(torch.as_tensor(self.spin, dtype=torch.float64)),
+                )
+            ),
+            "radiative_efficiency_prescription": _prescription_name(
+                self.radiative_efficiency
+            ),
             "relativity": self.relativity,
-            "radial_flux_profile": "Page-Thorne",
             "brightness_units": "Jy m^-2 projected source plane",
             "integrated_flux_units": "Jy",
             "is_time_static": True,

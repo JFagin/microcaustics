@@ -59,6 +59,21 @@ flux = result.flux_tensor()  # [image, time, band]
 curve_b = result["B"].light_curve
 ```
 
+Collections may mix systems with any image multiplicity. Concurrency counts
+individual macroimage curves, while outputs retain one entry per input system:
+
+```python
+batch = mc.batched_system_light_curves(
+    [single_system, double_system, system],
+    duration_days=3650,
+    map_cadence_days=25,
+    source_cadence_days=1,
+    curves_per_batch=3,
+    output_path="dataset.npz",
+)
+q2237 = batch.load_system(2)
+```
+
 A scalar seed is a reproducible base seed. Stable independent image seeds are
 derived from each image name, so reordering the mapping does not change a
 realization. Supply `seed={"A": ..., "B": ...}` when exact per-image seeds
@@ -237,11 +252,12 @@ responses = system.transfer_functions(
 property `observer_mean_delays_days` adds the image's macro arrival delay.
 
 Finally, an arbitrary visit sequence can sample the fine truth light curves.
-For Rubin data, use an OpSim cadence and the standard random-plus-systematic
-magnitude uncertainty:
+For Rubin data, build the OpSim index once, sample a WFD cadence, and apply the
+same visits to every resolved macroimage:
 
 ```python
-cadence = mc.sample_random_rubin_wfd_cadence("baseline.db", seed=0)
+rubin = mc.RubinOpSimCadenceIndex.from_database("baseline.db")
+cadence = rubin.sample(seed=0)  # WFD by default
 observations = mc.observe_multi_image_light_curves(
     curves,
     cadence,
@@ -251,6 +267,8 @@ observations = mc.observe_multi_image_light_curves(
 
 All photometric source models return flux density in Jy, so observations and
 plots use AB magnitudes directly. No fitted reference magnitude is required.
+Known sky positions, DDF sampling, single-light-curve observations, and
+advanced noise controls are described in [`observations.md`](observations.md).
 
 Bands are read from the cadence and source. `ugrizy` is not hard-coded into the
 multi-image simulator. General macro-image rendering is a separate optional

@@ -26,7 +26,7 @@ class RandomizedNumericalProperties(unittest.TestCase):
             macro = mc.MacroLens(
                 convergence,
                 shear,
-                shear_angle_rad=angle,
+                shear_angle_deg=math.degrees(angle),
                 smooth_matter_fraction=smooth_fraction,
             )
             simulation = mc.MicrolensingSimulation.create(

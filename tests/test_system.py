@@ -249,6 +249,88 @@ class MicrolensingSystemTests(unittest.TestCase):
         )
         self.assertEqual(overridden.seed_for("observations"), 77)
 
+    def test_stellar_draws_ignore_observation_schedule_and_nonstellar_seeds(
+        self,
+    ) -> None:
+        """Schedules within one declared horizon must not redraw the lens field."""
+
+        source = mc.GaussianSource(
+            mc.SourceGeometry(
+                shape=self.source_grid.shape,
+                pixel_scale_m=(1.0e10, 1.0e10),
+                wavelengths_angstrom=(5_000.0,),
+                band_names=("optical",),
+            ),
+            sigma_m=1.0e10,
+        )
+        seeds = {
+            "base": 7_301,
+            "stars": 401,
+            "kinematics": 402,
+            "variability": 403,
+            "observations": 404,
+        }
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            source=source,
+            stellar_population=mc.StellarPopulation.salpeter(
+                count=31,
+                kinematics=mc.IsotropicKinematics(dispersion_km_s=170.0),
+            ),
+            lens_region=self.lens_region,
+            duration_days=100.0,
+            seed=seeds,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+
+        def assert_same_field(first, second) -> None:
+            for name in (
+                "x_uas",
+                "y_uas",
+                "mass_solar",
+                "einstein_radius_uas",
+                "velocity_x_uas_per_day",
+                "velocity_y_uas_per_day",
+            ):
+                first_value = getattr(first, name)
+                second_value = getattr(second, name)
+                self.assertEqual(first_value is None, second_value is None, name)
+                if first_value is not None:
+                    torch.testing.assert_close(
+                        first_value,
+                        second_value,
+                        rtol=0,
+                        atol=0,
+                        msg=name,
+                    )
+
+        sparse = system._realize_for_times((0.0, 5.0, 100.0)).stars
+        dense = system._realize_for_times((0.0, 1.0, 5.0, 25.0, 100.0)).stars
+        assert_same_field(sparse, dense)
+        assert_same_field(sparse.at_time(5.0), dense.at_time(5.0))
+
+        variable = system.with_source(
+            mc.ModulatedSource(
+                source,
+                mc.broken_power_law_driving_signal(
+                    cadence_days=1.0,
+                    max_duration_days=120.0,
+                    history_days=10.0,
+                ),
+            )
+        )
+        changed_variability = variable.with_seed(
+            {**seeds, "variability": 999, "observations": 998}
+        )
+        assert_same_field(
+            sparse,
+            changed_variability._realize_for_times((0.0, 100.0)).stars,
+        )
+
+        changed_stars = system.with_seed({**seeds, "stars": 999}).realized_stars
+        self.assertFalse(torch.equal(sparse.x_uas, changed_stars.x_uas))
+
     def test_summary_does_not_realize_or_compile(self) -> None:
         system = mc.MicrolensingSystem(
             macro=self.macro,
@@ -366,11 +448,10 @@ class MicrolensingSystemTests(unittest.TestCase):
             places=12,
         )
 
-    def test_degree_first_macro_lens_matches_radian_compatibility(self) -> None:
-        degrees = mc.MacroLens(0.3, 0.2, shear_angle_deg=37.5)
-        radians = mc.MacroLens(0.3, 0.2, shear_angle_rad=math.radians(37.5))
-        self.assertAlmostEqual(degrees.shear_angle_rad, radians.shear_angle_rad)
-        self.assertAlmostEqual(degrees.shear_angle_deg, 37.5)
+    def test_macro_lens_exposes_derived_radian_angle(self) -> None:
+        lens = mc.MacroLens(0.3, 0.2, shear_angle_deg=37.5)
+        self.assertAlmostEqual(lens.shear_angle_rad, math.radians(37.5))
+        self.assertAlmostEqual(lens.shear_angle_deg, 37.5)
 
     def test_rectangle_uses_internal_shear_aligned_coordinates(self) -> None:
         angle_deg = 37.5
@@ -1239,7 +1320,7 @@ class MicrolensingSystemTests(unittest.TestCase):
         )
 
     def test_rotated_shear_aperture_encloses_transformed_source_corners(self) -> None:
-        macro = mc.MacroLens(0.31, 0.22, shear_angle_rad=0.37)
+        macro = mc.MacroLens(0.31, 0.22, shear_angle_deg=math.degrees(0.37))
         source_region = mc.PlaneRegion((1.4, 2.2), center_uas=(0.13, -0.27))
         population = mc.StellarPopulation.salpeter(
             mean_mass_solar=0.3,
@@ -1431,7 +1512,7 @@ class MicrolensingSystemTests(unittest.TestCase):
     def test_physical_support_avoids_treating_zero_map_corners_as_emission(
         self,
     ) -> None:
-        macro = mc.MacroLens(0.31, 0.22, shear_angle_rad=0.37)
+        macro = mc.MacroLens(0.31, 0.22, shear_angle_deg=math.degrees(0.37))
         population = mc.StellarPopulation.salpeter(
             mean_mass_solar=0.3,
             mass_ratio=20.0,

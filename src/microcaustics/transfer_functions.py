@@ -46,10 +46,142 @@ class TransferFunctionSource(Protocol):
         ...
 
 
+@runtime_checkable
+class MeanResponseDelaySource(Protocol):
+    """Source contract for direct response-weighted mean delays."""
+
+    geometry: SourceGeometry
+
+    def mean_response_delays(
+        self,
+        *,
+        magnification: torch.Tensor | None = None,
+        driver_amplitude: float = 1.0,
+    ) -> torch.Tensor:
+        """Return one response-weighted mean delay per band."""
+
+        ...
+
+
+def steady_mean_response_delays(
+    source: MeanResponseDelaySource,
+    *,
+    driver_amplitude: float = 1.0,
+) -> torch.Tensor:
+    """Return exact unlensed response-weighted mean delays without binning."""
+
+    if not isinstance(source, MeanResponseDelaySource):
+        raise TypeError("source must implement the MeanResponseDelaySource protocol")
+    return source.mean_response_delays(driver_amplitude=driver_amplitude)
+
+
+def microlensed_mean_response_delays(
+    source: MeanResponseDelaySource,
+    magnification_map: MagnificationMap,
+    distances: LensingDistances,
+    *,
+    source_center_uas: tuple[float, float] = (0.0, 0.0),
+    strict_coverage: bool = True,
+    driver_amplitude: float = 1.0,
+) -> torch.Tensor:
+    """Return exact microlensed mean delays without delay-bin construction."""
+
+    if not isinstance(source, MeanResponseDelaySource):
+        raise TypeError("source must implement the MeanResponseDelaySource protocol")
+    if len(source_center_uas) != 2:
+        raise ValueError("source_center_uas must contain Cartesian x and y")
+    values_map = magnification_map.values
+    device, dtype = values_map.device, values_map.dtype
+    offset_x, offset_y = _source_offsets_uas(
+        source,
+        distances,
+        device=device,
+        dtype=dtype,
+    )
+    magnification = _sample_map(
+        magnification_map,
+        offset_x + float(source_center_uas[0]),
+        offset_y + float(source_center_uas[1]),
+        strict_coverage=strict_coverage,
+    )
+    return source.mean_response_delays(
+        magnification=magnification,
+        driver_amplitude=driver_amplitude,
+    )
+
+
+def microlensed_mean_response_delays_batch(
+    source: MeanResponseDelaySource,
+    magnification_maps: Sequence[MagnificationMap],
+    distances: LensingDistances,
+    *,
+    source_centers_uas: Sequence[tuple[float, float]] | None = None,
+    strict_coverage: bool = True,
+    driver_amplitude: float = 1.0,
+    spatial_chunk_size: int = 262_144,
+) -> torch.Tensor:
+    """Return exact mean delays for a bounded batch of magnification maps."""
+
+    if not isinstance(source, MeanResponseDelaySource):
+        raise TypeError("source must implement the MeanResponseDelaySource protocol")
+    maps = tuple(magnification_maps)
+    if not maps:
+        raise ValueError("at least one magnification map is required")
+    centers = (
+        ((0.0, 0.0),) * len(maps)
+        if source_centers_uas is None
+        else tuple(source_centers_uas)
+    )
+    if len(centers) != len(maps) or any(len(center) != 2 for center in centers):
+        raise ValueError("source centers must contain one Cartesian pair per map")
+    device, dtype = maps[0].values.device, maps[0].values.dtype
+    if any(item.values.device != device or item.values.dtype != dtype for item in maps):
+        raise ValueError("all magnification maps must share device and dtype")
+    offset_x, offset_y = _source_offsets_uas(
+        source,
+        distances,
+        device=device,
+        dtype=dtype,
+    )
+    sampled = torch.stack(
+        [
+            _sample_map(
+                magnification_map,
+                offset_x + float(center[0]),
+                offset_y + float(center[1]),
+                strict_coverage=strict_coverage,
+            )
+            for magnification_map, center in zip(maps, centers, strict=True)
+        ]
+    )
+    batched = getattr(source, "batched_mean_response_delays", None)
+    if callable(batched):
+        return batched(
+            magnification=sampled,
+            driver_amplitude=driver_amplitude,
+            spatial_chunk_size=spatial_chunk_size,
+        )
+    return torch.stack(
+        [
+            source.mean_response_delays(
+                magnification=magnification,
+                driver_amplitude=driver_amplitude,
+            )
+            for magnification in sampled
+        ]
+    )
+
+
 def _mean_delays(values: torch.Tensor, edges: torch.Tensor) -> torch.Tensor:
     centers = 0.5 * (edges[:-1] + edges[1:])
     normalizer = values.sum(dim=0).clamp_min(1.0e-30)
     return (values * centers[:, None]).sum(dim=0) / normalizer
+
+
+def _batched_mean_delays(values: torch.Tensor, edges: torch.Tensor) -> torch.Tensor:
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    normalizer = values.sum(dim=1).clamp_min(1.0e-30)
+    return (values * centers[None, :, None]).sum(dim=1) / normalizer
 
 
 def steady_transfer_function(
@@ -182,6 +314,8 @@ def streaming_microlensed_transfer_functions(
     driver_amplitude: float = 1.0,
     normalize: bool = True,
     map_observer: Callable[[int, MagnificationMap], None] | None = None,
+    response_batch_size: int | None = None,
+    response_spatial_chunk_size: int = 262_144,
 ) -> TransferFunctionSeries:
     """Stream dynamic maps into time-dependent microlensed responses.
 
@@ -206,9 +340,48 @@ def streaming_microlensed_transfer_functions(
     resolved_schedule = DynamicConfig() if schedule is None else schedule
     runtime.synchronize(detailed=False)
     started = perf_counter()
-    responses = []
-    means = []
+    if response_batch_size is None:
+        response_batch_size = resolved_schedule.temporal_batch_size
+    if response_batch_size is None:
+        response_batch_size = 1
+    response_batch_size = int(response_batch_size)
+    if response_batch_size < 1:
+        raise ValueError("response_batch_size must be positive")
+    if response_spatial_chunk_size < 1:
+        raise ValueError("response_spatial_chunk_size must be positive")
+    batched_response = getattr(source, "batched_transfer_function", None)
+    use_batched_response = callable(batched_response) and response_batch_size > 1
+    offset_x, offset_y = _source_offsets_uas(
+        source,
+        distances,
+        device=device,
+        dtype=dtype,
+    )
+    responses: list[torch.Tensor] = []
+    means: list[torch.Tensor] = []
+    sampled_batch: list[torch.Tensor] = []
     map_methods: set[str] = set()
+
+    def flush_response_batch() -> None:
+        if not sampled_batch:
+            return
+        assert callable(batched_response)
+        batch = batched_response(
+            delay_edges_days,
+            magnification=torch.stack(sampled_batch),
+            driver_amplitude=driver_amplitude,
+            normalize=normalize,
+            spatial_chunk_size=response_spatial_chunk_size,
+        )
+        batch_edges = torch.as_tensor(
+            delay_edges_days,
+            device=batch.device,
+            dtype=batch.dtype,
+        )
+        responses.extend(batch.unbind(0))
+        means.extend(_batched_mean_delays(batch, batch_edges).unbind(0))
+        sampled_batch.clear()
+
     for index, magnification_map in enumerate(
         simulation.dynamic_maps(
             lens_region,
@@ -221,21 +394,35 @@ def streaming_microlensed_transfer_functions(
         map_methods.add(magnification_map.method)
         if map_observer is not None:
             map_observer(index, magnification_map)
-        product = microlensed_transfer_function(
-            source,
-            magnification_map,
-            distances,
-            delay_edges_days,
-            source_center_uas=(
-                float(centers[index, 0]),
-                float(centers[index, 1]),
-            ),
-            strict_coverage=strict_coverage,
-            driver_amplitude=driver_amplitude,
-            normalize=normalize,
-        )
-        responses.append(product.values)
-        means.append(product.mean_delays_days)
+        if use_batched_response:
+            sampled_batch.append(
+                _sample_map(
+                    magnification_map,
+                    offset_x + centers[index, 0],
+                    offset_y + centers[index, 1],
+                    strict_coverage=strict_coverage,
+                )
+            )
+            if len(sampled_batch) == response_batch_size:
+                flush_response_batch()
+        else:
+            product = microlensed_transfer_function(
+                source,
+                magnification_map,
+                distances,
+                delay_edges_days,
+                source_center_uas=(
+                    float(centers[index, 0]),
+                    float(centers[index, 1]),
+                ),
+                strict_coverage=strict_coverage,
+                driver_amplitude=driver_amplitude,
+                normalize=normalize,
+            )
+            responses.append(product.values)
+            means.append(product.mean_delays_days)
+    if use_batched_response:
+        flush_response_batch()
     runtime.synchronize(detailed=False)
     elapsed = perf_counter() - started
     edges = torch.as_tensor(
@@ -257,6 +444,12 @@ def streaming_microlensed_transfer_functions(
             "strict_coverage": bool(strict_coverage),
             "normalized": bool(normalize),
             "driver_amplitude": float(driver_amplitude),
+            "response_batch_size": (
+                response_batch_size if use_batched_response else 1
+            ),
+            "response_spatial_chunk_size": (
+                response_spatial_chunk_size if use_batched_response else None
+            ),
             "source": dict(source.metadata()),
         },
         timing=TimingBreakdown(

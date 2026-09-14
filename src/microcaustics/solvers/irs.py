@@ -1,4 +1,4 @@
-"""Source-independent uniform-grid inverse ray shooting."""
+"""Source-independent Cartesian and random inverse ray shooting."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import torch
 from ..compile import run_tensor_kernel
 from ..config import IRSConfig
 from ..geometry import PlaneGrid, PlaneRegion
+from ..random import derive_seed
 from ..results import MagnificationMap, TimingBreakdown
 from .direct import raytrace_direct
 
@@ -25,6 +26,26 @@ def _regular_ray_shape(rays: int, region: PlaneRegion) -> tuple[int, int]:
     nx = max(1, int(round(math.sqrt(int(rays) * fov_x / fov_y))))
     ny = max(1, int(round(int(rays) / nx)))
     return ny, nx
+
+
+def _counter_uniform(
+    indices: torch.Tensor,
+    seed: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Map integer ray indices to reproducible uniform variates in ``(0, 1)``.
+
+    The 32-bit integer finalizer is stateless. Therefore its output is
+    independent of spatial chunking, temporal scheduling, and backend RNG
+    implementations. Integer operations are identical on CPU and CUDA.
+    """
+
+    mask = 0xFFFFFFFF
+    values = (indices.to(torch.int64) + (int(seed) & mask)) & mask
+    values = ((values ^ (values >> 16)) * 0x7FEB352D) & mask
+    values = ((values ^ (values >> 15)) * 0x846CA68B) & mask
+    values = values ^ (values >> 16)
+    return (values.to(dtype) + 0.5) * (1.0 / 2**32)
 
 
 def _deposit_regular_rays(
@@ -60,7 +81,7 @@ def _deposit_regular_rays(
 
 
 @torch.no_grad()
-def uniform_grid_irs(
+def inverse_ray_shooting(
     simulation: MicrolensingSimulation,
     lens_region: PlaneRegion,
     source_grid: PlaneGrid,
@@ -68,13 +89,15 @@ def uniform_grid_irs(
     *,
     time_days: float = 0.0,
 ) -> MagnificationMap:
-    """Generate an absolute magnification map with regular inverse rays.
+    """Generate an absolute magnification map by inverse ray shooting.
 
-    Rays uniformly sample ``lens_region`` and are deposited into the half-open
-    pixels of ``source_grid``. Each ray carries its lens-plane area, so the
-    returned values are absolute magnifications rather than count maps or
-    maps normalized to their own mean. Rays mapped outside the requested
-    source field are correctly omitted.
+    Rays sample ``lens_region`` on a Cartesian lattice or with reproducible
+    pseudorandom uniform coordinates, as selected by ``config.sampling``.
+    They are deposited into the half-open pixels of ``source_grid``. Each ray
+    carries its lens-plane area, so the returned values are absolute
+    magnifications rather than count maps or maps normalized to their own
+    mean. Rays mapped outside the requested source field are correctly
+    omitted.
 
     This first extracted IRS implementation uses the exact point-mass lens
     equation. Far-field acceleration is enabled only after its package version
@@ -97,12 +120,22 @@ def uniform_grid_irs(
             time_days=time_days,
             star_chunk_size=config.star_chunk_size,
         )
-    ray_ny, ray_nx = _regular_ray_shape(config.rays, lens_region)
-    actual_rays = ray_ny * ray_nx
+    if config.sampling == "cartesian":
+        ray_ny, ray_nx = _regular_ray_shape(config.rays, lens_region)
+        actual_rays = ray_ny * ray_nx
+        random_x_seed = random_y_seed = None
+    else:
+        ray_ny = ray_nx = None
+        actual_rays = int(config.rays)
+        random_x_seed = derive_seed(config.seed, "irs-ray-x")
+        random_y_seed = derive_seed(config.seed, "irs-ray-y")
     lens_y_size, lens_x_size = lens_region.field_of_view_uas
     lens_xmin, _, lens_ymin, _ = lens_region.bounds_uas
-    lens_dx = lens_x_size / ray_nx
-    lens_dy = lens_y_size / ray_ny
+    if config.sampling == "cartesian":
+        lens_dx = lens_x_size / ray_nx
+        lens_dy = lens_y_size / ray_ny
+    else:
+        lens_dx = lens_dy = None
     source_ny, source_nx = source_grid.shape
     source_dy, source_dx = source_grid.pixel_scale_uas
     source_xmin, source_xmax, source_ymin, source_ymax = source_grid.bounds_uas
@@ -129,11 +162,20 @@ def uniform_grid_irs(
     deposition_calls = 0
     for start in range(0, actual_rays, ray_chunk):
         stop = min(actual_rays, start + ray_chunk)
-        linear = torch.arange(start, stop, device=runtime.device)
-        row = torch.div(linear, ray_nx, rounding_mode="floor")
-        column = linear - row * ray_nx
-        lens_x = lens_xmin + (column.to(runtime.dtype) + 0.5) * lens_dx
-        lens_y = lens_ymin + (row.to(runtime.dtype) + 0.5) * lens_dy
+        if config.sampling == "cartesian":
+            linear = torch.arange(start, stop, device=runtime.device)
+            row = torch.div(linear, ray_nx, rounding_mode="floor")
+            column = linear - row * ray_nx
+            lens_x = lens_xmin + (column.to(runtime.dtype) + 0.5) * lens_dx
+            lens_y = lens_ymin + (row.to(runtime.dtype) + 0.5) * lens_dy
+        else:
+            indices = torch.arange(start, stop, device=runtime.device)
+            lens_x = lens_xmin + lens_x_size * _counter_uniform(
+                indices, int(random_x_seed), runtime.dtype
+            )
+            lens_y = lens_ymin + lens_y_size * _counter_uniform(
+                indices, int(random_y_seed), runtime.dtype
+            )
         if far_field is None:
             source_x, source_y, raytrace_diagnostics = raytrace_direct(
                 simulation,
@@ -217,11 +259,22 @@ def uniform_grid_irs(
         magnification,
         source_grid,
         time_days=float(time_days),
-        method="uniform_grid_irs_direct",
+        method=f"{config.sampling}_irs_direct",
         metadata={
+            "sampling": config.sampling,
+            "seed": int(config.seed) if config.sampling == "random" else None,
+            "coordinate_seeds": (
+                {"x": int(random_x_seed), "y": int(random_y_seed)}
+                if config.sampling == "random"
+                else None
+            ),
             "requested_rays": int(config.rays),
             "actual_rays": actual_rays,
-            "ray_grid_shape": [ray_ny, ray_nx],
+            "ray_grid_shape": (
+                [ray_ny, ray_nx]
+                if config.sampling == "cartesian"
+                else None
+            ),
             "lens_region": {
                 "field_of_view_uas": list(lens_region.field_of_view_uas),
                 "center_uas": list(lens_region.center_uas),

@@ -712,7 +712,7 @@ def _source_at_driver_mean(source):
     mean = signal.metadata().get("mean_amplitude", 1.0)
     if isinstance(source, ThermalReprocessingSource):
         return replace(source, signal=_ConstantDrivingSignal(mean), is_time_static=True)
-    if isinstance(source, (ModulatedSource, DelayedModulatedSource)):
+    if isinstance(source, ModulatedSource | DelayedModulatedSource):
         return replace(
             source,
             signal=_ConstantDrivingSignal(mean),

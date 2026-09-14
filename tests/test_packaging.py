@@ -67,7 +67,8 @@ class PackagingContractTests(unittest.TestCase):
         self.assertEqual(metadata["version"], "1.0.0")
         self.assertEqual(microcaustics.__version__, metadata["version"])
         self.assertIn(f"version: {metadata['version']}", citation)
-        self.assertEqual(metadata["license"], {"file": "LICENSE"})
+        self.assertEqual(metadata["license"], "MIT")
+        self.assertEqual(metadata["license-files"], ["LICENSE"])
         self.assertIn("MIT License", license_text)
 
     def test_doctor_cli_returns_machine_readable_runtime_information(self) -> None:

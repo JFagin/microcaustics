@@ -26,6 +26,7 @@ magnification = system.magnification_map(
     map_pixels=128,
     method=mc.IRSConfig(
         rays=1_000_000,
+        sampling="cartesian",  # use "random" with a seed for Monte Carlo IRS
         far_field_approx=mc.FarFieldApproxConfig(enabled=False),
     ),
 )

@@ -11,7 +11,11 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from ..runtime import RuntimeCapabilities, _torch_compile_supported
+from ..runtime import (
+    RuntimeCapabilities,
+    _torch_compile_supported,
+    warn_compilation,
+)
 from .coordinates import _polar_integrals
 from .geodesics import (
     incoming_radial_mino_time,
@@ -318,6 +322,7 @@ def trace_axis_lamppost(
     compile_solver: bool = False,
     compile_mode: str = "reduce-overhead",
     fallback_to_eager: bool = True,
+    warn_on_compile: bool = True,
 ) -> AxisLamppostRayTransfer:
     """Trace isotropic rays from a static axial source to the first disk hit."""
 
@@ -407,6 +412,13 @@ def trace_axis_lamppost(
                 candidate = _COMPILED_LAMPPOST.get(key)
             cache_hit = candidate is not None
             if candidate is None:
+                warn_compilation(
+                    "axis-lamppost ray tracing",
+                    backend="torch.compile",
+                    device=device,
+                    dtype=dtype,
+                    enabled=warn_on_compile,
+                )
                 candidate = torch.compile(
                     _trace_chunk,
                     mode=effective_compile_mode,
@@ -585,6 +597,7 @@ def axis_lamppost_profile(
     compile_solver: bool = False,
     compile_mode: str = "reduce-overhead",
     fallback_to_eager: bool = True,
+    warn_on_compile: bool = True,
 ) -> AxisLamppostProfile:
     """Build a conservative, no-splat annular GR lamppost profile.
 
@@ -622,6 +635,7 @@ def axis_lamppost_profile(
         compile_solver=compile_solver,
         compile_mode=compile_mode,
         fallback_to_eager=fallback_to_eager,
+        warn_on_compile=warn_on_compile,
     )
     edges = torch.linspace(
         rays.disk_inner_rg,

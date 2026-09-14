@@ -217,7 +217,7 @@ def _resolve_per_band(
                 f"{name} mapping must match bands. Missing={missing}, extra={extra}"
             )
         return tuple(value[band] for band in band_names)
-    if isinstance(value, (tuple, list)):
+    if isinstance(value, tuple | list):
         if len(value) != len(band_names):
             raise ValueError(f"{name} sequence must contain one item per band")
         return tuple(value)
@@ -249,7 +249,7 @@ def _resolve_psfs(
         and tensor.shape[0] == len(band_names)
     ):
         return tuple(tensor[index] for index in range(len(band_names)))
-    if isinstance(psf, (tuple, list)) and len(psf) == len(band_names):
+    if isinstance(psf, tuple | list) and len(psf) == len(band_names):
         return tuple(psf)
     raise ValueError("psf must be 2D, [band,y,x], or a band mapping")
 
@@ -502,6 +502,3 @@ class CausticsMacroImageRenderer:
                 "observation": dict(observation_metadata),
             },
         )
-
-
-MacroImageRenderer = CausticsMacroImageRenderer

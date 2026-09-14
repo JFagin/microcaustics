@@ -248,6 +248,20 @@ def _sparse_determinant_layout(
     active_columns = active_flat - active_rows * output_nx
     active_indices = torch.stack((active_rows, active_columns), dim=1)
 
+    return active_indices, _vertices_for_active_cells(lens_grid, active_indices)
+
+
+def _vertices_for_active_cells(
+    lens_grid: PlaneGrid,
+    active_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Return the unique determinant vertices needed by active grid cells."""
+
+    nx = int(lens_grid.shape[1])
+    if active_indices.numel() == 0:
+        return torch.empty((0, 2), device=active_indices.device, dtype=torch.int64)
+    active_rows = active_indices[:, 0]
+    active_columns = active_indices[:, 1]
     vertex_flat = torch.cat(
         (
             active_rows * nx + active_columns,
@@ -259,7 +273,152 @@ def _sparse_determinant_layout(
     vertex_flat = torch.unique(vertex_flat, sorted=True)
     vertex_rows = torch.div(vertex_flat, nx, rounding_mode="floor")
     vertex_columns = vertex_flat - vertex_rows * nx
-    return active_indices, torch.stack((vertex_rows, vertex_columns), dim=1)
+    return torch.stack((vertex_rows, vertex_columns), dim=1)
+
+
+def _sparse_marching_geometry(
+    lens_grid: PlaneGrid,
+    active_indices: torch.Tensor,
+    vertex_indices: torch.Tensor,
+    dtype: torch.dtype,
+):
+    """Build reusable corner and boundary indices for one sparse cell layout."""
+
+    ny, nx = lens_grid.shape
+    row, column = active_indices.unbind(dim=1)
+    vertex_flat = vertex_indices[:, 0] * nx + vertex_indices[:, 1]
+    corner_flat = torch.stack(
+        (
+            row * nx + column,
+            row * nx + column + 1,
+            (row + 1) * nx + column + 1,
+            (row + 1) * nx + column,
+        )
+    )
+    corner_positions = torch.searchsorted(vertex_flat, corner_flat)
+    dy, dx = lens_grid.pixel_scale_uas
+    xmin, _, ymin, _ = lens_grid.bounds_uas
+    x0 = xmin + (column.to(dtype) + 0.5) * dx
+    x1 = x0 + dx
+    y0 = ymin + (row.to(dtype) + 0.5) * dy
+    y1 = y0 + dy
+    active_flat = row * (nx - 1) + column
+
+    def neighbor_active(neighbor_row, neighbor_column, valid):
+        neighbor_flat = neighbor_row * (nx - 1) + neighbor_column
+        locations = torch.searchsorted(active_flat, neighbor_flat)
+        safe = locations.clamp_max(max(int(active_flat.numel()) - 1, 0))
+        return (
+            valid
+            & (locations < active_flat.numel())
+            & (active_flat[safe] == neighbor_flat)
+        )
+
+    boundary = torch.stack(
+        (
+            ~neighbor_active(row - 1, column, row > 0),
+            ~neighbor_active(row, column + 1, column < nx - 2),
+            ~neighbor_active(row + 1, column, row < ny - 2),
+            ~neighbor_active(row, column - 1, column > 0),
+        )
+    )
+    return corner_positions, x0, x1, y0, y1, boundary
+
+
+def _critical_discovery_mask(
+    simulation: MicrolensingSimulation,
+    lens_grid: PlaneGrid,
+    times: tuple[float, ...],
+    far_fields: tuple,
+    batched: BatchedTaylorFarFieldApproximation | None,
+    config: CausticConfig,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Find high-resolution detA cells worth evaluating from a coarse grid.
+
+    A temporal batch uses the union of its per-epoch discovery masks. This is
+    conservative across the batch and allows every epoch to share one compact
+    sparse determinant layout.
+    """
+
+    runtime = simulation.runtime
+    ny, nx = lens_grid.shape
+    ratio = int(config.discovery_downsample_ratio)
+    coarse_ny = max(2, int(round(ny / ratio)))
+    coarse_nx = max(2, int(round(nx / ratio)))
+    dy, dx = lens_grid.pixel_scale_uas
+    xmin, xmax, ymin, ymax = lens_grid.bounds_uas
+    x_axis = torch.linspace(
+        xmin + 0.5 * dx,
+        xmax - 0.5 * dx,
+        coarse_nx,
+        device=runtime.device,
+        dtype=runtime.dtype,
+    )
+    y_axis = torch.linspace(
+        ymin + 0.5 * dy,
+        ymax - 0.5 * dy,
+        coarse_ny,
+        device=runtime.device,
+        dtype=runtime.dtype,
+    )
+    y, x = torch.meshgrid(y_axis, x_axis, indexing="ij")
+    flat_x = x.reshape(-1)
+    flat_y = y.reshape(-1)
+    if batched is not None:
+        determinant = batched.jacobian_determinant(flat_x, flat_y)
+    else:
+        values = []
+        for time_days, far_field in zip(times, far_fields, strict=True):
+            if far_field is None:
+                value, _ = jacobian_determinant_direct(
+                    simulation,
+                    flat_x,
+                    flat_y,
+                    time_days=time_days,
+                )
+            else:
+                value = far_field.jacobian_determinant(flat_x, flat_y)
+            values.append(value)
+        determinant = torch.stack(values)
+    determinant = determinant.reshape(len(times), coarse_ny, coarse_nx)
+    corners = (
+        determinant[:, :-1, :-1],
+        determinant[:, :-1, 1:],
+        determinant[:, 1:, 1:],
+        determinant[:, 1:, :-1],
+    )
+    cell_min = torch.stack(corners, dim=-1).amin(dim=-1)
+    cell_max = torch.stack(corners, dim=-1).amax(dim=-1)
+    candidate = (cell_min <= 0.0) & (cell_max >= 0.0)
+    quantile = float(config.discovery_near_zero_quantile)
+    if quantile > 0.0:
+        minimum_absolute = torch.stack(
+            tuple(value.abs() for value in corners), dim=-1
+        ).amin(dim=-1)
+        for frame in range(len(times)):
+            finite = minimum_absolute[frame][torch.isfinite(minimum_absolute[frame])]
+            if finite.numel():
+                candidate[frame] |= minimum_absolute[frame] <= torch.quantile(
+                    finite, quantile
+                )
+    union = candidate.any(dim=0)
+    for _ in range(int(config.discovery_dilation_cells)):
+        union = functional.max_pool2d(
+            union[None, None].to(torch.float32), 3, stride=1, padding=1
+        )[0, 0].to(torch.bool)
+    fine = functional.interpolate(
+        union[None, None].to(torch.float32),
+        size=(ny - 1, nx - 1),
+        mode="nearest",
+    )[0, 0].to(torch.bool)
+    return fine, {
+        "critical_discovery_downsample_ratio": ratio,
+        "critical_discovery_grid_shape": [coarse_ny, coarse_nx],
+        "critical_discovery_candidate_fraction": float(
+            union.to(torch.float32).mean().detach().cpu()
+        ),
+        "critical_discovery_temporal_union": len(times) > 1,
+    }
 
 
 def _sparse_marching_segments(
@@ -610,6 +769,7 @@ def caustic_fields_from_far_fields(
     *,
     far_fields=None,
     selected_cell_indices: torch.Tensor | None = None,
+    selected_cell_indices_by_frame=None,
     selected_cell_shape: tuple[int, int] | None = None,
     source_region: PlaneRegion | None = None,
 ) -> tuple[CausticField, ...]:
@@ -645,41 +805,131 @@ def caustic_fields_from_far_fields(
         raise ValueError("far_fields must match the caustic time batch")
     batched = (
         BatchedTaylorFarFieldApproximation(far_fields)
-        if len(times) > 1 and all(item is not None for item in far_fields)
+        if (len(times) > 1 or selected_cell_indices_by_frame is not None)
+        and all(item is not None for item in far_fields)
         else None
     )
     runtime.synchronize()
     built = perf_counter()
     ny, nx = lens_grid.shape
-    sparse = selected_cell_indices is not None
+    sparse_ragged = selected_cell_indices_by_frame is not None
+    sparse = selected_cell_indices is not None or sparse_ragged
     active_indices = None
     vertex_indices = None
+    discovery_metadata: dict[str, object] = {}
     if sparse:
+        # Convert the source scout's active IPM cells to the unique determinant
+        # vertices needed by marching squares, then add an independent coarse
+        # discovery mask so distant critical structure cannot be missed.
         if selected_cell_shape is None:
             raise ValueError("selected_cell_shape is required with selected cells")
-        active_indices, vertex_indices = _sparse_determinant_layout(
-            lens_grid,
-            torch.as_tensor(
-                selected_cell_indices,
+        selections = (
+            tuple(selected_cell_indices_by_frame)
+            if sparse_ragged
+            else (selected_cell_indices,)
+        )
+        if sparse_ragged and len(selections) != len(times):
+            raise ValueError("per-frame selected cells must match the time batch")
+        layout_cache = {}
+        layouts = []
+        for selection in selections:
+            selection = torch.as_tensor(
+                selection,
                 device=runtime.device,
                 dtype=torch.int64,
-            ),
-            selected_cell_shape,
+            )
+            key = (int(selection.data_ptr()), int(selection.numel()))
+            layout = layout_cache.get(key)
+            if layout is None:
+                layout = _sparse_determinant_layout(
+                    lens_grid,
+                    selection,
+                    selected_cell_shape,
+                )
+                layout_cache[key] = layout
+            layouts.append(layout)
+        active_rows, vertex_rows = zip(*layouts, strict=True)
+        source_active_before = tuple(int(row.shape[0]) for row in active_rows)
+        if sparse_ragged:
+            # The per-frame source scouts are already conservative endpoint
+            # unions.  This is the validated paper path: every selected cell
+            # is marched directly, avoiding a second all-frame coarse detA
+            # discovery pass that duplicates most of the Jacobian work.
+            discovery_metadata = {"critical_discovery": "source_scout"}
+        else:
+            discovery_mask, discovery_metadata = _critical_discovery_mask(
+                simulation,
+                lens_grid,
+                times,
+                far_fields,
+                batched,
+                config,
+            )
+            filtered_layouts = []
+            for row in active_rows:
+                if row.numel():
+                    keep = discovery_mask[row[:, 0], row[:, 1]]
+                    row = row[keep]
+                filtered_layouts.append(
+                    (row, _vertices_for_active_cells(lens_grid, row))
+                )
+            active_rows, vertex_rows = zip(*filtered_layouts, strict=True)
+        if sparse_ragged:
+            active_indices = active_rows
+            vertex_indices = vertex_rows
+        else:
+            active_indices = active_rows[0]
+            vertex_indices = vertex_rows[0]
+        discovery_metadata.update(
+            {
+                "critical_discovery_source_active_before": (
+                    list(source_active_before)
+                    if sparse_ragged
+                    else source_active_before[0]
+                ),
+                "critical_discovery_source_active_after": (
+                    [int(row.shape[0]) for row in active_rows]
+                    if sparse_ragged
+                    else int(active_indices.shape[0])
+                ),
+            }
         )
-        point_count = int(vertex_indices.shape[0])
+        point_count = (
+            sum(int(row.shape[0]) for row in vertex_rows)
+            if sparse_ragged
+            else int(vertex_indices.shape[0])
+        )
     else:
         point_count = ny * nx
-    determinant = torch.empty(
-        (len(times), point_count),
-        device=runtime.device,
-        dtype=runtime.dtype,
+    determinant = (
+        None
+        if sparse_ragged
+        else torch.empty(
+            (len(times), point_count),
+            device=runtime.device,
+            dtype=runtime.dtype,
+        )
     )
     dy, dx = lens_grid.pixel_scale_uas
     xmin, _, ymin, _ = lens_grid.bounds_uas
     chunk_size = int(config.jacobian_chunk_size)
+    if sparse_ragged:
+        vertex_lengths = tuple(int(row.shape[0]) for row in vertex_indices)
+        flat_vertices = torch.cat(vertex_indices)
+        flat_frames = torch.repeat_interleave(
+            torch.arange(len(times), device=runtime.device, dtype=torch.int32),
+            torch.tensor(vertex_lengths, device=runtime.device, dtype=torch.int64),
+            output_size=point_count,
+        )
+        flat_determinant = torch.empty(
+            point_count, device=runtime.device, dtype=runtime.dtype
+        )
     for start in range(0, point_count, chunk_size):
         stop = min(point_count, start + chunk_size)
-        if sparse:
+        if sparse_ragged:
+            row = flat_vertices[start:stop, 0]
+            column = flat_vertices[start:stop, 1]
+        elif sparse:
             row = vertex_indices[start:stop, 0]
             column = vertex_indices[start:stop, 1]
         else:
@@ -688,7 +938,13 @@ def caustic_fields_from_far_fields(
             column = linear - row * nx
         x = xmin + (column.to(runtime.dtype) + 0.5) * dx
         y = ymin + (row.to(runtime.dtype) + 0.5) * dy
-        if batched is not None:
+        if sparse_ragged and batched is not None:
+            flat_determinant[start:stop] = batched.jacobian_determinant_indexed_flat(
+                x,
+                y,
+                flat_frames[start:stop],
+            )
+        elif batched is not None:
             determinant[:, start:stop] = batched.jacobian_determinant(x, y)
         else:
             values = []
@@ -704,21 +960,71 @@ def caustic_fields_from_far_fields(
                 else:
                     values.append(far_field.jacobian_determinant(x, y))
             determinant[:, start:stop] = torch.stack(values)
-    if not sparse:
+    if sparse_ragged:
+        determinant = tuple(flat_determinant.split(vertex_lengths))
+    elif not sparse:
         determinant = determinant.reshape(len(times), ny, nx)
     runtime.synchronize()
     evaluated = perf_counter()
     sparse_marching_started = perf_counter()
-    sparse_marching_batch = (
-        _batched_sparse_marching_segments(
-            determinant,
-            active_indices,
-            vertex_indices,
-            lens_grid,
+    if sparse_ragged:
+        marching_inputs = []
+        marching_geometry_cache = {}
+        for det_row, active_row, vertex_row in zip(
+            determinant, active_indices, vertex_indices, strict=True
+        ):
+            key = (int(active_row.data_ptr()), int(active_row.shape[0]))
+            geometry = marching_geometry_cache.get(key)
+            if geometry is None:
+                geometry = _sparse_marching_geometry(
+                    lens_grid,
+                    active_row,
+                    vertex_row,
+                    runtime.dtype,
+                )
+                marching_geometry_cache[key] = geometry
+            corner_positions, x0, x1, y0, y1, boundary = geometry
+            values = tuple(det_row[position] for position in corner_positions)
+            marching_inputs.append((*values, x0, x1, y0, y1, boundary))
+        if runtime.device.type == "cuda" and runtime.dtype == torch.float32:
+            from .triton_caustics import ragged_sparse_marching_squares_zero_triton
+
+            cell_lengths = tuple(int(row.shape[0]) for row in active_indices)
+            cell_frames = torch.repeat_interleave(
+                torch.arange(len(times), device=runtime.device, dtype=torch.int32),
+                torch.tensor(cell_lengths, device=runtime.device, dtype=torch.int64),
+                output_size=sum(cell_lengths),
+            )
+            columns = tuple(torch.cat([row[index] for row in marching_inputs]) for index in range(8))
+            boundaries = torch.cat([row[8] for row in marching_inputs], dim=1)
+            sparse_marching_batch = ragged_sparse_marching_squares_zero_triton(
+                *columns,
+                boundaries,
+                cell_frames,
+                len(times),
+            )
+        else:
+            rows = tuple(
+                _sparse_marching_segments(det_row, active_row, vertex_row, lens_grid)
+                for det_row, active_row, vertex_row in zip(
+                    determinant, active_indices, vertex_indices, strict=True
+                )
+            )
+            sparse_marching_batch = (
+                tuple(row[0] for row in rows),
+                tuple(row[1] for row in rows),
+            )
+    else:
+        sparse_marching_batch = (
+            _batched_sparse_marching_segments(
+                determinant,
+                active_indices,
+                vertex_indices,
+                lens_grid,
+            )
+            if sparse and len(times) > 1
+            else None
         )
-        if sparse and len(times) > 1
-        else None
-    )
     runtime.synchronize()
     sparse_batch_marching_seconds = (
         perf_counter() - sparse_marching_started
@@ -740,6 +1046,8 @@ def caustic_fields_from_far_fields(
         )
 
         if triton_caustics_available():
+            # Dense CUDA batches can clean and march every frame together;
+            # portable and single-frame paths retain the exact scalar fallback.
             phase_started = perf_counter()
             if config.minimum_determinant_sign_pixels > 0:
                 for frame in range(len(times)):
@@ -876,12 +1184,18 @@ def caustic_fields_from_far_fields(
     for frame, (time_days, far_field) in enumerate(zip(times, far_fields, strict=True)):
         phase = perf_counter()
         sparse_boundary = None
+        frame_active_indices = (
+            active_indices[frame] if sparse_ragged else active_indices
+        )
+        frame_vertex_indices = (
+            vertex_indices[frame] if sparse_ragged else vertex_indices
+        )
         if sparse:
             if sparse_marching_batch is None:
                 critical, sparse_boundary, rasterizer = _sparse_marching_segments(
                     determinant[frame],
-                    active_indices,
-                    vertex_indices,
+                    frame_active_indices,
+                    frame_vertex_indices,
                     lens_grid,
                 )
             else:
@@ -973,14 +1287,16 @@ def caustic_fields_from_far_fields(
                     "determinant_grid_fraction": float(
                         1.0
                         if not sparse
-                        else int(active_indices.shape[0]) / max((ny - 1) * (nx - 1), 1)
+                        else int(frame_active_indices.shape[0])
+                        / max((ny - 1) * (nx - 1), 1)
                     ),
                     "sparse_active_cells": (
-                        None if not sparse else int(active_indices.shape[0])
+                        None if not sparse else int(frame_active_indices.shape[0])
                     ),
                     "sparse_unique_vertices": (
-                        None if not sparse else int(vertex_indices.shape[0])
+                        None if not sparse else int(frame_vertex_indices.shape[0])
                     ),
+                    **discovery_metadata,
                     "source_region_filtered": bool(source_region is not None),
                     "marching_squares": rasterizer,
                     "determinant_cleanup": (
@@ -1230,6 +1546,7 @@ def dynamic_labeled_maps(
         far_fields,
         selected_cell_indices=None,
         selected_cell_shape=None,
+        selected_cell_indices_by_frame=None,
     ) -> None:
         nonlocal previous_gauges
         nonlocal previous_distances
@@ -1242,6 +1559,7 @@ def dynamic_labeled_maps(
             config,
             far_fields=far_fields,
             selected_cell_indices=selected_cell_indices,
+            selected_cell_indices_by_frame=selected_cell_indices_by_frame,
             selected_cell_shape=selected_cell_shape,
             source_region=source_grid.region,
         )

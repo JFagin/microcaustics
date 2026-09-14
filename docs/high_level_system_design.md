@@ -279,9 +279,11 @@ configuration constructors remain public.
 
 ## Batching and multi-image systems
 
-Independent batching accepts resolved realizations. Compatible requests are
-grouped by shape and backend while retaining independent stars, far-field
-states, sources, and metadata.
+Independent batching accepts resolved realizations. Compatible production
+Triton requests use ownership-tagged ragged GPU queues across systems while
+retaining independent stars, scout cells, far-field states, sources, and
+metadata. Mixed multi-image inputs are partitioned by compatible macroimage
+contract and reconstructed in their original order.
 
 Multi-image systems contain one resolved realization per macro image. Each image
 has an independent stellar population, integration region, trajectory, and

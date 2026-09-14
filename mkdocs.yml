@@ -50,6 +50,7 @@ nav:
       - Source models: sources.md
       - Relativistic sources: relativistic_sources.md
       - Multi-image systems: multi_image.md
+      - Rubin observations: observations.md
       - Macro-image rendering: macro_image_rendering.md
       - Plotting: plotting.md
   - Development:

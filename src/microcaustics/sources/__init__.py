@@ -21,7 +21,9 @@ from .supernova import (
     paper_type_ia_supernova_source,
 )
 from .thin_disk import (
+    RadiativeEfficiency,
     ThinDiskSource,
+    ViscousFluxProfile,
     thin_disk_flux_radius_rg,
     thin_disk_temperature4,
 )
@@ -55,6 +57,7 @@ __all__ = [
     "PhotosphereEvolution",
     "PhysicalSourceModel",
     "PowerLawExponentialPhotosphere",
+    "RadiativeEfficiency",
     "SourceGeometry",
     "SourceGridConfig",
     "StaticSource",
@@ -69,6 +72,7 @@ __all__ = [
     "ThinDiskSource",
     "ThinDiskModel",
     "TransferredThinDiskSource",
+    "ViscousFluxProfile",
     "thin_disk_flux_radius_rg",
     "thin_disk_temperature4",
 ]

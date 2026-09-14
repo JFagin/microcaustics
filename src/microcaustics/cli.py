@@ -22,6 +22,7 @@ def _doctor() -> int:
         "dtype": str(resolved.dtype).replace("torch.", ""),
         "memory_fraction": resolved.memory_fraction,
         "torch_compile_mode": resolved.torch_compile_mode,
+        "warn_on_compile": resolved.warn_on_compile,
         "memory_budget_gib": (
             None
             if resolved.available_memory_bytes is None

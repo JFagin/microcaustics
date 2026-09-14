@@ -18,6 +18,42 @@ from .config import Backend, ProfilingLevel, RuntimeConfig
 _WARNED_BACKEND_FALLBACKS: set[tuple[str, type[BaseException], str]] = set()
 _WINDOWS_TOOLCHAIN_LOCK = threading.Lock()
 _WINDOWS_TOOLCHAIN_PROBED = False
+_COMPILATION_WARNING_LOCK = threading.Lock()
+_COMPILATION_WARNING_EVENT = 0
+
+
+class CompilationWarning(UserWarning):
+    """A package-managed compiled kernel is being prepared for first use."""
+
+
+def warn_compilation(
+    component: str,
+    *,
+    backend: str,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    enabled: bool,
+) -> None:
+    """Report a potentially slow first call or new compiled specialization."""
+
+    if not enabled:
+        return
+    global _COMPILATION_WARNING_EVENT
+    # Compilation may begin on several per-curve worker threads. Serialize the
+    # counter so each warning has a unique, monotonically increasing event ID.
+    with _COMPILATION_WARNING_LOCK:
+        _COMPILATION_WARNING_EVENT += 1
+        event = _COMPILATION_WARNING_EVENT
+    warnings.warn(
+        f"Compilation event {event}: preparing a new {backend} specialization "
+        f"for {component} on "
+        f"{device} ({dtype}). This first call may be slow while code is "
+        "compiled or loaded from the compiler cache. Another warning for "
+        "this component indicates a new specialization or cache miss. Set "
+        "warn_on_compile=False to suppress these messages.",
+        CompilationWarning,
+        stacklevel=3,
+    )
 
 
 def _prepend_environment_paths(name: str, paths: list[Path]) -> None:
@@ -60,8 +96,7 @@ def _activate_installed_windows_toolchain() -> bool:
         for root in program_roots:
             compiler_candidates.extend(
                 root.glob(
-                    "Microsoft Visual Studio/*/*/VC/Tools/MSVC/*/"
-                    "bin/Hostx64/x64/cl.exe"
+                    "Microsoft Visual Studio/*/*/VC/Tools/MSVC/*/bin/Hostx64/x64/cl.exe"
                 )
             )
         if not compiler_candidates:
@@ -159,7 +194,9 @@ class RuntimeCapabilities:
             platform=platform.platform(),
             torch_version=str(torch.__version__),
             cuda_available=cuda,
-            cuda_version=None if torch.version.cuda is None else str(torch.version.cuda),
+            cuda_version=None
+            if torch.version.cuda is None
+            else str(torch.version.cuda),
             mps_available=mps,
             torch_compile_available=callable(getattr(torch, "compile", None)),
             triton_importable=importlib.util.find_spec("triton") is not None,
@@ -178,6 +215,7 @@ class ResolvedRuntime:
     memory_fraction: float
     strict_backend: bool
     torch_compile_mode: str | None
+    warn_on_compile: bool
     profiling: ProfilingLevel
     capabilities: RuntimeCapabilities
     fallback_reason: str | None = None
@@ -268,7 +306,9 @@ def resolve_runtime(
     """
 
     config = RuntimeConfig() if config is None else config
-    capabilities = RuntimeCapabilities.detect() if capabilities is None else capabilities
+    capabilities = (
+        RuntimeCapabilities.detect() if capabilities is None else capabilities
+    )
     device = (
         _auto_device(capabilities)
         if str(config.device) == "auto"
@@ -304,12 +344,12 @@ def resolve_runtime(
         if supported:
             backend = requested
         elif config.strict_backend:
-            raise RuntimeError("Triton requires an importable Triton package and CUDA float32")
+            raise RuntimeError(
+                "Triton requires an importable Triton package and CUDA float32"
+            )
         else:
             backend = (
-                Backend.TORCH_COMPILE
-                if compile_supported
-                else Backend.TORCH_EAGER
+                Backend.TORCH_COMPILE if compile_supported else Backend.TORCH_EAGER
             )
             reason = "Triton is unavailable for the selected device or dtype"
     elif requested is Backend.TORCH_COMPILE:
@@ -336,6 +376,7 @@ def resolve_runtime(
         memory_fraction=float(config.memory_fraction),
         strict_backend=bool(config.strict_backend),
         torch_compile_mode=config.torch_compile_mode,
+        warn_on_compile=bool(config.warn_on_compile),
         profiling=config.profiling,
         capabilities=capabilities,
         fallback_reason=reason,

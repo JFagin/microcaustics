@@ -11,7 +11,6 @@ from ._common import (
     finish_axis,
     hide_image_axes,
     panel_colorbar,
-    paper_style,
     publication_style,
 )
 from .animations import animate_standardized_source_bands, save_fixed_palette_gif
@@ -42,8 +41,10 @@ from .paper_methods import (
     render_paper_sim5_validation,
 )
 from .sources import (
+    MeanSourceIsophotes,
     TemporalSourceStandardization,
     enclosed_flux_contour_levels,
+    mean_source_isophotes,
     plot_rendered_macro_image,
     plot_source_brightness,
     plot_standardized_source_bands,
@@ -80,6 +81,8 @@ __all__ = [
     "plot_transfer_function",
     "plot_far_field_method",
     "enclosed_flux_contour_levels",
+    "mean_source_isophotes",
+    "MeanSourceIsophotes",
     "standardize_source_over_time",
     "TemporalSourceStandardization",
     "transfer_response_density",
@@ -93,7 +96,6 @@ __all__ = [
     "add_scale_bar",
     "band_colors",
     "finish_axis",
-    "paper_style",
     "publication_style",
     "hide_image_axes",
     "panel_colorbar",

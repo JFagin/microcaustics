@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -12,6 +11,29 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ._system.coordinates import (
+    _rotate_point_mass_field,
+    _rotate_region_center,
+    _RotatedTrajectory,
+    _source_in_rotated_frame,
+    _stellar_motion_metadata,
+    _warn_incomplete_explicit_motion,
+)
+from ._system.geometry import (
+    _direct_star_region,
+    _lens_plane_region,
+    _source_grid_from_model,
+)
+from ._system.scheduling import (
+    _LABELED_CURVE_CALL_OPTIONS,
+    _LIGHT_CURVE_CALL_OPTIONS,
+    _evaluate_light_curve,
+    _light_curve_options,
+    _light_curve_times,
+    _production_dynamic_settings,
+    _retaining_map_observer,
+    _with_method_options,
+)
 from .config import (
     CausticConfig,
     DynamicConfig,
@@ -19,12 +41,10 @@ from .config import (
     IRSConfig,
     RuntimeConfig,
     _production_static_ipm_config,
-    production_dynamic_config,
     production_ipm_config,
 )
 from .geometry import PlaneGrid, PlaneRegion
 from .lens import (
-    IncompleteKinematicsWarning,
     LensingDistances,
     MacroLens,
     PointMassField,
@@ -64,602 +84,6 @@ class IntegrationDomain(str, Enum):
     SCOUT = "scout"
     FULL = "full"
     RECTANGLE = "rectangle"
-
-
-def _warn_incomplete_explicit_motion(stars: PointMassField) -> None:
-    """Warn when explicit dynamic velocities omit bulk or differential motion."""
-
-    if len(stars) == 0:
-        return
-    if not stars.has_motion:
-        warnings.warn(
-            "Dynamic point-mass field contains no velocities. Stellar "
-            "dispersion and bulk motion are omitted. Supply explicit "
-            "observer-frame velocity arrays, or use a StellarPopulation with "
-            "SkyProjectedKinematics.",
-            IncompleteKinematicsWarning,
-            stacklevel=4,
-        )
-        return
-    assert stars.velocity_x_uas_per_day is not None
-    assert stars.velocity_y_uas_per_day is not None
-    velocity = torch.stack(
-        (stars.velocity_x_uas_per_day, stars.velocity_y_uas_per_day),
-        dim=1,
-    )
-    mean = velocity.mean(dim=0)
-    centered = velocity - mean
-    floating = torch.finfo(velocity.dtype)
-    scale = max(float(velocity.abs().max()), floating.tiny)
-    tolerance = 32.0 * floating.eps * scale
-    missing = []
-    if float(mean.abs().max()) <= tolerance:
-        missing.append("bulk motion")
-    if len(stars) < 2 or float(centered.abs().max()) <= tolerance:
-        missing.append("stellar velocity dispersion")
-    if missing:
-        warnings.warn(
-            "Dynamic explicit point-mass velocities omit "
-            + " and ".join(missing)
-            + ". Explicit arrays are interpreted as final observer-frame "
-            "velocities. Include projected CMB, lens, and source motion in "
-            "their common drift, plus independent stellar motion, or use a "
-            "StellarPopulation with SkyProjectedKinematics.",
-            IncompleteKinematicsWarning,
-            stacklevel=4,
-        )
-
-
-def _stellar_motion_metadata(stars: PointMassField) -> dict[str, object]:
-    """Summarize the realized observer-frame point-lens velocities."""
-
-    if not stars.has_motion or len(stars) == 0:
-        return {
-            "has_motion": False,
-            "coordinate_basis": "realization x/y",
-        }
-    assert stars.velocity_x_uas_per_day is not None
-    assert stars.velocity_y_uas_per_day is not None
-    velocity = torch.stack(
-        (stars.velocity_x_uas_per_day, stars.velocity_y_uas_per_day),
-        dim=1,
-    )
-    mean = velocity.mean(dim=0)
-    centered = velocity - mean
-    component_rms = torch.sqrt(torch.mean(centered.square(), dim=0))
-    return {
-        "has_motion": True,
-        "coordinate_basis": "realization x/y",
-        "mean_velocity_uas_per_day": [float(value) for value in mean],
-        "component_rms_uas_per_day": [
-            float(value) for value in component_rms
-        ],
-    }
-
-
-def _rotate_cartesian_components(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    angle_deg: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Express Cartesian components in axes rotated by ``angle_deg``.
-
-    This is a coordinate-basis change, not an interpolation or a rotation of
-    a materialized image.  A positive angle maps sky-frame components to the
-    local frame through an active rotation by the negative of that angle.
-    """
-
-    angle = torch.as_tensor(
-        math.radians(float(angle_deg)),
-        device=x.device,
-        dtype=x.dtype,
-    )
-    cosine = torch.cos(angle)
-    sine = torch.sin(angle)
-    return cosine * x + sine * y, -sine * x + cosine * y
-
-
-def _rotate_point_mass_field(
-    stars: PointMassField,
-    angle_deg: float,
-) -> PointMassField:
-    """Return the same physical point lenses in a rotated coordinate basis."""
-
-    x, y = _rotate_cartesian_components(stars.x_uas, stars.y_uas, angle_deg)
-    velocity_x = velocity_y = None
-    if stars.has_motion:
-        assert stars.velocity_x_uas_per_day is not None
-        assert stars.velocity_y_uas_per_day is not None
-        velocity_x, velocity_y = _rotate_cartesian_components(
-            stars.velocity_x_uas_per_day,
-            stars.velocity_y_uas_per_day,
-            angle_deg,
-        )
-    return PointMassField._from_einstein_radii(
-        x,
-        y,
-        stars.einstein_radius_uas,
-        mass_solar=stars.mass_solar,
-        velocity_x_uas_per_day=velocity_x,
-        velocity_y_uas_per_day=velocity_y,
-    )
-
-
-@dataclass(frozen=True)
-class _RotatedTrajectory:
-    """Internal coordinate-basis view of an arbitrary source trajectory."""
-
-    trajectory: SourceTrajectory
-    angle_deg: float
-
-    def position_uas(
-        self,
-        times_days,
-        *,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> torch.Tensor:
-        positions = self.trajectory.position_uas(
-            times_days,
-            device=device,
-            dtype=dtype,
-        )
-        x, y = _rotate_cartesian_components(
-            positions[..., 0], positions[..., 1], self.angle_deg
-        )
-        return torch.stack((x, y), dim=-1)
-
-
-def _source_in_rotated_frame(source, angle_deg: float):
-    """Return a physical source model expressed in a rotated basis.
-
-    Built-in physical models expose their sky position angle explicitly, so
-    changing coordinates only requires subtracting the basis angle before
-    pixelization.  Gaussian centers are transformed in the same operation.
-    Materialized pixel arrays are deliberately not accepted because rotating
-    those would introduce an interpolation into the scientific calculation.
-    """
-
-    updates: dict[str, object] = {}
-    if hasattr(source, "position_angle_deg"):
-        updates["position_angle_deg"] = float(source.position_angle_deg) - float(
-            angle_deg
-        )
-    elif hasattr(source, "position_angle_rad"):
-        updates["position_angle_rad"] = float(source.position_angle_rad) - math.radians(
-            float(angle_deg)
-        )
-    else:
-        raise TypeError(
-            "automatic shear-frame alignment requires a physical source model "
-            "with position_angle_deg or position_angle_rad"
-        )
-    for name in ("center_m", "center_uas"):
-        if getattr(source, name, None) is not None:
-            center = torch.as_tensor(getattr(source, name), dtype=torch.float64)
-            x, y = _rotate_cartesian_components(center[0], center[1], angle_deg)
-            updates[name] = (float(x), float(y))
-    return replace(source, **updates)
-
-
-def _rotate_region_center(region: PlaneRegion, angle_deg: float) -> PlaneRegion:
-    """Rotate a region center while preserving a circular aperture's size."""
-
-    center = torch.as_tensor(
-        (region.center_uas[1], region.center_uas[0]), dtype=torch.float64
-    )
-    x, y = _rotate_cartesian_components(center[0], center[1], angle_deg)
-    return PlaneRegion(region.field_of_view_uas, (float(y), float(x)))
-
-
-def _retaining_map_observer(
-    times_days: Sequence[float],
-    keep_maps_at_days: Sequence[float] | None,
-    map_observer,
-):
-    """Compose optional map retention with an existing streaming observer."""
-
-    retained: dict[float, MagnificationMap] = {}
-    if keep_maps_at_days is None:
-        return map_observer, retained
-    times = torch.as_tensor(times_days, dtype=torch.float64).reshape(-1)
-    requested = tuple(float(value) for value in keep_maps_at_days)
-    indices: dict[int, float] = {}
-    for requested_time in requested:
-        if not math.isfinite(requested_time):
-            raise ValueError("keep_maps_at_days must contain finite times in days")
-        differences = torch.abs(times - requested_time)
-        index = int(torch.argmin(differences))
-        tolerance = max(1.0e-6, 1.0e-8 * max(1.0, abs(requested_time)))
-        if float(differences[index]) > tolerance:
-            nearby = sorted(times[torch.argsort(differences)[:2]].tolist())
-            warnings.warn(
-                f"Requested map at day {requested_time:g} is not an evaluated map "
-                f"epoch. Nearby evaluated times are {nearby}. This retention "
-                "request will be omitted. Change keep_maps_at_days or the map "
-                "cadence to retain that epoch",
-                UserWarning,
-                stacklevel=3,
-            )
-            continue
-        indices[index] = float(times[index])
-
-    def observer(index, frame):
-        if map_observer is not None:
-            map_observer(index, frame)
-        if index in indices:
-            retained[indices[index]] = getattr(frame, "magnification_map", frame)
-
-    def reset():
-        retained.clear()
-        reset_callback = getattr(map_observer, "reset", None)
-        if callable(reset_callback):
-            reset_callback()
-
-    observer.reset = reset
-    return observer, retained
-
-
-def _cadence_times(
-    times_days,
-    *,
-    duration_days: float | None,
-    cadence_days: float | None,
-    start_day: float = 0.0,
-) -> torch.Tensor:
-    """Resolve an explicit time axis or an inclusive regular cadence."""
-
-    if times_days is not None:
-        if duration_days is not None or cadence_days is not None:
-            raise ValueError(
-                "supply times_days or duration_days/cadence_days, not both"
-            )
-        times = torch.as_tensor(times_days, dtype=torch.float64)
-        if times.ndim != 1:
-            raise ValueError("times_days must be a one-dimensional time axis")
-    else:
-        if duration_days is None or cadence_days is None:
-            raise ValueError("supply times_days or both duration_days and cadence_days")
-        duration = float(duration_days)
-        cadence = float(cadence_days)
-        if (
-            not all(
-                math.isfinite(value) for value in (duration, cadence, float(start_day))
-            )
-            or duration < 0.0
-            or cadence <= 0.0
-        ):
-            raise ValueError(
-                "duration_days must be non-negative and cadence_days positive"
-            )
-        count = int(math.floor(duration / cadence + 1.0e-10)) + 1
-        times = float(start_day) + torch.arange(count, dtype=torch.float64) * cadence
-        final = float(start_day) + duration
-        if float(times[-1]) < final - 1.0e-10:
-            times = torch.cat((times, torch.tensor((final,), dtype=torch.float64)))
-    if times.numel() < 1 or not bool(torch.all(torch.isfinite(times))):
-        raise ValueError("time axis must contain finite values")
-    if times.numel() > 1 and not bool(torch.all(times[1:] > times[:-1])):
-        raise ValueError("time axis must be strictly increasing")
-    return times
-
-
-def _with_method_options(kwargs: dict, *, dynamic: bool) -> dict:
-    """Resolve common plain solver keywords into an advanced configuration."""
-
-    resolved = dict(kwargs)
-    option_names = {
-        "rays",
-        "scout_ratio",
-        "refinement",
-        "virtual_refinement",
-        "scout_dilation_cells",
-        "far_field",
-    }
-    options = {
-        name: resolved.pop(name) for name in tuple(resolved) if name in option_names
-    }
-    method = resolved.get("method")
-    if isinstance(method, str):
-        name = method.lower().replace("-", "_")
-        rays = int(options.pop("rays", 10_000_000))
-        if name == "ipm":
-            method = (
-                production_ipm_config(rays=rays)
-                if dynamic
-                else _production_static_ipm_config(rays=rays)
-            )
-        elif name == "irs":
-            if options:
-                raise ValueError("scout/refinement options apply only to method='ipm'")
-            method = IRSConfig(rays=rays)
-        else:
-            raise ValueError("method must be 'ipm', 'irs', or a config object")
-        resolved["method"] = method
-    elif isinstance(method, IRSConfig):
-        rays = options.pop("rays", None)
-        if options:
-            raise ValueError("scout/refinement options apply only to IPM")
-        if rays is not None:
-            resolved["method"] = replace(method, rays=int(rays))
-        return resolved
-    if not options:
-        return resolved
-    method = resolved.get("method")
-    if method is None:
-        method = production_ipm_config() if dynamic else _production_static_ipm_config()
-    if not isinstance(method, IPMConfig):
-        raise ValueError("IPM numerical options require an IPM method")
-    far_field = options.pop("far_field", None)
-    if far_field is not None:
-        options["far_field_approx"] = replace(
-            method.far_field_approx,
-            enabled=bool(far_field),
-        )
-    resolved["method"] = replace(method, **options)
-    return resolved
-
-
-_LIGHT_CURVE_CALL_OPTIONS = frozenset(
-    {
-        "source",
-        "trajectory",
-        "strict_coverage",
-        "map_observer",
-        "keep_maps_at_days",
-    }
-)
-_LABELED_CURVE_CALL_OPTIONS = frozenset({"diagnostic_grid", "include_distance_map"})
-
-
-def _light_curve_options(
-    kwargs: dict, *, include_labels: bool, allowed_options=()
-) -> dict:
-    """Resolve the common call and warmup controls in one place.
-
-    Plain options override advanced configurations explicitly supplied in the
-    same call. Label batches inherit the temporal batch unless overridden.
-    """
-
-    options = dict(kwargs)
-    updates = {
-        name: options.pop(name)
-        for name in (
-            "temporal_batch_size",
-            "scout_refresh_frames",
-            "light_curve_batch_size",
-        )
-        if name in options
-    }
-    label_batch = options.pop("label_batch_size", None)
-    schedule = options.get("schedule")
-    if schedule is None:
-        schedule = production_dynamic_config(
-            temporal_batch_size=30 if include_labels else 49
-        )
-    options["schedule"] = replace(schedule, **updates) if updates else schedule
-    if not include_labels and (
-        label_batch is not None or options.get("caustics") is not None
-    ):
-        raise ValueError("caustic settings require include_labels=True")
-    options = _with_method_options(options, dynamic=True)
-    if options.get("method") is None:
-        options["method"] = production_ipm_config()
-    if not include_labels:
-        options.pop("caustics", None)
-    unknown = set(options) - {"method", "schedule", "caustics"} - set(allowed_options)
-    if unknown:
-        raise TypeError(f"unsupported light-curve options {sorted(unknown)}")
-    if label_batch is not None:
-        _, caustics = _production_dynamic_settings(
-            options.get("method") or production_ipm_config(),
-            options["schedule"],
-            options.get("caustics"),
-        )
-        options["caustics"] = replace(caustics, temporal_batch_size=label_batch)
-    return options
-
-
-def _light_curve_times(
-    times_days=None,
-    *,
-    duration_days=None,
-    map_cadence_days=None,
-    source_cadence_days=None,
-    flux_times_days=None,
-    start_day=0.0,
-):
-    """Resolve regular or irregular map and photometry epochs consistently."""
-
-    map_times = _cadence_times(
-        times_days,
-        duration_days=duration_days,
-        cadence_days=map_cadence_days,
-        start_day=start_day,
-    )
-    if flux_times_days is not None and source_cadence_days is not None:
-        raise ValueError("supply flux_times_days or source_cadence_days, not both")
-    if flux_times_days is not None:
-        flux_times = _cadence_times(
-            flux_times_days, duration_days=None, cadence_days=None
-        )
-    elif source_cadence_days is not None:
-        flux_times = _cadence_times(
-            None,
-            duration_days=float(map_times[-1] - map_times[0]),
-            cadence_days=source_cadence_days,
-            start_day=float(map_times[0]),
-        )
-    else:
-        return map_times, None
-    if float(flux_times[0]) < float(map_times[0]) or float(flux_times[-1]) > float(
-        map_times[-1]
-    ):
-        raise ValueError(
-            "flux_times_days must lie within the evaluated map time interval"
-        )
-    return map_times, None if torch.equal(map_times, flux_times) else flux_times
-
-
-def _production_dynamic_settings(
-    method: IPMConfig | IRSConfig,
-    schedule: DynamicConfig | None,
-    caustics: CausticConfig | None = None,
-    *,
-    include_labels: bool = True,
-) -> tuple[DynamicConfig, CausticConfig | None]:
-    """Resolve coherent high-level dynamic and optional caustic settings."""
-
-    # The fused 8192-square determinant and label workload reaches its best
-    # steady-state throughput with thirty frames per shared map/label batch.
-    # Light-curve-only calls retain the forty-nine-frame production preset.
-    resolved_schedule = (
-        production_dynamic_config(temporal_batch_size=30 if include_labels else 49)
-        if schedule is None
-        else schedule
-    )
-    if not include_labels:
-        return resolved_schedule, None
-    if caustics is None:
-        inherited_far_field = (
-            method.far_field_approx if isinstance(method, IPMConfig) else None
-        )
-        resolved_caustics = CausticConfig(
-            **(
-                {"far_field_approx": inherited_far_field}
-                if inherited_far_field is not None
-                else {}
-            ),
-            temporal_batch_size=resolved_schedule.temporal_batch_size,
-        )
-    else:
-        resolved_caustics = (
-            replace(
-                caustics,
-                temporal_batch_size=resolved_schedule.temporal_batch_size,
-            )
-            if caustics.temporal_batch_size is None
-            else caustics
-        )
-    return resolved_schedule, resolved_caustics
-
-
-def _evaluate_light_curve(
-    realization, map_times, flux_times, *, include_labels, **kwargs
-):
-    """Dispatch one resolved request without changing the numerical schedulers."""
-
-    from .results import _unified_light_curve
-
-    if flux_times is None:
-        calculate = (
-            realization.light_curve_with_labels
-            if include_labels
-            else realization.light_curve
-        )
-        result = calculate(map_times, **kwargs)
-    else:
-        calculate = (
-            realization.multirate_light_curve_with_labels
-            if include_labels
-            else realization.multirate_light_curve
-        )
-        result = calculate(map_times, flux_times, **kwargs)
-    return _unified_light_curve(result)
-
-
-def _source_grid_from_model(
-    source: PixelatedSource,
-    distances: LensingDistances,
-) -> PlaneGrid:
-    """Convert a pixelated source's physical geometry to an angular grid."""
-
-    geometry = source.geometry
-    fov_m = (
-        float(geometry.shape[0]) * float(geometry.pixel_scale_m[0]),
-        float(geometry.shape[1]) * float(geometry.pixel_scale_m[1]),
-    )
-    fov_uas = distances.source_length_to_uas(fov_m, dtype=torch.float64)
-    return PlaneGrid(
-        shape=geometry.shape,
-        field_of_view_uas=(float(fov_uas[0]), float(fov_uas[1])),
-    )
-
-
-def _direct_star_region(
-    stars: PointMassField,
-    macro: MacroLens,
-    source_region: PlaneRegion,
-) -> PlaneRegion:
-    """Infer a conservative integration box for directly supplied stars."""
-
-    angle = 2.0 * macro.shear_angle_rad
-    gamma_1 = macro.shear * math.cos(angle)
-    gamma_2 = macro.shear * math.sin(angle)
-    a_xx = 1.0 - macro.convergence - gamma_1
-    a_xy = -gamma_2
-    a_yy = 1.0 - macro.convergence + gamma_1
-    determinant = a_xx * a_yy - a_xy * a_xy
-    if abs(determinant) <= 1.0e-12:
-        raise ValueError("macro-lens matrix is too close to singular")
-    inverse_xx = a_yy / determinant
-    inverse_xy = -a_xy / determinant
-    inverse_yy = a_xx / determinant
-
-    source_fov_y, source_fov_x = source_region.field_of_view_uas
-    source_center_y, source_center_x = source_region.center_uas
-    half_source_x = 0.5 * source_fov_x
-    half_source_y = 0.5 * source_fov_y
-    center_x = inverse_xx * source_center_x + inverse_xy * source_center_y
-    center_y = inverse_xy * source_center_x + inverse_yy * source_center_y
-    half_x = abs(inverse_xx) * half_source_x + abs(inverse_xy) * half_source_y
-    half_y = abs(inverse_xy) * half_source_x + abs(inverse_yy) * half_source_y
-    xmin, xmax = center_x - half_x, center_x + half_x
-    ymin, ymax = center_y - half_y, center_y + half_y
-    if len(stars):
-        star_x = stars.x_uas.detach().cpu()
-        star_y = stars.y_uas.detach().cpu()
-        xmin = min(xmin, float(star_x.min()))
-        xmax = max(xmax, float(star_x.max()))
-        ymin = min(ymin, float(star_y.min()))
-        ymax = max(ymax, float(star_y.max()))
-    padding = (
-        2.0 * float(stars.einstein_radius_uas.detach().max().cpu())
-        if len(stars)
-        else 0.0
-    )
-    if xmax <= xmin:
-        xmin -= max(padding, 0.5)
-        xmax += max(padding, 0.5)
-    if ymax <= ymin:
-        ymin -= max(padding, 0.5)
-        ymax += max(padding, 0.5)
-    return PlaneRegion(
-        (ymax - ymin + 2.0 * padding, xmax - xmin + 2.0 * padding),
-        (0.5 * (ymin + ymax), 0.5 * (xmin + xmax)),
-    )
-
-
-def _lens_plane_region(
-    lens_plane_uas: str | float | tuple[float, float],
-) -> PlaneRegion | None:
-    """Resolve a centered public lens-plane size or the automatic sentinel."""
-
-    if isinstance(lens_plane_uas, str):
-        if lens_plane_uas != "auto":
-            raise ValueError("lens_plane_uas must be 'auto', a size, or two sizes")
-        return None
-    if isinstance(lens_plane_uas, (int, float)):
-        size = float(lens_plane_uas)
-        if not math.isfinite(size) or size <= 0.0:
-            raise ValueError("lens_plane_uas must be positive and finite")
-        return PlaneRegion((size, size))
-    if len(lens_plane_uas) != 2:
-        raise ValueError("lens_plane_uas must contain (height, width)")
-    sizes = tuple(float(value) for value in lens_plane_uas)
-    if any(not math.isfinite(value) or value <= 0.0 for value in sizes):
-        raise ValueError("lens_plane_uas values must be positive and finite")
-    return PlaneRegion(sizes)
 
 
 @dataclass(frozen=True)
@@ -933,9 +357,15 @@ class MicrolensingRealization:
         method: IRSConfig | IPMConfig | None = None,
         schedule: DynamicConfig | None = None,
         map_observer=None,
+        keep_maps_at_days: Sequence[float] | None = None,
         flux_times_days=None,
     ) -> tuple[LightCurve, ...]:
-        """Batch multiple sources or trajectories through one map sequence."""
+        """Batch multiple sources or trajectories through one map sequence.
+
+        Selected evaluated epochs may be retained on every returned curve with
+        ``keep_maps_at_days``. Retention composes with ``map_observer`` and does
+        not repeat map generation.
+        """
 
         requests = tuple(
             replace(
@@ -956,16 +386,20 @@ class MicrolensingRealization:
         resolved_schedule, _ = _production_dynamic_settings(
             resolved_method, schedule, include_labels=False
         )
-        return self.simulation.light_curves(
+        observer, retained = _retaining_map_observer(
+            times_days, keep_maps_at_days, map_observer
+        )
+        curves = self.simulation.light_curves(
             self.lens_region,
             self.source_grid,
             times_days,
             requests,
             method=resolved_method,
             schedule=resolved_schedule,
-            map_observer=map_observer,
+            map_observer=observer,
             flux_times_days=flux_times_days,
         )
+        return tuple(replace(curve, maps=retained) for curve in curves)
 
     def multirate_light_curve(
         self,
@@ -1132,6 +566,8 @@ class MicrolensingRealization:
         driver_amplitude: float = 1.0,
         normalize: bool = True,
         map_observer=None,
+        response_batch_size: int | None = None,
+        response_spatial_chunk_size: int = 262_144,
     ):
         """Stream dynamic maps into microlensed response functions."""
 
@@ -1161,6 +597,8 @@ class MicrolensingRealization:
             driver_amplitude=driver_amplitude,
             normalize=normalize,
             map_observer=map_observer,
+            response_batch_size=response_batch_size,
+            response_spatial_chunk_size=response_spatial_chunk_size,
         )
 
     def _trajectory_in_local_frame(
@@ -1421,6 +859,9 @@ class MicrolensingSystem:
             )
         elif self.duration_days > 0.0 and self.stars is not None:
             _warn_incomplete_explicit_motion(self.stars)
+        # Rectangular preimages are smallest in the shear-aligned frame. Rotate
+        # the complete numerical problem together so the physical sky geometry
+        # and resulting light curve remain unchanged.
         physical_source = isinstance(self.source, PhysicalSourceModel)
         source_has_orientation = physical_source and (
             hasattr(self.source, "position_angle_deg")
@@ -1471,6 +912,9 @@ class MicrolensingSystem:
             else self.trajectory
         )
         source_support_radius_uas = self.source_support_radius_uas
+        # Resolve physical source models only after the runtime and coordinate
+        # frame are known; this keeps pixelization on the requested device and
+        # lets the model provide its own physically motivated support grid.
         if physical_source:
             assert isinstance(numerical_source_model, PhysicalSourceModel)
             native_source_grid = (
@@ -1549,6 +993,9 @@ class MicrolensingSystem:
 
         aperture = None
         if stellar_population is not None:
+            # Aperture sizing includes the requested duration and source
+            # support. Its physical key intentionally excludes cadence and
+            # variability seeds, which must not change the stellar draw.
             aperture = circular_stellar_aperture(
                 numerical_macro,
                 source_grid.region,
@@ -1562,6 +1009,9 @@ class MicrolensingSystem:
             )
             sampling_aperture = aperture
             if align_rectangle:
+                # Sampling happens in the sky frame so a frame rotation cannot
+                # alter a seeded stellar realization; only the returned field
+                # is transformed into the numerical shear frame.
                 sampling_region = _rotate_region_center(
                     aperture.bounding_region, -frame_rotation_deg
                 )
@@ -2222,6 +1672,9 @@ class MicrolensingSystem:
 
         Requests inherit this system's distances unless explicitly overridden.
         Duration, cadence, rays and batch controls match :meth:`light_curve`.
+        ``keep_maps_at_days`` retains selected evaluated map epochs and attaches
+        the same ordered maps to every returned light curve. It composes with
+        an optional ``map_observer`` without generating the maps twice.
         Use ``batched_system_light_curves`` for independent stellar fields.
         """
         if requests is None:
@@ -2237,7 +1690,9 @@ class MicrolensingSystem:
             start_day=start_day,
         )
         options = _light_curve_options(
-            kwargs, include_labels=False, allowed_options={"map_observer"}
+            kwargs,
+            include_labels=False,
+            allowed_options={"keep_maps_at_days", "map_observer"},
         )
         return self._realize_for_times(map_times).light_curves(
             map_times,

@@ -67,6 +67,34 @@ class TemporalSourceStandardization:
         return self.standardize(self.representative)
 
 
+@dataclass(frozen=True)
+class MeanSourceIsophotes:
+    """Mean source images and one enclosed-flux isophote per band.
+
+    Arrays use package-standard ``[y, x, band]`` image order. ``levels`` and
+    the radius array have one entry per source band. The plotted contour
+    retains the image's actual shape; ``area_equivalent_radii_uas`` only
+    summarizes its enclosed pixel area as ``sqrt(A / pi)``.
+    """
+
+    mean_brightness: np.ndarray
+    levels: np.ndarray
+    enclosed_fractions: np.ndarray
+    area_equivalent_radii_uas: np.ndarray
+    x_uas: np.ndarray
+    y_uas: np.ndarray
+    requested_fraction: float
+
+    @property
+    def images(self) -> tuple[np.ndarray, ...]:
+        """Return mean brightness planes in source-band order."""
+
+        return tuple(
+            self.mean_brightness[:, :, index]
+            for index in range(self.mean_brightness.shape[-1])
+        )
+
+
 def _source_support(source, shape: tuple[int, int]) -> np.ndarray:
     """Return the source's wavelength-independent physical image support."""
 
@@ -185,6 +213,86 @@ def standardize_source_over_time(
         band_support,
         valid,
         (lower, upper),
+    )
+
+
+def mean_source_isophotes(
+    source: PixelatedSource,
+    times_days,
+    grid: PlaneGrid,
+    *,
+    fraction: float = 0.95,
+    batch_size: int = 4,
+    dtype: torch.dtype = torch.float64,
+    device=None,
+) -> MeanSourceIsophotes:
+    """Measure enclosed-flux isophotes from a source's mean brightness.
+
+    Brightness is accumulated in small temporal batches, so the full
+    ``[time, y, x, band]`` cube is never retained. ``grid.bounds_uas`` defines
+    the angular field occupied by the source images; its pixel resolution may
+    differ from the source image resolution. One intensity level enclosing
+    ``fraction`` of the mean positive finite flux is measured independently
+    for every band.
+    """
+
+    times = torch.as_tensor(times_days, device=device, dtype=dtype).reshape(-1)
+    if times.numel() == 0:
+        raise ValueError("times_days must contain at least one epoch")
+    if int(batch_size) < 1:
+        raise ValueError("batch_size must be positive")
+    requested_fraction = float(fraction)
+    if (
+        not np.isfinite(requested_fraction)
+        or not 0.0 < requested_fraction < 1.0
+    ):
+        raise ValueError("fraction must be finite and lie within (0, 1)")
+
+    total = None
+    count = 0
+    for chunk in times.split(int(batch_size)):
+        values = np.asarray(
+            as_numpy(source.brightness(chunk, dtype=dtype, device=device)),
+            dtype=np.float64,
+        )
+        if values.ndim != 4 or values.shape[-1] != len(source.geometry.band_names):
+            raise ValueError("source brightness must have [time, y, x, band] shape")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("source brightness contains non-finite values")
+        chunk_total = values.sum(axis=0, dtype=np.float64)
+        total = chunk_total if total is None else total + chunk_total
+        count += values.shape[0]
+
+    mean = total / count
+    ny, nx, bands = mean.shape
+    x0, x1, y0, y1 = grid.bounds_uas
+    dx = (x1 - x0) / nx
+    dy = (y1 - y0) / ny
+    x_uas = x0 + (np.arange(nx, dtype=np.float64) + 0.5) * dx
+    y_uas = y0 + (np.arange(ny, dtype=np.float64) + 0.5) * dy
+    levels = np.empty(bands, dtype=np.float64)
+    enclosed = np.empty(bands, dtype=np.float64)
+    radii = np.empty(bands, dtype=np.float64)
+    for index in range(bands):
+        image = mean[:, :, index]
+        level = enclosed_flux_contour_levels(
+            image, fractions=(requested_fraction,)
+        )[0]
+        positive = np.isfinite(image) & (image > 0.0)
+        selected = positive & (image >= level)
+        positive_flux = np.where(positive, image, 0.0)
+        levels[index] = level
+        enclosed[index] = positive_flux[selected].sum() / positive_flux.sum()
+        radii[index] = np.sqrt(selected.sum() * abs(dx * dy) / np.pi)
+
+    return MeanSourceIsophotes(
+        mean,
+        levels,
+        enclosed,
+        radii,
+        x_uas,
+        y_uas,
+        requested_fraction,
     )
 
 

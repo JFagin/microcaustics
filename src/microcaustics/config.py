@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from typing import Literal
 
 import torch
 
@@ -143,6 +144,9 @@ class RuntimeConfig:
     torch_compile_mode:
         Optional mode forwarded to :func:`torch.compile`. ``None`` uses the
         PyTorch default. It has no effect on eager or Triton runtimes.
+    warn_on_compile:
+        Emit a warning before a package-managed kernel specialization is
+        compiled or loaded from the compiler cache. Enabled by default.
     profiling:
         ``"off"`` avoids timing-only accelerator barriers. ``"total"``
         synchronizes only around complete public calculations.
@@ -155,6 +159,7 @@ class RuntimeConfig:
     strict_backend: bool = False
     memory_fraction: float = 0.95
     torch_compile_mode: str | None = None
+    warn_on_compile: bool = True
     profiling: ProfilingLevel | str = ProfilingLevel.OFF
 
     def __post_init__(self) -> None:
@@ -265,9 +270,18 @@ class IPMConfig:
 
 @dataclass(frozen=True)
 class IRSConfig:
-    """Uniform-grid inverse ray-shooting configuration."""
+    """Inverse ray-shooting configuration.
+
+    ``sampling="cartesian"`` places rays at the centers of a regular image-
+    plane lattice and is the default deterministic reference.  ``"random"``
+    draws pseudorandom uniform coordinates from reproducible streams.  A
+    fixed random seed also fixes the ray coordinates across dynamic frames,
+    preventing Monte Carlo shot noise from becoming artificial variability.
+    """
 
     rays: int = 10_000_000
+    sampling: Literal["cartesian", "random"] = "cartesian"
+    seed: int = 0
     ray_chunk_size: int = 262_144
     star_chunk_size: int = 4096
     far_field_approx: FarFieldApproxConfig = field(
@@ -277,6 +291,10 @@ class IRSConfig:
     def __post_init__(self) -> None:
         if self.rays < 1:
             raise ValueError("rays must be positive")
+        if self.sampling not in {"cartesian", "random"}:
+            raise ValueError("sampling must be 'cartesian' or 'random'")
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+            raise TypeError("seed must be an integer")
         if self.ray_chunk_size < 1 or self.star_chunk_size < 1:
             raise ValueError("ray and star chunk sizes must be positive")
 
@@ -415,13 +433,19 @@ class CausticConfig:
     temporal parity alignment. When ``temporal_batch_size`` is omitted in a
     light-curve call, labels inherit the map/light-curve temporal batch. Set it
     explicitly only when label memory or throughput benefits from a different
-    batch size.
+    batch size. ``discovery_downsample_ratio`` controls the coarse
+    critical-curve discovery grid used before sparse high-resolution
+    determinant evaluation. The production value of 16 maps an ``8192 x
+    8192`` determinant grid to a ``512 x 512`` discovery grid.
     """
 
     far_field_approx: FarFieldApproxConfig = field(default_factory=FarFieldApproxConfig)
     tuning: AutoTuningConfig = field(default_factory=AutoTuningConfig)
     temporal_batch_size: int | None = None
     jacobian_chunk_size: int = 1_048_576
+    discovery_downsample_ratio: int = 16
+    discovery_near_zero_quantile: float = 0.05
+    discovery_dilation_cells: int = 2
     minimum_determinant_sign_pixels: int = 4
     anchor_count: int = 9
     gauge_count: int = 9
@@ -442,6 +466,7 @@ class CausticConfig:
     def __post_init__(self) -> None:
         for name in (
             "jacobian_chunk_size",
+            "discovery_downsample_ratio",
             "anchor_count",
             "gauge_count",
             "minimum_alignment_gauges",
@@ -453,6 +478,10 @@ class CausticConfig:
                 raise ValueError(f"{name} must be positive")
         if int(self.minimum_determinant_sign_pixels) < 0:
             raise ValueError("minimum_determinant_sign_pixels must be non-negative")
+        if not 0.0 <= float(self.discovery_near_zero_quantile) <= 1.0:
+            raise ValueError("discovery_near_zero_quantile must lie between zero and one")
+        if int(self.discovery_dilation_cells) < 0:
+            raise ValueError("discovery_dilation_cells must be non-negative")
         if self.temporal_batch_size is not None and self.temporal_batch_size < 1:
             raise ValueError("temporal_batch_size must be positive when supplied")
         for name in (

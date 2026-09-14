@@ -169,11 +169,27 @@ separate. The current package only reports a fused operation when the
 underlying solver actually executes one.
 
 This shared-map source batching is distinct from independent-system
-concurrency. Use `batched_system_light_curves` when every curve has its own
-stellar realization, macro lens, source, and map sequence. Its explicit
-`curves_per_batch` value controls how many complete systems run concurrently
-on one CUDA device. Lossless OOM backoff halves that concurrency and retries.
-CPU and Apple MPS retain the same interface and execute systems sequentially.
+concurrency. `batched_system_light_curves` accepts arbitrary mixtures of
+single- and multi-image systems. It realizes inputs lazily, batches individual
+macroimage curves with `curves_per_batch`, and reconstructs each system in its
+original image order. Compatible tiled-IPM Triton curves fuse their far-field,
+ragged scout-cell rasterization, and optional Jacobian/marching-squares queues
+without mixing stellar fields or tracing a union of different systems' cells.
+For mixed doubles or quads, matching macroimage contracts are grouped across
+systems while incompatible images use the established private-stream path.
+Lossless OOM backoff halves CUDA concurrency and retries; CPU and Apple MPS use
+the same interface and execute curves sequentially.
+
+Set `output_path` to a directory for flat per-image NPZ files and a manifest,
+or to a `.npz` file for one combined NumPy archive. A bounded single-writer
+queue overlaps serialization with calculation. The returned
+`IndependentLightCurveBatch` stores compact records instead of every curve;
+`batch.load_system(index)` reconstructs a single `LightCurve` or complete
+`MultiImageLightCurves`. Use `compression=False` when write speed matters more
+than space. Flat-directory output supports `resume=True`; a complete system is
+reused only when every expected image file exists. Combined archives are
+atomically finalized and do not support partial resume. Retained maps remain
+separate products and should be handled with map observers in disk-backed runs.
 
 ## Paper production and conservative reference modes
 

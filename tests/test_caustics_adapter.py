@@ -28,7 +28,7 @@ def _far_field() -> TaylorFarFieldApproximation:
         mc.MacroLens(
             convergence=0.27,
             shear=0.16,
-            shear_angle_rad=0.31,
+            shear_angle_deg=17.76169164905552,
             smooth_matter_fraction=0.4,
         ),
         mc.PointMassField._from_einstein_radii(

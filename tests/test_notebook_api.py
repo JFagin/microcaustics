@@ -1,6 +1,7 @@
 """Fast checks of notebook API calls and the self-contained dataset workflow."""
 
 import ast
+import importlib
 import inspect
 import json
 from dataclasses import replace
@@ -17,6 +18,36 @@ NOTEBOOKS = Path(__file__).resolve().parents[1] / "examples" / "notebooks"
 
 def cells(path):
     return json.loads(path.read_text(encoding="utf-8"))["cells"]
+
+
+@pytest.mark.parametrize(
+    "path", sorted(NOTEBOOKS.rglob("*.ipynb")), ids=lambda p: p.stem
+)
+def test_notebook_microcaustics_imports_exist(path):
+    """Resolve package imports so stale renamed symbols fail before execution."""
+
+    for cell in cells(path):
+        if cell["cell_type"] != "code":
+            continue
+        code = "\n".join(
+            line
+            for line in "".join(cell["source"]).splitlines()
+            if not line.lstrip().startswith(("%", "!"))
+        )
+        for node in ast.walk(ast.parse(code)):
+            if not isinstance(node, ast.ImportFrom) or not node.module:
+                continue
+            if not (
+                node.module == "microcaustics"
+                or node.module.startswith("microcaustics.")
+            ):
+                continue
+            module = importlib.import_module(node.module)
+            for alias in node.names:
+                if alias.name != "*":
+                    assert hasattr(module, alias.name), (
+                        f"{node.module} does not export {alias.name}"
+                    )
 
 
 @pytest.mark.parametrize(

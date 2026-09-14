@@ -14,7 +14,43 @@ import torch.nn.functional as torch_functional
 from ..config import Backend, IPMConfig
 from ..geometry import PlaneGrid, PlaneRegion
 from ..results import MagnificationMap, TimingBreakdown
-from ..runtime import warn_backend_fallback
+from ..runtime import warn_backend_fallback, warn_compilation
+
+_PREPARED_TRITON_IPM_SPECIALIZATIONS: set[tuple[object, ...]] = set()
+
+
+def _warn_new_triton_ipm_specialization(
+    runtime,
+    *,
+    temporal: bool,
+    frames: int,
+    source_shape: tuple[int, int],
+    refinement: int,
+    virtual_refinement: int,
+) -> None:
+    # These are the constexpr/layout controls used by the Triton rasterizers;
+    # changing physical star values alone does not create a new warning key.
+    key = (
+        str(runtime.device),
+        str(runtime.dtype),
+        runtime.warn_on_compile,
+        bool(temporal),
+        int(frames),
+        tuple(source_shape),
+        int(refinement),
+        int(virtual_refinement),
+    )
+    if key in _PREPARED_TRITON_IPM_SPECIALIZATIONS:
+        return
+    warn_compilation(
+        "batched IPM rasterization" if temporal else "IPM rasterization",
+        backend="Triton",
+        device=runtime.device,
+        dtype=runtime.dtype,
+        enabled=runtime.warn_on_compile,
+    )
+    _PREPARED_TRITON_IPM_SPECIALIZATIONS.add(key)
+
 
 if TYPE_CHECKING:
     from ..simulation import MicrolensingSimulation
@@ -303,12 +339,8 @@ def _source_scout_cells(
     if selected_tiles.numel() == 0:
         fine_linear = torch.empty(0, device=runtime.device, dtype=torch.long)
     else:
-        fine_rows = (
-            selected_tiles[:, 0, None] * ratio + local_y.reshape(1, -1)
-        )
-        fine_columns = (
-            selected_tiles[:, 1, None] * ratio + local_x.reshape(1, -1)
-        )
+        fine_rows = selected_tiles[:, 0, None] * ratio + local_y.reshape(1, -1)
+        fine_columns = selected_tiles[:, 1, None] * ratio + local_x.reshape(1, -1)
         fine_linear = (fine_rows * fine_nx + fine_columns).reshape(-1)
     metadata: dict[str, int | float | bool] = {
         "scout_ratio": ratio,
@@ -414,15 +446,25 @@ def _source_scout_union_temporal(
         config.scout_dilation_cells,
     )
     selected_after = selected.sum(dim=(-2, -1), dtype=torch.int64)
-    union_tiles = selected.any(dim=0).nonzero(as_tuple=False)
     local_y, local_x = torch.meshgrid(
         torch.arange(ratio, device=runtime.device),
         torch.arange(ratio, device=runtime.device),
         indexing="ij",
     )
-    fine_rows = union_tiles[:, 0, None] * ratio + local_y.reshape(1, -1)
-    fine_columns = union_tiles[:, 1, None] * ratio + local_x.reshape(1, -1)
-    fine_linear = (fine_rows * fine_nx + fine_columns).reshape(-1)
+    local_y = local_y.reshape(1, -1)
+    local_x = local_x.reshape(1, -1)
+
+    def expand_tiles(tiles: torch.Tensor) -> torch.Tensor:
+        fine_rows = tiles[:, 0, None] * ratio + local_y
+        fine_columns = tiles[:, 1, None] * ratio + local_x
+        return (fine_rows * fine_nx + fine_columns).reshape(-1)
+
+    component_fine_linear = tuple(
+        expand_tiles(frame_selected.nonzero(as_tuple=False))
+        for frame_selected in selected
+    )
+    union_tiles = selected.any(dim=0).nonzero(as_tuple=False)
+    fine_linear = expand_tiles(union_tiles)
     counts = torch.stack((selected_before, selected_after)).detach().cpu()
     metadata = [
         {
@@ -442,7 +484,7 @@ def _source_scout_union_temporal(
         }
         for frame in range(len(far_fields))
     ]
-    return fine_linear, fine_ny, fine_nx, metadata
+    return fine_linear, fine_ny, fine_nx, metadata, component_fine_linear
 
 
 @torch.no_grad()
@@ -605,27 +647,6 @@ def interpolated_nodes(
     )
 
 
-def biquadratic_nodes(
-    node_x: torch.Tensor,
-    node_y: torch.Tensor,
-    *,
-    virtual_refinement: int = 4,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reconstruct a mapped ``r=2`` lattice by biquadratic interpolation.
-
-    This compatibility helper enforces the paper method's true refinement and
-    delegates to :func:`interpolated_nodes`.
-    """
-
-    if tuple(node_x.shape[1:]) != (3, 3):
-        raise ValueError("biquadratic reconstruction requires r=2 node lattices")
-    return interpolated_nodes(
-        node_x,
-        node_y,
-        virtual_refinement=virtual_refinement,
-    )
-
-
 def triangles_from_node_lattices(
     node_x: torch.Tensor,
     node_y: torch.Tensor,
@@ -668,9 +689,7 @@ def _clip_axis(
         if current_inside != previous_inside:
             denominator = current[axis] - previous[axis]
             fraction = (
-                0.0
-                if denominator == 0.0
-                else (boundary - previous[axis]) / denominator
+                0.0 if denominator == 0.0 else (boundary - previous[axis]) / denominator
             )
             intersection = (
                 previous[0] + fraction * (current[0] - previous[0]),
@@ -816,6 +835,9 @@ def full_field_ipm(
             time_days=time_days,
         )
     built = perf_counter()
+    # A dynamic scheduler may supply a conservative selection shared by several
+    # epochs. Otherwise static tiled calls scout now, and full-field calls visit
+    # every base cell. All three paths meet at the same mapping/rasterization loop.
     if _selected_cell_indices is not None:
         if _selected_cell_shape is None:
             raise ValueError("scheduled cell indices require their fine-grid shape")
@@ -874,18 +896,27 @@ def full_field_ipm(
         and runtime.dtype == torch.float32
         and side <= 16
     )
+    if use_triton:
+        _warn_new_triton_ipm_specialization(
+            runtime,
+            temporal=False,
+            frames=1,
+            source_shape=source_grid.shape,
+            refinement=refinement,
+            virtual_refinement=side,
+        )
     compact_sparse_nodes = bool(config.compact_sparse_nodes and config.tiled)
     compact_node_x = compact_node_y = compact_inverse = None
     if compact_sparse_nodes:
-        compact_node_x, compact_node_y, compact_inverse = (
-            _compact_sparse_node_plan(
-                cell_indices,
-                cell_ny=cell_ny,
-                cell_nx=cell_nx,
-                refinement=refinement,
-                lens_region=lens_region,
-                dtype=runtime.dtype,
-            )
+        # Neighboring active cells share refined vertices. Trace each unique
+        # vertex once and use ``compact_inverse`` to reconstruct cell lattices.
+        compact_node_x, compact_node_y, compact_inverse = _compact_sparse_node_plan(
+            cell_indices,
+            cell_ny=cell_ny,
+            cell_nx=cell_nx,
+            refinement=refinement,
+            lens_region=lens_region,
+            dtype=runtime.dtype,
         )
     trace_backends: set[str] = set()
 
@@ -926,6 +957,8 @@ def full_field_ipm(
                 )
                 trace_backends.add(far_field.last_query_backend)
         for start in range(0, selected_count, int(config.cell_chunk_size)):
+            # Each chunk follows the same IPM stages: trace base nodes, refine
+            # their mapped polygons, then deposit conserved lens-plane area.
             stop = min(selected_count, start + int(config.cell_chunk_size))
             if compact_sparse_nodes:
                 inverse = compact_inverse[start:stop]
@@ -935,22 +968,22 @@ def full_field_ipm(
                 linear = cell_indices[start:stop]
                 row = torch.div(linear, cell_nx, rounding_mode="floor")
                 column = linear - row * cell_nx
-                lens_x = xmin + (
-                    column[:, None, None].to(runtime.dtype)
-                    + offsets[None, None, :]
-                ) * cell_dx
-                lens_y = ymin + (
-                    row[:, None, None].to(runtime.dtype)
-                    + offsets[None, :, None]
-                ) * cell_dy
+                lens_x = (
+                    xmin
+                    + (column[:, None, None].to(runtime.dtype) + offsets[None, None, :])
+                    * cell_dx
+                )
+                lens_y = (
+                    ymin
+                    + (row[:, None, None].to(runtime.dtype) + offsets[None, :, None])
+                    * cell_dy
+                )
                 lens_x, lens_y = torch.broadcast_tensors(lens_x, lens_y)
                 if far_field is None:
-                    source_x, source_y, trace_diagnostics = (
-                        simulation.raytrace_direct(
-                            lens_x,
-                            lens_y,
-                            time_days=time_days,
-                        )
+                    source_x, source_y, trace_diagnostics = simulation.raytrace_direct(
+                        lens_x,
+                        lens_y,
+                        time_days=time_days,
                     )
                     trace_backends.add(trace_diagnostics.effective_backend)
                 else:
@@ -1001,6 +1034,8 @@ def full_field_ipm(
     correction_diagnostics: dict[str, object] = {}
     scalar_correction = _scalar_correction
     if config.dual_scout_scalar_correction and scalar_correction is None:
+        # The k=2 production scout omits a nearly uniform low-level contribution;
+        # measure it once against k=1 and add only that scalar normalization.
         scalar_correction, correction_diagnostics = dual_scout_scalar_correction(
             simulation,
             far_field,
@@ -1050,9 +1085,7 @@ def full_field_ipm(
         source_grid,
         time_days=float(time_days),
         method=(
-            "tiled_interpolated_ipm"
-            if config.tiled
-            else "full_field_interpolated_ipm"
+            "tiled_interpolated_ipm" if config.tiled else "full_field_interpolated_ipm"
         ),
         metadata={
             "requested_base_cells": int(config.rays),
@@ -1080,9 +1113,7 @@ def full_field_ipm(
                     if use_triton and refinement == 2 and side == 4
                     else "torch-eager"
                 ),
-                "rasterization": (
-                    "triton" if use_triton else "python-exact-reference"
-                ),
+                "rasterization": ("triton" if use_triton else "python-exact-reference"),
             },
             "rasterizer": (
                 "triton_direct_cell_scanline"
@@ -1100,7 +1131,9 @@ def full_field_ipm(
                 "source_scout": scouted - built,
                 "trace_reconstruct_raster": mapped - scouted,
                 "dual_scout_scalar_correction": finished - mapped,
-            } if runtime.profiling.value == "detailed" else {},
+            }
+            if runtime.profiling.value == "detailed"
+            else {},
         ),
     )
 
@@ -1115,12 +1148,13 @@ def temporal_batch_ipm(
     *,
     far_fields=None,
     selected_cell_indices: torch.Tensor | None = None,
+    selected_cell_indices_by_frame=None,
     selected_cell_shape: tuple[int, int] | None = None,
     selection_metadata: dict[str, object] | None = None,
     scalar_correction: float | torch.Tensor | None = None,
     real_frame_count: int | None = None,
 ) -> tuple[MagnificationMap, ...]:
-    """Generate a temporal IPM batch with one shared cell queue.
+    """Generate a temporal IPM batch with shared or ragged cell queues.
 
     The CUDA production path stacks every frame's mapped node lattices and
     rasterizes them in one direct-cell Triton launch per cell chunk. Lens
@@ -1128,10 +1162,12 @@ def temporal_batch_ipm(
     allocation are shared. Portable backends preserve the numerical contract
     with the exact eager rasterizer.
 
-    A tiled calculation must supply one conservative cell selection valid for
-    the complete batch, normally the endpoint union prepared by the dynamic
-    scheduler. ``real_frame_count`` permits a padded final batch while dropping
-    the synthetic frames from the returned sequence.
+    A tiled calculation normally supplies one conservative cell selection valid
+    for the complete temporal batch. Independent compatible systems may instead
+    supply ``selected_cell_indices_by_frame``; those queues are concatenated
+    with explicit output-frame tags, so no system traces another system's scout
+    cells. ``real_frame_count`` permits a padded final batch while dropping the
+    synthetic frames from the returned sequence.
     """
 
     runtime = simulation.runtime
@@ -1162,7 +1198,9 @@ def temporal_batch_ipm(
         if len(far_fields) != total_frames:
             raise ValueError("far_fields must match the padded temporal batch")
     batched_far_field = None
-    if total_frames > 1 and all(item is not None for item in far_fields):
+    if (
+        total_frames > 1 or selected_cell_indices_by_frame is not None
+    ) and all(item is not None for item in far_fields):
         from .far_field import BatchedTaylorFarFieldApproximation
 
         batched_far_field = BatchedTaylorFarFieldApproximation(far_fields)
@@ -1174,7 +1212,42 @@ def temporal_batch_ipm(
         lens_region,
         config.scout_ratio,
     )
-    if selected_cell_indices is None:
+    if selected_cell_indices is not None and selected_cell_indices_by_frame is not None:
+        raise ValueError("supply shared or per-frame selected cells, not both")
+    ragged_cells = selected_cell_indices_by_frame is not None
+    cell_frame_index = None
+    if ragged_cells:
+        if selected_cell_shape is None:
+            raise ValueError("selected_cell_shape is required with selected cells")
+        cell_ny, cell_nx = (int(value) for value in selected_cell_shape)
+        rows = tuple(
+            torch.as_tensor(value, device=runtime.device, dtype=torch.long).reshape(-1)
+            for value in selected_cell_indices_by_frame
+        )
+        if len(rows) != total_frames:
+            raise ValueError("per-frame selected cells must match the temporal batch")
+        lengths = tuple(int(value.numel()) for value in rows)
+        cell_indices = torch.cat(rows) if rows else torch.empty(
+            0, device=runtime.device, dtype=torch.long
+        )
+        cell_frame_index = torch.repeat_interleave(
+            torch.arange(total_frames, device=runtime.device, dtype=torch.int32),
+            torch.tensor(lengths, device=runtime.device, dtype=torch.int64),
+            output_size=sum(lengths),
+        )
+        scout_metadata = dict(selection_metadata or {})
+        scout_metadata.update(
+            {
+                "selected_fine_cells": int(cell_indices.numel()),
+                "selected_fine_cells_per_frame": list(lengths),
+                "selected_fine_fraction": float(
+                    cell_indices.numel() / max(total_frames * cell_ny * cell_nx, 1)
+                ),
+                "scheduled_selection_reuse": True,
+                "ragged_cell_queue": True,
+            }
+        )
+    elif selected_cell_indices is None:
         if config.tiled:
             raise ValueError(
                 "temporal tiled IPM requires a conservative shared selection"
@@ -1212,6 +1285,15 @@ def temporal_batch_ipm(
         and runtime.dtype == torch.float32
         and int(config.virtual_refinement) <= 16
     )
+    if use_triton:
+        _warn_new_triton_ipm_specialization(
+            runtime,
+            temporal=True,
+            frames=total_frames,
+            source_shape=source_grid.shape,
+            refinement=int(config.refinement),
+            virtual_refinement=int(config.virtual_refinement),
+        )
     trace_backends: set[str] = set()
     fov_y, fov_x = lens_region.field_of_view_uas
     lens_xmin, _, lens_ymin, _ = lens_region.bounds_uas
@@ -1231,17 +1313,68 @@ def temporal_batch_ipm(
     source_xmin, _, source_ymin, _ = source_grid.bounds_uas
     compact_sparse_nodes = bool(config.compact_sparse_nodes and config.tiled)
     compact_node_x = compact_node_y = compact_inverse = None
+    compact_node_frame_index = None
     if compact_sparse_nodes:
-        compact_node_x, compact_node_y, compact_inverse = (
-            _compact_sparse_node_plan(
-                cell_indices,
-                cell_ny=cell_ny,
-                cell_nx=cell_nx,
-                refinement=refinement,
-                lens_region=lens_region,
-                dtype=runtime.dtype,
+        if ragged_cells:
+            # Deduplicate independently inside each physical frame, then pack
+            # those variable-length node queues with explicit ownership tags.
+            # Nodes are never shared across frames because their lens states
+            # differ even when their integer lattice coordinates coincide. The
+            # scheduler reuses one selection tensor throughout each refresh
+            # interval, so cache its integer topology instead of repeating the
+            # relatively expensive unique/sort operation for every frame.
+            plan_cache = {}
+            plans = []
+            for row in rows:
+                key = (int(row.data_ptr()), int(row.numel()))
+                plan = plan_cache.get(key)
+                if plan is None:
+                    plan = _compact_sparse_node_plan(
+                        row,
+                        cell_ny=cell_ny,
+                        cell_nx=cell_nx,
+                        refinement=refinement,
+                        lens_region=lens_region,
+                        dtype=runtime.dtype,
+                    )
+                    plan_cache[key] = plan
+                plans.append(plan)
+            plans = tuple(plans)
+            node_lengths = tuple(int(plan[0].numel()) for plan in plans)
+            compact_node_x = torch.cat(tuple(plan[0] for plan in plans))
+            compact_node_y = torch.cat(tuple(plan[1] for plan in plans))
+            node_offsets = []
+            offset = 0
+            for plan in plans:
+                node_offsets.append(plan[2] + offset)
+                offset += int(plan[0].numel())
+            compact_inverse = torch.cat(tuple(node_offsets))
+            compact_node_frame_index = torch.repeat_interleave(
+                torch.arange(
+                    total_frames,
+                    device=runtime.device,
+                    dtype=torch.int32,
+                ),
+                torch.tensor(
+                    node_lengths,
+                    device=runtime.device,
+                    dtype=torch.int64,
+                ),
+                output_size=sum(node_lengths),
             )
-        )
+        else:
+            # The unique-node plan is spatial and shared across all temporal
+            # frames; only mapped coordinates vary with the moving stars.
+            compact_node_x, compact_node_y, compact_inverse = (
+                _compact_sparse_node_plan(
+                    cell_indices,
+                    cell_ny=cell_ny,
+                    cell_nx=cell_nx,
+                    refinement=refinement,
+                    lens_region=lens_region,
+                    dtype=runtime.dtype,
+                )
+            )
 
     def calculate(accelerated: bool) -> torch.Tensor:
         from .triton_ipm import TritonRasterWorkspace, accumulate_cells_triton
@@ -1263,13 +1396,20 @@ def temporal_batch_ipm(
         selected_count = int(cell_indices.numel())
         compact_traced_x = compact_traced_y = None
         if compact_sparse_nodes:
-            if batched_far_field is not None:
+            if batched_far_field is not None and ragged_cells:
                 compact_traced_x, compact_traced_y = (
-                    batched_far_field.raytrace(compact_node_x, compact_node_y)
+                    batched_far_field.raytrace_indexed_flat(
+                        compact_node_x,
+                        compact_node_y,
+                        compact_node_frame_index,
+                    )
                 )
-                trace_backends.update(
-                    item.last_query_backend for item in far_fields
+                trace_backends.update(item.last_query_backend for item in far_fields)
+            elif batched_far_field is not None:
+                compact_traced_x, compact_traced_y = batched_far_field.raytrace(
+                    compact_node_x, compact_node_y
                 )
+                trace_backends.update(item.last_query_backend for item in far_fields)
             else:
                 mapped_x = []
                 mapped_y = []
@@ -1297,22 +1437,47 @@ def temporal_batch_ipm(
             stop = min(selected_count, start + int(config.cell_chunk_size))
             if compact_sparse_nodes:
                 inverse = compact_inverse[start:stop]
-                traced_x = compact_traced_x[:, inverse]
-                traced_y = compact_traced_y[:, inverse]
+                chunk_frame_index = (
+                    None if cell_frame_index is None else cell_frame_index[start:stop]
+                )
+                if ragged_cells:
+                    traced_x = compact_traced_x[inverse]
+                    traced_y = compact_traced_y[inverse]
+                else:
+                    traced_x = compact_traced_x[:, inverse]
+                    traced_y = compact_traced_y[:, inverse]
             else:
                 linear = cell_indices[start:stop]
+                chunk_frame_index = (
+                    None if cell_frame_index is None else cell_frame_index[start:stop]
+                )
                 row = torch.div(linear, cell_nx, rounding_mode="floor")
                 column = linear - row * cell_nx
-                lens_x = lens_xmin + (
-                    column[:, None, None].to(runtime.dtype)
-                    + offsets[None, None, :]
-                ) * cell_dx
-                lens_y = lens_ymin + (
-                    row[:, None, None].to(runtime.dtype)
-                    + offsets[None, :, None]
-                ) * cell_dy
+                lens_x = (
+                    lens_xmin
+                    + (column[:, None, None].to(runtime.dtype) + offsets[None, None, :])
+                    * cell_dx
+                )
+                lens_y = (
+                    lens_ymin
+                    + (row[:, None, None].to(runtime.dtype) + offsets[None, :, None])
+                    * cell_dy
+                )
                 lens_x, lens_y = torch.broadcast_tensors(lens_x, lens_y)
-                if batched_far_field is not None:
+                if batched_far_field is not None and chunk_frame_index is not None:
+                    point_frames = torch.repeat_interleave(
+                        chunk_frame_index,
+                        (refinement + 1) * (refinement + 1),
+                    )
+                    traced_x, traced_y = batched_far_field.raytrace_indexed_flat(
+                        lens_x.reshape(-1), lens_y.reshape(-1), point_frames
+                    )
+                    traced_x = traced_x.reshape_as(lens_x)
+                    traced_y = traced_y.reshape_as(lens_y)
+                    trace_backends.update(
+                        item.last_query_backend for item in far_fields
+                    )
+                elif batched_far_field is not None:
                     traced_x, traced_y = batched_far_field.raytrace(lens_x, lens_y)
                     trace_backends.update(
                         item.last_query_backend for item in far_fields
@@ -1320,9 +1485,7 @@ def temporal_batch_ipm(
                 else:
                     mapped_x = []
                     mapped_y = []
-                    for time_days, far_field in zip(
-                        times, far_fields, strict=True
-                    ):
+                    for time_days, far_field in zip(times, far_fields, strict=True):
                         if far_field is None:
                             source_x, source_y, trace_diagnostics = (
                                 simulation.raytrace_direct(
@@ -1331,9 +1494,7 @@ def temporal_batch_ipm(
                                     time_days=time_days,
                                 )
                             )
-                            trace_backends.add(
-                                trace_diagnostics.effective_backend
-                            )
+                            trace_backends.add(trace_diagnostics.effective_backend)
                         else:
                             source_x, source_y = far_field.raytrace(
                                 lens_x,
@@ -1344,15 +1505,15 @@ def temporal_batch_ipm(
                         mapped_y.append(source_y)
                     traced_x = torch.stack(mapped_x)
                     traced_y = torch.stack(mapped_y)
-            chunk_cells = int(traced_x.shape[1])
+            chunk_cells = int(
+                traced_x.shape[0] if ragged_cells else traced_x.shape[1]
+            )
             raw_x = traced_x.reshape(-1, refinement + 1, refinement + 1)
             raw_y = traced_y.reshape(-1, refinement + 1, refinement + 1)
             if accelerated and refinement == 2 and virtual == 4:
                 from .triton_ipm import materialize_biquadratic_v4_triton
 
-                virtual_x, virtual_y = materialize_biquadratic_v4_triton(
-                    raw_x, raw_y
-                )
+                virtual_x, virtual_y = materialize_biquadratic_v4_triton(raw_x, raw_y)
             else:
                 virtual_x, virtual_y = interpolated_nodes(
                     raw_x,
@@ -1360,8 +1521,7 @@ def temporal_batch_ipm(
                     virtual_refinement=virtual,
                 )
             virtual_x = virtual_x.reshape(
-                total_frames,
-                chunk_cells,
+                *((chunk_cells,) if ragged_cells else (total_frames, chunk_cells)),
                 virtual + 1,
                 virtual + 1,
             )
@@ -1376,13 +1536,26 @@ def temporal_batch_ipm(
                     pixel_size_x=source_dx,
                     pixel_size_y=source_dy,
                     lens_area_per_triangle_uas2=triangle_lens_area,
+                    cell_frame_index=(
+                        chunk_frame_index if ragged_cells else None
+                    ),
                 )
             else:
                 for frame in range(total_frames):
+                    frame_x = (
+                        virtual_x[cell_frame_index[start:stop] == frame]
+                        if ragged_cells
+                        else virtual_x[frame]
+                    )
+                    frame_y = (
+                        virtual_y[cell_frame_index[start:stop] == frame]
+                        if ragged_cells
+                        else virtual_y[frame]
+                    )
                     output[frame] += rasterize_triangles_exact_eager(
                         triangles_from_node_lattices(
-                            virtual_x[frame],
-                            virtual_y[frame],
+                            frame_x,
+                            frame_y,
                         ),
                         source_grid,
                         lens_area_per_triangle_uas2=triangle_lens_area,
@@ -1435,9 +1608,7 @@ def temporal_batch_ipm(
         )
     )
     coefficient_backends = {
-        item.coefficient_build_backend
-        for item in far_fields
-        if item is not None
+        item.coefficient_build_backend for item in far_fields if item is not None
     }
     far_field_build_backend = (
         "disabled"
@@ -1468,9 +1639,7 @@ def temporal_batch_ipm(
                     "virtual_refinement": virtual,
                     "compact_sparse_nodes": compact_sparse_nodes,
                     "compact_unique_nodes": (
-                        int(compact_node_x.numel())
-                        if compact_sparse_nodes
-                        else None
+                        int(compact_node_x.numel()) if compact_sparse_nodes else None
                     ),
                     "tiled": bool(config.tiled),
                     "absolute_magnification": True,
@@ -1514,7 +1683,9 @@ def temporal_batch_ipm(
                     component_seconds={
                         "temporal_far_field_preparation": far_field_seconds,
                         "shared_trace_interpolate_raster": solve_seconds,
-                    } if runtime.profiling.value == "detailed" else {},
+                    }
+                    if runtime.profiling.value == "detailed"
+                    else {},
                 ),
             )
         )

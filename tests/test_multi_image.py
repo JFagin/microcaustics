@@ -96,7 +96,7 @@ class MultiImageTests(unittest.TestCase):
             shear=0.52,
             shear_gamma1=0.4,
             shear_gamma2=0.33,
-            shear_angle_rad=0.34,
+            shear_angle_deg=19.48056503444799,
             source_residual_arcsec=1.0e-8,
         )
         local = solution.local_macro_lens(smooth_matter_fraction=0.2)
@@ -336,9 +336,19 @@ class MultiImageTests(unittest.TestCase):
                 return {"type": "test_response"}
 
             @staticmethod
-            def transfer_function(edges, *, magnification, normalize=True):
+            def transfer_function(
+                edges,
+                *,
+                magnification,
+                driver_amplitude=1.0,
+                normalize=True,
+            ):
                 del edges, normalize
-                return magnification.new_tensor([[1.0, 3.0], [3.0, 1.0]]) / 4.0
+                return (
+                    magnification.new_tensor([[1.0, 3.0], [3.0, 1.0]])
+                    * driver_amplitude
+                    / 4.0
+                )
 
         system = MultiImageSimulation.create([_image("A", 4.0)])
         result = system.transfer_functions(

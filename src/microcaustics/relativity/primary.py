@@ -14,7 +14,11 @@ from dataclasses import dataclass
 
 import torch
 
-from ..runtime import RuntimeCapabilities, _torch_compile_supported
+from ..runtime import (
+    RuntimeCapabilities,
+    _torch_compile_supported,
+    warn_compilation,
+)
 from .geodesics import (
     invert_radial_motion,
     kerr_radial_root_parts,
@@ -114,6 +118,7 @@ def _primary_calculation(
     compile_solver: bool,
     compile_mode: str,
     fallback_to_eager: bool,
+    warn_on_compile: bool,
 ):
     if not compile_solver:
         return _trace_primary_tensors, "torch eager"
@@ -140,6 +145,13 @@ def _primary_calculation(
         calculation = _COMPILED_PRIMARY.get(key)
         cache_hit = calculation is not None
         if calculation is None:
+            warn_compilation(
+                "primary Kerr ray tracing",
+                backend="torch.compile",
+                device=screen.x_rg.device,
+                dtype=screen.x_rg.dtype,
+                enabled=warn_on_compile,
+            )
             calculation = torch.compile(
                 _trace_primary_tensors,
                 mode=compile_mode,
@@ -165,6 +177,7 @@ def trace_primary_equatorial(
     compile_solver: bool = False,
     compile_mode: str = "reduce-overhead",
     fallback_to_eager: bool = True,
+    warn_on_compile: bool = True,
 ) -> PrimaryKerrTrace:
     """Trace first equatorial intersections from a distant observer.
 
@@ -212,6 +225,7 @@ def trace_primary_equatorial(
         compile_solver=bool(compile_solver),
         compile_mode=compile_mode,
         fallback_to_eager=bool(fallback_to_eager),
+        warn_on_compile=bool(warn_on_compile),
     )
     try:
         outputs = calculation(

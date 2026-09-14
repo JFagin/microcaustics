@@ -325,6 +325,27 @@ weights = reprocessed.linear_response_weights()
 psi = reprocessed.transfer_function(delay_edges_days, magnification=mu)
 ```
 
+When only the first moment is needed, use the direct mean-delay operations:
+
+```python
+steady_mean = mc.steady_mean_response_delays(reprocessed)
+microlensed_mean = mc.microlensed_mean_response_delays(
+    reprocessed,
+    magnification_map,
+    distances,
+)
+mean_series = mc.microlensed_mean_response_delays_batch(
+    reprocessed,
+    magnification_maps,
+    distances,
+)
+```
+
+These operations do not construct delay bins. Repeated no-gradient calls also
+reuse the source's invariant linear-response weights, and the batch operation
+uses bounded spatial chunks for long dynamic-map sequences. Request a full
+transfer function only when its delay-dependent shape is required.
+
 Transfer functions are also first-class standalone data products. They do not
 require a low-level `microcaustics.multi_image.MultiImageSimulation`:
 
@@ -349,8 +370,16 @@ series = simulation.transfer_functions(
     distances,
     delay_edges_days,
     method=ipm,
+    response_batch_size=16,
 )
 ```
+
+Built-in thermal sources batch full transfer-function accumulation across map
+epochs. By default the response batch follows the dynamic temporal batch;
+`response_batch_size` can lower its memory footprint independently, while
+`response_spatial_chunk_size` bounds the temporary pixel-by-band product.
+Custom transfer-function sources without a batched implementation continue to
+use the scalar streaming path.
 
 Each product contains the binned response, band names, bin edges, mean lags,
 normalization and source provenance. The time-dependent interface streams maps
@@ -387,6 +416,15 @@ source = mc.ThinDiskModel(
     source_margin=1.05,
 )
 ```
+
+The default viscous flux profile is `"novikov-thorne"`; select
+`"shakura-sunyaev"` for the Newtonian thin-disk profile. A custom callable
+receives `(radius_rg, spin, isco_rg)` and may carry additional parameters in a
+closure, `functools.partial`, or callable object. Custom profiles require an
+explicit `radiative_efficiency`, supplied as a value, one of the two built-in
+names, or a callable of `(spin, isco_rg)`. This keeps the high-level API fixed
+without restricting additional model parameters. See the disk-flux-profile
+notebook for a parameterized example.
 
 The reddest thin-disk band sets the common outer support. The Gaussian model
 uses the widest requested band and includes ellipticity, orientation, and an

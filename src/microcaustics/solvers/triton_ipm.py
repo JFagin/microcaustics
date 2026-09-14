@@ -107,15 +107,124 @@ if triton is not None:
             tl.where(falling, fall, tl.where(rising, rise, 0.0)),
         )
 
+    @triton.jit
+    def _compact_active_triangles_kernel(
+        node_x_ptr,
+        node_y_ptr,
+        active_cells_ptr,
+        active_count_ptr,
+        total_cells,
+        XMIN: tl.constexpr,
+        YMIN: tl.constexpr,
+        INV_PIXEL_X: tl.constexpr,
+        INV_PIXEL_Y: tl.constexpr,
+        ROWS: tl.constexpr,
+        COLUMNS: tl.constexpr,
+        VIRTUAL_REFINEMENT: tl.constexpr,
+        TRIANGLE_BLOCK: tl.constexpr,
+    ):
+        cell = tl.program_id(0)
+        triangle = tl.arange(0, TRIANGLE_BLOCK)
+        active_cell = cell < total_cells
+        valid_triangle = triangle < 2 * VIRTUAL_REFINEMENT * VIRTUAL_REFINEMENT
+        subcell = triangle // 2
+        split = triangle - subcell * 2
+        sub_i = subcell // VIRTUAL_REFINEMENT
+        sub_j = subcell - sub_i * VIRTUAL_REFINEMENT
+        node_side = VIRTUAL_REFINEMENT + 1
+        base = cell * node_side * node_side
+        index00 = base + sub_i * node_side + sub_j
+        index10 = base + (sub_i + 1) * node_side + sub_j
+        index11 = base + (sub_i + 1) * node_side + sub_j + 1
+        index01 = base + sub_i * node_side + sub_j + 1
+        ax = (tl.load(node_x_ptr + index00) - XMIN) * INV_PIXEL_X
+        ay = (tl.load(node_y_ptr + index00) - YMIN) * INV_PIXEL_Y
+        bx = (
+            tl.where(
+                split == 0,
+                tl.load(node_x_ptr + index10),
+                tl.load(node_x_ptr + index11),
+            )
+            - XMIN
+        ) * INV_PIXEL_X
+        by = (
+            tl.where(
+                split == 0,
+                tl.load(node_y_ptr + index10),
+                tl.load(node_y_ptr + index11),
+            )
+            - YMIN
+        ) * INV_PIXEL_Y
+        cx = (
+            tl.where(
+                split == 0,
+                tl.load(node_x_ptr + index11),
+                tl.load(node_x_ptr + index01),
+            )
+            - XMIN
+        ) * INV_PIXEL_X
+        cy = (
+            tl.where(
+                split == 0,
+                tl.load(node_y_ptr + index11),
+                tl.load(node_y_ptr + index01),
+            )
+            - YMIN
+        ) * INV_PIXEL_Y
+        twice_area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        minimum_x = tl.minimum(ax, tl.minimum(bx, cx))
+        maximum_x = tl.maximum(ax, tl.maximum(bx, cx))
+        minimum_y = tl.minimum(ay, tl.minimum(by, cy))
+        maximum_y = tl.maximum(ay, tl.maximum(by, cy))
+        finite = (
+            (ax == ax)
+            & (ay == ay)
+            & (bx == bx)
+            & (by == by)
+            & (cx == cx)
+            & (cy == cy)
+            & (tl.abs(ax) < 3.4028235e38)
+            & (tl.abs(ay) < 3.4028235e38)
+            & (tl.abs(bx) < 3.4028235e38)
+            & (tl.abs(by) < 3.4028235e38)
+            & (tl.abs(cx) < 3.4028235e38)
+            & (tl.abs(cy) < 3.4028235e38)
+        )
+        keep = (
+            active_cell
+            & valid_triangle
+            & finite
+            & (tl.abs(twice_area) > 1.1754944e-38)
+            & (maximum_x > 0.0)
+            & (minimum_x < COLUMNS)
+            & (maximum_y > 0.0)
+            & (minimum_y < ROWS)
+        )
+        has_source_triangle = tl.sum(keep.to(tl.int32), axis=0) > 0
+        first = triangle == 0
+        destination = tl.atomic_add(
+            active_count_ptr + triangle * 0,
+            1 + triangle * 0,
+            mask=active_cell & has_source_triangle & first,
+        )
+        tl.store(
+            active_cells_ptr + destination,
+            cell.to(tl.int32),
+            mask=active_cell & has_source_triangle & first,
+        )
+
 
     @triton.jit
     def _direct_cell_kernel(
         node_x_ptr,
         node_y_ptr,
+        active_cells_ptr,
+        active_count_ptr,
         histogram_ptr,
         row_difference_ptr,
         total_cells,
         cells_per_frame,
+        cell_frame_ptr,
         XMIN: tl.constexpr,
         YMIN: tl.constexpr,
         INV_PIXEL_X: tl.constexpr,
@@ -125,11 +234,26 @@ if triton is not None:
         TRIANGLE_MASS: tl.constexpr,
         TRIANGLE_BLOCK: tl.constexpr,
         VIRTUAL_REFINEMENT: tl.constexpr,
+        COMPACT_ACTIVE: tl.constexpr,
+        INDEXED_FRAMES: tl.constexpr,
     ):
-        cell = tl.program_id(0)
-        frame = cell // cells_per_frame
+        active_index = tl.program_id(0)
+        if COMPACT_ACTIVE:
+            active_limit = tl.load(active_count_ptr).to(tl.int32)
+            active_cell = (active_index < total_cells) & (active_index < active_limit)
+            cell = tl.load(
+                active_cells_ptr + active_index,
+                mask=active_cell,
+                other=0,
+            ).to(tl.int64)
+        else:
+            active_cell = active_index < total_cells
+            cell = active_index
+        if INDEXED_FRAMES:
+            frame = tl.load(cell_frame_ptr + cell).to(tl.int64)
+        else:
+            frame = cell // cells_per_frame
         triangle = tl.arange(0, TRIANGLE_BLOCK)
-        active_cell = cell < total_cells
         valid_triangle = triangle < 2 * VIRTUAL_REFINEMENT * VIRTUAL_REFINEMENT
         subcell = triangle // 2
         split = triangle - subcell * 2
@@ -532,6 +656,7 @@ def accumulate_cells_triton(
     pixel_size_x: float,
     pixel_size_y: float,
     lens_area_per_triangle_uas2: float,
+    cell_frame_index: torch.Tensor | None = None,
 ) -> None:
     """Add one chunk of mapped cell lattices to a persistent workspace."""
 
@@ -550,7 +675,21 @@ def accumulate_cells_triton(
         raise ValueError("workspace and mapped nodes must share a CUDA device")
     temporal_frames = 1 if node_x.ndim == 3 else int(node_x.shape[0])
     cells_per_frame = int(node_x.shape[-3])
-    if workspace.frames != temporal_frames:
+    indexed_frames = cell_frame_index is not None
+    if indexed_frames:
+        if node_x.ndim != 3:
+            raise ValueError("indexed raster queues must have shape [cell, v+1, v+1]")
+        cell_frame_index = torch.as_tensor(
+            cell_frame_index, device=node_x.device, dtype=torch.int32
+        ).reshape(-1).contiguous()
+        if cell_frame_index.numel() != cells_per_frame:
+            raise ValueError("cell_frame_index must contain one entry per cell")
+        if cell_frame_index.numel() and bool(
+            torch.any((cell_frame_index < 0) | (cell_frame_index >= workspace.frames))
+        ):
+            raise ValueError("cell_frame_index entries are outside the workspace")
+        temporal_frames = workspace.frames
+    elif workspace.frames != temporal_frames:
         raise ValueError("workspace and mapped nodes must have the same frame count")
     virtual_refinement = int(node_x.shape[-1]) - 1
     if virtual_refinement > 16:
@@ -563,14 +702,43 @@ def accumulate_cells_triton(
     source_pixel_area = float(pixel_size_x) * float(pixel_size_y)
     triangle_count = 2 * virtual_refinement * virtual_refinement
     triangle_block = triton.next_power_of_2(triangle_count)
-    total_cells = temporal_frames * cells_per_frame
+    total_cells = cells_per_frame if indexed_frames else temporal_frames * cells_per_frame
+    frame_ptr = (
+        cell_frame_index
+        if indexed_frames
+        else torch.empty(1, device=node_x.device, dtype=torch.int32)
+    )
+    active_cells = torch.empty(
+        total_cells, device=node_x.device, dtype=torch.int32
+    )
+    active_count = torch.zeros((), device=node_x.device, dtype=torch.int32)
+    _compact_active_triangles_kernel[(total_cells,)](
+        node_x,
+        node_y,
+        active_cells,
+        active_count,
+        total_cells,
+        XMIN=float(xmin),
+        YMIN=float(ymin),
+        INV_PIXEL_X=1.0 / float(pixel_size_x),
+        INV_PIXEL_Y=1.0 / float(pixel_size_y),
+        ROWS=rows,
+        COLUMNS=columns,
+        VIRTUAL_REFINEMENT=virtual_refinement,
+        TRIANGLE_BLOCK=triangle_block,
+        num_warps=1,
+        num_stages=1,
+    )
     _direct_cell_kernel[(total_cells,)](
         node_x,
         node_y,
+        active_cells,
+        active_count,
         workspace.histogram,
         workspace.row_difference,
         total_cells,
         cells_per_frame,
+        frame_ptr,
         XMIN=float(xmin),
         YMIN=float(ymin),
         INV_PIXEL_X=1.0 / float(pixel_size_x),
@@ -580,6 +748,8 @@ def accumulate_cells_triton(
         TRIANGLE_MASS=float(lens_area_per_triangle_uas2) / source_pixel_area,
         TRIANGLE_BLOCK=triangle_block,
         VIRTUAL_REFINEMENT=virtual_refinement,
+        COMPACT_ACTIVE=True,
+        INDEXED_FRAMES=indexed_frames,
         num_warps=max(1, min(8, triangle_block // 32)),
         num_stages=1,
     )
@@ -618,15 +788,3 @@ def rasterize_cells_triton(
         lens_area_per_triangle_uas2=lens_area_per_triangle_uas2,
     )
     return workspace.result()
-
-
-def rasterize_v4_cells_triton(
-    node_x: torch.Tensor,
-    node_y: torch.Tensor,
-    **kwargs,
-) -> torch.Tensor:
-    """Compatibility alias that requires the production ``v=4`` node shape."""
-
-    if tuple(node_x.shape[1:]) != (5, 5):
-        raise ValueError("rasterize_v4_cells_triton requires 5×5 node lattices")
-    return rasterize_cells_triton(node_x, node_y, **kwargs)

@@ -540,6 +540,14 @@ def multirate_streaming_light_curve(
         )
         runtime.synchronize()
         source_seconds += perf_counter() - source_started
+    elif bool(getattr(source, "is_time_static", False)):
+        runtime.synchronize()
+        source_started = perf_counter()
+        factorized_base = source.brightness(
+            flux_times_device[:1], device=device, dtype=dtype
+        )[0]
+        runtime.synchronize()
+        source_seconds += perf_counter() - source_started
 
     def next_map(index: int) -> MagnificationMap:
         nonlocal map_seconds, dynamic_metadata
@@ -717,9 +725,9 @@ def streaming_light_curves(
     times_device = times.to(device=device, dtype=dtype)
 
     centers: list[torch.Tensor] = []
-    offsets: list[tuple[torch.Tensor, torch.Tensor]] = []
+    offsets: list[tuple[torch.Tensor, torch.Tensor] | None] = []
     map_aligned: list[bool] = []
-    groups: dict[tuple[tuple[int, int], int, bool], list[int]] = {}
+    groups: dict[tuple[tuple[int, int], int, bool, bool], list[int]] = {}
     for request_index, request in enumerate(requests):
         trajectory = (
             LinearTrajectory() if request.trajectory is None else request.trajectory
@@ -732,27 +740,28 @@ def streaming_light_curves(
         if position.shape != (times.numel(), 2):
             raise ValueError("trajectory positions must have shape [time, 2]")
         centers.append(position)
-        map_aligned.append(
-            _source_is_map_aligned(
-                request.source,
-                request.distances,
-                request.trajectory,
-                source_grid,
-            )
+        aligned = _source_is_map_aligned(
+            request.source,
+            request.distances,
+            request.trajectory,
+            source_grid,
         )
+        map_aligned.append(aligned)
         offsets.append(
-            _source_offsets_uas(
-                request.source,
-                request.distances,
-                device=device,
-                dtype=dtype,
+            None
+            if aligned
+            else _source_offsets_uas(
+                request.source, request.distances, device=device, dtype=dtype
             )
         )
         key = (
             request.source.geometry.shape,
             len(request.source.geometry.band_names),
             bool(request.strict_coverage),
+            aligned,
         )
+        # Only shape-compatible sources can share a tensor contraction. The
+        # physical models and trajectories within a group may still differ.
         groups.setdefault(key, []).append(request_index)
 
     temporal_batch = resolved_schedule.temporal_batch_size
@@ -802,6 +811,14 @@ def streaming_light_curves(
                 device=device,
                 dtype=dtype,
             )
+        elif bool(getattr(request.source, "is_time_static", False)):
+            factorized_bases[index] = request.source.brightness(
+                times_device[:1], device=device, dtype=dtype
+            )[0]
+    factorized_unlensed = [
+        None if base is None else base.sum(dim=(0, 1))
+        for base in factorized_bases
+    ]
     runtime.synchronize()
     source_seconds += perf_counter() - factorized_started
 
@@ -809,6 +826,7 @@ def streaming_light_curves(
     map_index = -1
 
     def advance_map():
+        # Keep only the bracketing pair needed by the next photometry epoch.
         nonlocal left_map, right_map, map_index, map_seconds, dynamic_metadata
         left_map, right_map = right_map, next(map_iterator)
         map_index += 1
@@ -817,7 +835,7 @@ def streaming_light_curves(
         dynamic_metadata = {
             key: value
             for key, value in right_map.metadata.items()
-            if key.startswith("dynamic_") or key.startswith("dual_scout_")
+            if key.startswith(("dynamic_", "dual_scout_", "cross_system_"))
         }
         if map_observer is not None:
             map_observer(map_index, right_map)
@@ -825,11 +843,19 @@ def streaming_light_curves(
     def sample_frame(frame, active, frame_index):
         if all(map_aligned[index] for index in active):
             return frame.values.unsqueeze(0).expand(len(active), -1, -1)
+        if any(offsets[index] is None for index in active):
+            raise RuntimeError("mixed aligned and sampled sources cannot share a group")
         x_batch = torch.stack(
-            [offsets[index][0] + centers[index][frame_index, 0] for index in active]
+            [
+                offsets[index][0] + centers[index][frame_index, 0]
+                for index in active
+            ]
         )
         y_batch = torch.stack(
-            [offsets[index][1] + centers[index][frame_index, 1] for index in active]
+            [
+                offsets[index][1] + centers[index][frame_index, 1]
+                for index in active
+            ]
         )
         return _sample_map_batch(
             frame, x_batch, y_batch, strict_coverage=requests[active[0]].strict_coverage
@@ -861,38 +887,53 @@ def streaming_light_curves(
                     if left_map is None or weight == 1.0:
                         samples = sample_frame(right_map, active, frame_index)
                     else:
+                        # Interpolate the two map-source contractions, not the
+                        # full maps. This is algebraically equivalent for a
+                        # fixed source frame and avoids a map-sized temporary.
                         samples = sample_frame(left_map, active, frame_index)
                         if weight != 0.0:
                             other = sample_frame(right_map, active, frame_index)
                             samples = samples + weight * (other - samples)
-                    source_frames = torch.stack(
-                        [
-                            (
-                                factorized_bases[index]
-                                if factorized_bases[index] is not None
-                                else brightness[index][local]
-                            )
-                            for index in active
-                        ]
+                    source_items = [
+                        (
+                            factorized_bases[index]
+                            if factorized_bases[index] is not None
+                            else brightness[index][local]
+                        )
+                        for index in active
+                    ]
+                    source_frames = (
+                        source_items[0].unsqueeze(0)
+                        if len(source_items) == 1
+                        else torch.stack(source_items)
                     )
                     lensed = (source_frames * samples[..., None]).sum(dim=(1, 2))
-                    unlensed = source_frames.sum(dim=(1, 2))
-                    modulation = torch.stack(
-                        [
-                            (
-                                factorized_amplitudes[index][frame_index]
-                                if factorized_amplitudes[index] is not None
-                                else torch.ones(
-                                    len(requests[index].source.geometry.band_names),
-                                    device=device,
-                                    dtype=dtype,
-                                )
-                            )
-                            for index in active
-                        ]
+                    unlensed_items = [
+                        (
+                            factorized_unlensed[index]
+                            if factorized_unlensed[index] is not None
+                            else source_items[row].sum(dim=(0, 1))
+                        )
+                        for row, index in enumerate(active)
+                    ]
+                    unlensed = (
+                        unlensed_items[0].unsqueeze(0)
+                        if len(unlensed_items) == 1
+                        else torch.stack(unlensed_items)
                     )
-                    lensed = lensed * modulation
-                    unlensed = unlensed * modulation
+                    if any(factorized_amplitudes[index] is not None for index in active):
+                        modulation = torch.stack(
+                            [
+                                (
+                                    factorized_amplitudes[index][frame_index]
+                                    if factorized_amplitudes[index] is not None
+                                    else torch.ones_like(unlensed_items[row])
+                                )
+                                for row, index in enumerate(active)
+                            ]
+                        )
+                        lensed = lensed * modulation
+                        unlensed = unlensed * modulation
                     runtime.synchronize()
                     convolution_seconds += perf_counter() - convolution_started
                     for row, index in enumerate(active):

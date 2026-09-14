@@ -2408,6 +2408,8 @@ dev = [
     { name = "ruff" },
 ]
 docs = [
+    { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "matplotlib", version = "3.11.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "mkdocs" },
     { name = "mkdocs-material" },
     { name = "mkdocstrings", extra = ["python"] },
@@ -2444,9 +2446,17 @@ science = [
     { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 test = [
+    { name = "astropy", version = "6.1.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "astropy", version = "8.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "hypothesis" },
+    { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "matplotlib", version = "3.11.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 validation = [
     { name = "astropy", version = "6.1.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -2460,6 +2470,7 @@ validation = [
 [package.metadata]
 requires-dist = [
     { name = "astropy", marker = "extra == 'science'", specifier = ">=5.3" },
+    { name = "astropy", marker = "extra == 'test'", specifier = ">=5.3" },
     { name = "astropy", marker = "extra == 'validation'", specifier = ">=5.3" },
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.2" },
     { name = "caustics", marker = "python_full_version >= '3.11' and extra == 'macro'", specifier = ">=1.7" },
@@ -2468,8 +2479,10 @@ requires-dist = [
     { name = "ipywidgets", marker = "extra == 'notebooks'", specifier = ">=8" },
     { name = "jupyterlab", marker = "extra == 'notebooks'", specifier = ">=4" },
     { name = "lenstronomy", marker = "extra == 'validation'", specifier = ">=1.11" },
+    { name = "matplotlib", marker = "extra == 'docs'", specifier = ">=3.7" },
     { name = "matplotlib", marker = "extra == 'notebooks'", specifier = ">=3.7" },
     { name = "matplotlib", marker = "extra == 'plot'", specifier = ">=3.7" },
+    { name = "matplotlib", marker = "extra == 'test'", specifier = ">=3.7" },
     { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6" },
     { name = "mkdocs-material", marker = "extra == 'docs'", specifier = ">=9.5" },
     { name = "mkdocstrings", extras = ["python"], marker = "extra == 'docs'", specifier = ">=0.25" },
@@ -2486,7 +2499,9 @@ requires-dist = [
     { name = "scipy", marker = "extra == 'macro'", specifier = ">=1.10" },
     { name = "scipy", marker = "extra == 'notebooks'", specifier = ">=1.10" },
     { name = "scipy", marker = "extra == 'science'", specifier = ">=1.10" },
+    { name = "scipy", marker = "extra == 'test'", specifier = ">=1.10" },
     { name = "scipy", marker = "extra == 'validation'", specifier = ">=1.10" },
+    { name = "tomli", marker = "python_full_version < '3.11' and extra == 'test'", specifier = ">=2" },
     { name = "torch", specifier = ">=2.4" },
 ]
 provides-extras = ["plot", "science", "macro", "notebooks", "docs", "test", "validation", "dev"]

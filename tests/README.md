@@ -104,7 +104,7 @@ The test therefore compares winding modulo two, which is independent of curve
 orientation. Raw signed winding integers require a shared determinant-side
 orientation convention and are not asserted across the two codes.
 
-Repository maintainers can additionally run the root-level legacy parity
+Repository maintainers can additionally run the root-level reference parity
 harness against the pre-package monolith. It is intentionally outside this
 installable package and is not part of the user-facing source distribution.
 

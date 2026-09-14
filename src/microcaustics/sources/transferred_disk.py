@@ -7,9 +7,21 @@ from dataclasses import dataclass
 
 import torch
 
-from ..relativity import ObserverTransfer
+from ..relativity import ObserverTransfer, kerr_isco_radius
 from .base import SourceGeometry, _as_times
-from .thin_disk import _C, _H, _K_B, thin_disk_temperature4
+from .thin_disk import (
+    _C,
+    _H,
+    _K_B,
+    _NOVIKOV_THORNE,
+    RadiativeEfficiency,
+    ViscousFluxProfile,
+    _prescription_metadata,
+    _prescription_name,
+    _radiative_efficiency,
+    _validate_viscous_prescriptions,
+    thin_disk_temperature4,
+)
 
 
 def _transferred_brightness_from_temperature4(
@@ -62,7 +74,7 @@ def _transferred_brightness_from_temperature4(
 
 @dataclass(frozen=True)
 class TransferredThinDiskSource:
-    """A Page--Thorne disk seen through a supplied observer transfer.
+    """A physical thin disk seen through a supplied observer transfer.
 
     The transfer may come from the package's analytic Kerr tracer, SIM5, or a
     user backend, as long as it obeys the one-pixel observer-transfer contract.
@@ -78,10 +90,16 @@ class TransferredThinDiskSource:
     source_redshift: float | torch.Tensor
     color_correction: float | torch.Tensor = 1.0
     temperature_slope_beta: float | torch.Tensor = 0.75
+    viscous_flux_profile: ViscousFluxProfile = _NOVIKOV_THORNE
+    radiative_efficiency: RadiativeEfficiency = None
     name: str = "transferred_thin_disk"
     is_time_static: bool = True
 
     def __post_init__(self) -> None:
+        _validate_viscous_prescriptions(
+            self.viscous_flux_profile,
+            self.radiative_efficiency,
+        )
         if self.transfer.shape != self.geometry.shape:
             raise ValueError("observer transfer and source geometry shapes must match")
         for name in (
@@ -127,6 +145,8 @@ class TransferredThinDiskSource:
             eddington_ratio=self.eddington_ratio,
             spin=self.spin,
             temperature_slope_beta=self.temperature_slope_beta,
+            viscous_flux_profile=self.viscous_flux_profile,
+            radiative_efficiency=self.radiative_efficiency,
         )
         return _transferred_brightness_from_temperature4(
             temperature4,
@@ -178,6 +198,23 @@ class TransferredThinDiskSource:
             "source_redshift": scalar(self.source_redshift),
             "color_correction": scalar(self.color_correction),
             "temperature_slope_beta": scalar(self.temperature_slope_beta),
+            "viscous_flux_profile": _prescription_name(
+                self.viscous_flux_profile
+            ),
+            "viscous_flux_profile_metadata": _prescription_metadata(
+                self.viscous_flux_profile
+            ),
+            "radiative_efficiency": float(
+                _radiative_efficiency(
+                    self.radiative_efficiency,
+                    self.viscous_flux_profile,
+                    torch.as_tensor(self.spin, dtype=torch.float64),
+                    kerr_isco_radius(torch.as_tensor(self.spin, dtype=torch.float64)),
+                )
+            ),
+            "radiative_efficiency_prescription": _prescription_name(
+                self.radiative_efficiency
+            ),
             "brightness_units": "Jy m^-2 projected source plane",
             "integrated_flux_units": "Jy",
             "observer_transfer": dict(self.transfer.metadata),

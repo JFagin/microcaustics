@@ -13,14 +13,13 @@ from .far_field import (
     temporal_taylor_far_fields,
 )
 from .ipm import (
-    biquadratic_nodes,
     full_field_ipm,
     interpolated_nodes,
     rasterize_triangles_exact_eager,
     temporal_batch_ipm,
     triangles_from_node_lattices,
 )
-from .irs import uniform_grid_irs
+from .irs import inverse_ray_shooting
 from .taylor import (
     complex_taylor_coefficients,
     evaluate_complex_taylor,
@@ -32,8 +31,7 @@ __all__ = [
     "DirectRaytraceDiagnostics",
     "jacobian_determinant_direct",
     "raytrace_direct",
-    "uniform_grid_irs",
-    "biquadratic_nodes",
+    "inverse_ray_shooting",
     "interpolated_nodes",
     "full_field_ipm",
     "temporal_batch_ipm",

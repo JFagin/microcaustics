@@ -23,15 +23,36 @@ CUDA/Triton, compiled or eager PyTorch, CPU, and Apple devices. Accelerated
 specializations are implementation details and always retain a portable
 correctness path.
 
+## High-level system facade
+
+`microcaustics.system` remains the stable home of `MicrolensingSystem`,
+`MicrolensingRealization`, and `IntegrationDomain`. Cohesive implementation
+details live in the private `microcaustics._system` package:
+
+
+- `scheduling` resolves cadences, numerical controls, dynamic defaults,
+  retained-map observers, and light-curve dispatch;
+- `geometry` derives source and lens-plane regions; and
+- `coordinates` handles coordinate-basis transformations and point-lens
+  motion diagnostics.
+
+Application code should continue importing the public classes from
+`microcaustics`. The private modules exist to keep the facade readable and
+to let batching and multi-image orchestration reuse policy without importing
+it indirectly through the public system class module.
+
 ## Migration rule
 
 Production code is extracted one component at a time. An extracted component
 must match deterministic fixtures from the final paper pipeline before the
-legacy runner is changed to import it. After that change, the package version
+reference runner is changed to import it. After that change, the package version
 becomes the sole implementation so the paper and public APIs cannot drift.
 
 The installed package does not contain abandoned experimental algorithms,
-paper figure builders, benchmark output, or external comparison binaries.
+generated benchmark output, or external comparison binaries. Maintained,
+publication-oriented figure builders that operate on public result objects are
+part of the optional `microcaustics.plotting` interface so notebooks and papers
+share one tested plotting implementation.
 
 ## Migrated production components
 

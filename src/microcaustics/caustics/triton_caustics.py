@@ -993,3 +993,84 @@ def batched_sparse_marching_squares_zero_triton(
     if return_flat:
         return (*rows, segments, boundaries, frame_indices, tuple(map(int, totals_cpu)))
     return rows
+
+
+def ragged_sparse_marching_squares_zero_triton(
+    f0: torch.Tensor,
+    f1: torch.Tensor,
+    f2: torch.Tensor,
+    f3: torch.Tensor,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    y0: torch.Tensor,
+    y1: torch.Tensor,
+    edge_boundary: torch.Tensor,
+    cell_frame_index: torch.Tensor,
+    frame_count: int,
+):
+    """Compact variable-length temporal cell queues in one Triton launch."""
+
+    if not triton_caustics_available() or f0.device.type != "cuda":
+        raise RuntimeError("ragged Triton sparse marching squares is unavailable")
+    if f0.dtype != torch.float32 or f0.ndim != 1:
+        raise ValueError("ragged sparse marching requires flat CUDA float32 fields")
+    values = tuple(item.contiguous() for item in (f0, f1, f2, f3))
+    coordinates = tuple(item.contiguous() for item in (x0, x1, y0, y1))
+    frames = cell_frame_index.to(device=f0.device, dtype=torch.int64).contiguous()
+    cells = int(f0.numel())
+    counts = torch.empty(cells, device=f0.device, dtype=torch.int32)
+    block = 256
+    if cells:
+        _sparse_marching_counts[(triton.cdiv(cells, block),)](
+            *values,
+            counts,
+            cells,
+            BLOCK=block,
+            num_warps=8,
+        )
+    offsets = torch.cumsum(counts, dim=0, dtype=torch.int64) - counts
+    frame_totals = torch.zeros(frame_count, device=f0.device, dtype=torch.int64)
+    frame_totals.scatter_add_(0, frames, counts.to(torch.int64))
+    totals_cpu = tuple(map(int, frame_totals.detach().cpu().tolist()))
+    total = sum(totals_cpu)
+    segments = torch.empty((total, 2, 2), device=f0.device, dtype=f0.dtype)
+    boundaries = torch.empty((total, 2), device=f0.device, dtype=torch.bool)
+    if total:
+        tables = _marching_tables(f0.device)
+        pair_a, pair_b = tables[:2]
+        positive_a, positive_b = tables[3], tables[2]
+        negative_a, negative_b = tables[5], tables[4]
+        _sparse_marching_write[(triton.cdiv(cells, block),)](
+            *values,
+            *coordinates,
+            edge_boundary.to(device=f0.device, dtype=torch.bool).contiguous(),
+            offsets,
+            pair_a,
+            pair_b,
+            positive_a,
+            positive_b,
+            negative_a,
+            negative_b,
+            segments,
+            boundaries,
+            counts,
+            cells,
+            cells,
+            EPS=1.0e-12,
+            BLOCK=block,
+            STORE_FRAMES=False,
+            num_warps=8,
+        )
+    segment_frames = torch.repeat_interleave(
+        torch.arange(frame_count, device=f0.device, dtype=torch.int32),
+        frame_totals,
+        output_size=total,
+    )
+    return (
+        tuple(segments.split(totals_cpu)),
+        tuple(boundaries.split(totals_cpu)),
+        segments,
+        boundaries,
+        segment_frames,
+        totals_cpu,
+    )

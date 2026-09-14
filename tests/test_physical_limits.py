@@ -178,6 +178,33 @@ class TransferFunctionLimitTests(unittest.TestCase):
         )
         product = mc.steady_transfer_function(source, edges)
 
+        magnifications = torch.stack(
+            (torch.ones_like(radius), torch.full_like(radius, 2.0))
+        )
+        batched = source.batched_transfer_function(
+            edges,
+            magnification=magnifications,
+            spatial_chunk_size=1_000,
+        )
+        sequential = torch.stack(
+            [
+                source.transfer_function(edges, magnification=magnification)
+                for magnification in magnifications
+            ]
+        )
+        torch.testing.assert_close(batched, sequential)
+        batched_means = source.batched_mean_response_delays(
+            magnification=magnifications,
+            spatial_chunk_size=1_000,
+        )
+        sequential_means = torch.stack(
+            [
+                source.mean_response_delays(magnification=magnification)
+                for magnification in magnifications
+            ]
+        )
+        torch.testing.assert_close(batched_means, sequential_means)
+
         self.assertAlmostEqual(float(product.values[:, 0].sum()), 1.0, places=14)
         nonzero = torch.nonzero(product.values[:, 0] > 0.0).reshape(-1)
         self.assertEqual(int(nonzero[0]), 0)
@@ -185,6 +212,33 @@ class TransferFunctionLimitTests(unittest.TestCase):
 
         weights = source.linear_response_weights(dtype=dtype)[..., 0]
         direct_mean = (weights[hit] * analytic_delay[hit]).sum() / weights[hit].sum()
+        exact_mean = mc.steady_mean_response_delays(source)
+        torch.testing.assert_close(exact_mean[0], direct_mean)
+        unit_map = mc.MagnificationMap(
+            torch.ones((5, 5), dtype=dtype),
+            mc.PlaneGrid((5, 5), (2.0, 2.0)),
+            method="unit_test_map",
+        )
+        microlensed_mean = mc.microlensed_mean_response_delays(
+            source,
+            unit_map,
+            mc.LensingDistances(1.0e25, 2.0e25, 1.0e25),
+        )
+        torch.testing.assert_close(microlensed_mean, exact_mean)
+        microlensed_batch = mc.microlensed_mean_response_delays_batch(
+            source,
+            (unit_map, unit_map),
+            mc.LensingDistances(1.0e25, 2.0e25, 1.0e25),
+            spatial_chunk_size=1_000,
+        )
+        torch.testing.assert_close(
+            microlensed_batch,
+            exact_mean.expand(2, -1),
+        )
+        with torch.no_grad():
+            first = source.linear_response_weights(dtype=dtype)
+            second = source.linear_response_weights(dtype=dtype)
+        self.assertIs(first, second)
         bin_width = edges[1] - edges[0]
         self.assertLess(
             abs(float(product.mean_delays_days[0] - direct_mean)),

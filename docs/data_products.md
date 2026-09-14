@@ -35,6 +35,17 @@ provenance.
 common products. FITS integrates with astronomy tools. Chunked HDF5 or Zarr is
 preferable for long sequences. Serialization is always explicit.
 
+Dataset generation can write directly from `batched_system_light_curves`.
+Passing a directory creates flat files named by system and image, plus one
+`manifest.json`; passing a filename ending in `.npz` creates a single archive
+with the manifest embedded. In both cases the returned batch index provides
+`load_system(index)` and preserves multi-image names, ordering, arrival delays,
+and metadata. Flat files are convenient for partial reruns and parallel
+consumers, while the combined archive avoids thousands of filesystem entries.
+For interrupted flat output, `resume=True` reuses systems with all expected
+image files and regenerates incomplete systems. Combined archives are written
+to a temporary file and atomically moved into place only after finalization.
+
 Light-curve archives preserve physical Jy fluxes and, when requested, the
 source-center labels, crossing flags, distances, censoring flags, and separate
 label epochs. After loading, use `result.labels.times_days` for that time axis.
@@ -42,8 +53,8 @@ It need not match the finer photometry cadence in `result.times_days`.
 
 Full caustic geometry and retained magnification maps are not included in the
 compact light-curve archive. Loaded labels have `caustics=None`. Save retained
-maps separately with `save_magnification_map`. Older photometry-only archives
-remain readable and return `labels=None`.
+maps separately with `save_magnification_map`. Archives use an explicit schema
+version and unsupported or unversioned layouts are rejected.
 
 See `examples/notebooks/workflows/03_streaming_and_exporting_results.ipynb` for
 selective retention, portable NPZ round trips, and optional FITS export.

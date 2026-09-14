@@ -627,22 +627,27 @@ def test_labelled_archive_round_trip_preserves_sparse_center_series(tmp_path, dt
             getattr(restored.labels, name), getattr(labels, name), rtol=0, atol=0
         )
     assert restored.labels.caustics is None and not restored.maps
-    # Old photometry-only archives are readable without fabricating labels.
+    # Missing schema metadata is rejected instead of guessing an old format.
     with np.load(tmp_path / "curve.npz") as data:
-        legacy = {
+        no_schema = {
             key: data[key]
-            for key in (
-                "times_days",
-                "flux",
-                "unlensed_flux",
-                "has_unlensed",
-                "band_names",
-                "metadata_json",
-            )
+            for key in data.files
+            if key != "schema_version"
         }
-    np.savez(tmp_path / "legacy.npz", **legacy)
-    assert mc.load_light_curve(tmp_path / "legacy.npz").labels is None
-    np.savez(tmp_path / "broken.npz", **legacy, has_labels=True)
+    np.savez(tmp_path / "no_schema.npz", **no_schema)
+    with pytest.raises(ValueError, match="unsupported.*schema_version"):
+        mc.load_light_curve(tmp_path / "no_schema.npz")
+    broken = {
+        key: value
+        for key, value in no_schema.items()
+        if not key.startswith("labels_") and key != "has_labels"
+    }
+    np.savez(
+        tmp_path / "broken.npz",
+        **broken,
+        schema_version=np.asarray(1),
+        has_labels=True,
+    )
     with pytest.raises(ValueError, match="missing label arrays"):
         mc.load_light_curve(tmp_path / "broken.npz")
 

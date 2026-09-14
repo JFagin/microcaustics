@@ -53,7 +53,7 @@ class MacroImageConfig:
             raise ValueError("macroimage name must be a non-empty string")
         if not math.isfinite(float(self.arrival_time_delay_days)):
             raise ValueError("arrival_time_delay_days must be finite")
-        if not isinstance(self.method, (IPMConfig, IRSConfig)):
+        if not isinstance(self.method, IPMConfig | IRSConfig):
             raise TypeError("method must be an IPMConfig or IRSConfig")
         if self.caustic_config is not None and self.lens_grid is None:
             raise ValueError("caustic_config requires lens_grid")
@@ -452,6 +452,8 @@ class MultiImageSimulation:
         *,
         normalize: bool = True,
         map_observers: Mapping[str, Callable] | None = None,
+        response_batch_size: int | None = None,
+        response_spatial_chunk_size: int = 262_144,
     ) -> MultiImageTransferFunctions:
         """Generate microlensing-weighted response functions per image.
 
@@ -460,10 +462,7 @@ class MultiImageSimulation:
         so known or model-derived inter-image delays remain interchangeable.
         """
 
-        from time import perf_counter
-
-        from .photometry import _sample_map, _source_offsets_uas
-        from .trajectories import LinearTrajectory
+        from .transfer_functions import streaming_microlensed_transfer_functions
 
         self._validate_time_mapping(map_times_days)
         observers = {} if map_observers is None else dict(map_observers)
@@ -485,82 +484,41 @@ class MultiImageSimulation:
             image_times = _times_for_image(map_times_days, image.name)
             runtime = image.simulation.runtime
             device, dtype = runtime.device, runtime.dtype
-            times = torch.as_tensor(image_times, device=device, dtype=dtype)
-            trajectory = (
-                LinearTrajectory()
-                if image.trajectory is None
-                else image.trajectory
-            )
-            centers = trajectory.position_uas(times, device=device, dtype=dtype)
-            offset_x, offset_y = _source_offsets_uas(
+            series = streaming_microlensed_transfer_functions(
+                image.simulation,
+                image.lens_region,
+                image.source_grid,
+                image_times,
                 source,
                 distances,
-                device=device,
-                dtype=dtype,
+                edges,
+                method=image.method,
+                trajectory=image.trajectory,
+                schedule=image.schedule,
+                strict_coverage=image.strict_coverage,
+                normalize=normalize,
+                map_observer=observers.get(image.name),
+                response_batch_size=response_batch_size,
+                response_spatial_chunk_size=response_spatial_chunk_size,
             )
-            values = []
-            means = []
-            observer = observers.get(image.name)
-            runtime.synchronize(detailed=False)
-            started = perf_counter()
-            for index, magnification_map in enumerate(
-                image.simulation.dynamic_maps(
-                    image.lens_region,
-                    image.source_grid,
-                    image_times,
-                    method=image.method,
-                    schedule=image.schedule,
-                )
-            ):
-                if observer is not None:
-                    observer(index, magnification_map)
-                magnification = _sample_map(
-                    magnification_map,
-                    offset_x + centers[index, 0],
-                    offset_y + centers[index, 1],
-                    strict_coverage=image.strict_coverage,
-                )
-                response = source.transfer_function(
-                    edges,
-                    magnification=magnification,
-                    normalize=normalize,
-                )
-                response_edges = edges.to(
-                    device=response.device,
-                    dtype=response.dtype,
-                )
-                centers_days = 0.5 * (
-                    response_edges[:-1] + response_edges[1:]
-                )
-                normalizer = response.sum(dim=0).clamp_min(1.0e-30)
-                mean = (response * centers_days[:, None]).sum(dim=0) / normalizer
-                values.append(response)
-                means.append(mean)
-            runtime.synchronize(detailed=False)
-            elapsed = perf_counter() - started
             outputs.append(
                 MacroImageTransferFunctions(
                     image_name=image.name,
                     arrival_time_delay_days=image.arrival_time_delay_days,
-                    map_times_days=times,
+                    map_times_days=series.times_days,
                     delay_edges_days=edges.to(device=device, dtype=dtype),
-                    values=torch.stack(values),
-                    mean_delays_days=torch.stack(means),
+                    values=series.values,
+                    mean_delays_days=series.mean_delays_days,
                     band_names=source.geometry.band_names,
                     metadata={
-                        "method": "microlensing_weighted_transfer_function",
-                        "normalization": "per_band" if normalize else "none",
-                        "source": dict(source.metadata()),
+                        **series.metadata,
                         "trajectory_time_convention": "observer_time",
                         "arrival_delay_applied_to_response_bins": False,
                     },
-                    timing=TimingBreakdown(
-                        collected=runtime.profiling_enabled,
-                        steady_seconds=elapsed,
-                    ),
+                    timing=series.timing,
                 )
             )
-            component_seconds[image.name] = elapsed
+            component_seconds[image.name] = series.timing.steady_seconds
         total_seconds = sum(component_seconds.values())
         return MultiImageTransferFunctions(
             tuple(outputs),

@@ -1,7 +1,7 @@
 # Thin disks and relativistic source calculations
 
 `ThinDiskModel` specifies a physical, static continuum disk implementing the same
-signed-spin ISCO, Page--Thorne radial dissipation, color correction, and
+signed-spin ISCO, Novikov--Thorne radial dissipation, color correction, and
 observed-frequency convention as the validated paper implementation. It is an
 object that chooses its own pixel grid. Its resolved source can be used with
 IRS, IPM, external maps, or without microlensing.
@@ -26,9 +26,9 @@ observer-frame angstroms and may describe any filters.
 The two currently published modes are explicit:
 
 - `relativity="none"` uses no photon frequency shift while retaining the
-  Page--Thorne radial flux profile.
+  selected radial flux profile.
 - `relativity="approximate"` adds the straight-screen circular-orbit
-  gravitational/Doppler shift used by the legacy approximation.
+  gravitational/Doppler shift used by the straight-screen approximation.
 
 Neither option is mislabeled as full GR. For ordinary full-GR calculations,
 `KerrDiskModel` owns the mutually consistent observer screen, primary-image
@@ -59,6 +59,63 @@ disk = mc.KerrDiskModel(
 )
 source = disk.pixelate(source_redshift=1.695, H0=70.0, Om0=0.3)
 ```
+
+## Viscous flux profiles and radiative efficiency
+
+`ThinDiskModel` and `KerrDiskModel` use the relativistic Novikov--Thorne
+profile by default. The Shakura--Sunyaev profile is also built in:
+
+```python
+disk = mc.KerrDiskModel(
+    black_hole_mass_solar=1.0e9,
+    eddington_ratio=0.1,
+    bands_angstrom={"g": 4800.0, "i": 7500.0},
+    viscous_flux_profile="shakura-sunyaev",
+)
+```
+
+When `radiative_efficiency=None`, each built-in profile uses its corresponding
+analytic efficiency. It may instead be set explicitly to
+`"novikov-thorne"`, `"shakura-sunyaev"`, a scalar in `(0, 1]`, or a callable
+of `(spin, isco_rg)`.
+
+Custom profiles are callables of `(radius_rg, spin, isco_rg)`. Additional
+parameters belong to the callable itself, so the package interface does not
+need a new keyword for every physical model:
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class WindSuppressedFlux:
+    wind_index: float
+    transition_rg: float
+    name: str = "wind-suppressed"
+
+    def __call__(self, radius_rg, spin, isco_rg):
+        base = mc.shakura_sunyaev_flux_factor(radius_rg, spin, isco_rg)
+        return base * (1 + radius_rg / self.transition_rg) ** (-self.wind_index)
+
+    def metadata(self):
+        return {
+            "wind_index": self.wind_index,
+            "transition_rg": self.transition_rg,
+        }
+
+disk = mc.ThinDiskModel(
+    black_hole_mass_solar=1.0e9,
+    eddington_ratio=0.1,
+    bands_angstrom={"g": 4800.0, "i": 7500.0},
+    viscous_flux_profile=WindSuppressedFlux(0.35, 50.0),
+    radiative_efficiency=0.1,
+)
+```
+
+The optional `name` and `metadata()` members are recorded in the resolved
+source metadata for reproducibility. They are not required for evaluation.
+The existing `temperature_slope_beta` remains a separate radial-temperature
+tilt whose normalization preserves the selected profile's bolometric viscous
+power.
 
 Omit `driving_signal` for a static relativistic disk. Use
 `disk.with_driving_signal(signal)` to retain every other choice. Resolution,
@@ -113,7 +170,7 @@ model. The next section documents that advanced interface.
 stores package-standard `[y, x]` maps of emission radius, frequency shift,
 observer solid angle, hit status, and optional relative delay and emission
 azimuth. `TransferredThinDiskSource` converts any compatible transfer into a
-physical Page--Thorne source:
+physical thin-disk source:
 
 ```python
 import torch
@@ -173,8 +230,8 @@ azimuth remain available for reverberation and non-axisymmetric extensions,
 but axisymmetric static brightness does not pay to recompute them.
 
 Choose the observer-screen extent from the emission model rather than an
-unrelated plotting constant. `thin_disk_flux_radius_rg` evaluates the
-Page--Thorne profile, optional axial-lamp heating, the reddest requested
+unrelated plotting constant. `thin_disk_flux_radius_rg` evaluates the selected
+viscous profile, optional axial-lamp heating, the reddest requested
 rest-frame wavelength, and a configurable enclosed-flux fraction:
 
 ```python
@@ -235,7 +292,7 @@ variable_disk = mc.ThermalReprocessingSource.from_axis_lamppost(
 `ObserverScreen.rotated` applies the position-angle convention without
 reimplementing coordinate algebra. `height_above_isco_rg` is converted with
 the package Kerr ISCO calculation. Supplying `lamp_fraction` evaluates the
-Novikov--Thorne radiative efficiency and the corresponding heating
+selected profile's radiative efficiency and corresponding heating
 normalization internally. The lower-level `source_height_rg` and
 `irradiation_efficiency` arguments remain available for externally specified
 models.
@@ -249,6 +306,11 @@ device, dtype, launch resolution, quadrature order, and compile mode. The ray
 result records `compile_warmup_s` separately from steady execution time, and a
 failed compiler toolchain falls back to the numerically identical eager path
 unless `fallback_to_eager=False` is requested.
+
+Compilation warnings are enabled by default. Set `warn_on_compile=False` on
+`KerrDiskModel`, `trace_primary_equatorial`, or `axis_lamppost_profile` to
+suppress them; a runtime with `RuntimeConfig(warn_on_compile=False)` also
+suppresses compilation warnings during high-level Kerr source construction.
 
 `ObserverScreen` uses pixel-center sampling and calculates each pixel's true
 solid angle from its impact-parameter extent, physical gravitational radius,
@@ -276,6 +338,8 @@ matches the validated paper coordinates to floating-point rounding on the
 frozen regression fixture.
 
 Low-level differentiable functions are available from
-`microcaustics.relativity` provides `kerr_isco_radius`, `page_thorne_flux_factor`,
-`circular_disk_gfactor`, `circular_disk_zamo_lorentz_factor`, and the explicitly
-named approximate frequency shift.
+`microcaustics.relativity`, including `kerr_isco_radius`,
+`novikov_thorne_flux_factor`, `shakura_sunyaev_flux_factor`, their analytic
+radiative efficiencies, `circular_disk_gfactor`,
+`circular_disk_zamo_lorentz_factor`, and the explicitly named approximate
+frequency shift.

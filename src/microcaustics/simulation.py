@@ -149,9 +149,9 @@ class MicrolensingSimulation:
         """
 
         if isinstance(method, IRSConfig):
-            from .solvers import uniform_grid_irs
+            from .solvers import inverse_ray_shooting
 
-            return uniform_grid_irs(
+            return inverse_ray_shooting(
                 self,
                 lens_region,
                 source_grid,
@@ -564,6 +564,8 @@ class MicrolensingSimulation:
         driver_amplitude: float = 1.0,
         normalize: bool = True,
         map_observer=None,
+        response_batch_size: int | None = None,
+        response_spatial_chunk_size: int = 262_144,
     ):
         """Stream dynamic maps into microlensing-weighted transfer functions.
 
@@ -588,4 +590,6 @@ class MicrolensingSimulation:
             driver_amplitude=driver_amplitude,
             normalize=normalize,
             map_observer=map_observer,
+            response_batch_size=response_batch_size,
+            response_spatial_chunk_size=response_spatial_chunk_size,
         )

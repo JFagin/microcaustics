@@ -60,17 +60,34 @@ def kerr_isco_radius(spin) -> torch.Tensor:
     return torch.where(spin.abs() < central_width, central, exact)
 
 
-def kerr_radiative_efficiency(spin) -> torch.Tensor:
+def novikov_thorne_radiative_efficiency(spin, isco_rg=None) -> torch.Tensor:
     """Return the Novikov--Thorne efficiency at the equatorial Kerr ISCO.
 
     The expression ``1 - sqrt(1 - 2 / (3 r_ISCO))`` is evaluated with the
     same differentiable ISCO convention as :func:`kerr_isco_radius`.
     """
 
-    radius = kerr_isco_radius(spin)
+    spin = _floating_tensor(spin)
+    if isco_rg is None:
+        radius = kerr_isco_radius(spin)
+    else:
+        radius = torch.as_tensor(isco_rg, device=spin.device, dtype=spin.dtype)
+        spin, radius = torch.broadcast_tensors(spin, radius)
     return 1.0 - torch.sqrt(
         (1.0 - 2.0 / (3.0 * radius)).clamp_min(0.0)
     )
+
+
+def shakura_sunyaev_radiative_efficiency(spin, isco_rg=None) -> torch.Tensor:
+    """Return the Newtonian thin-disk efficiency for a zero-torque ISCO."""
+
+    spin = _floating_tensor(spin)
+    if isco_rg is None:
+        radius = kerr_isco_radius(spin)
+    else:
+        radius = torch.as_tensor(isco_rg, device=spin.device, dtype=spin.dtype)
+        spin, radius = torch.broadcast_tensors(spin, radius)
+    return 0.5 / radius
 
 
 def lamppost_source_height_rg(spin, height_above_isco_rg) -> torch.Tensor:
@@ -155,7 +172,7 @@ def approximate_circular_disk_gfactor(
     """Straight-screen approximation to the circular-disk frequency shift.
 
     This retains gravitational and orbital Doppler shifts but does not bend
-    photon trajectories. It matches the legacy package's ``gr_mode='approx'``
+    photon trajectories. It implements the straight-screen approximation's
     convention and is explicitly distinct from full Kerr ray tracing.
     """
 
@@ -196,8 +213,8 @@ def approximate_circular_disk_gfactor(
     )
 
 
-def page_thorne_flux_factor(radius_rg, spin, isco_rg=None) -> torch.Tensor:
-    """Return the dimensionless Page--Thorne surface-flux factor.
+def novikov_thorne_flux_factor(radius_rg, spin, isco_rg=None) -> torch.Tensor:
+    """Return the dimensionless Novikov--Thorne surface-flux factor.
 
     The Schwarzschild limit is evaluated analytically. A centered continuation
     through a narrow interval around zero spin preserves finite derivatives.
@@ -262,4 +279,31 @@ def page_thorne_flux_factor(radius_rg, spin, isco_rg=None) -> torch.Tensor:
         radius > isco,
         result.clamp_min(0.0),
         torch.zeros_like(result),
+    )
+
+
+def shakura_sunyaev_flux_factor(radius_rg, spin, isco_rg=None) -> torch.Tensor:
+    """Return the dimensionless Shakura--Sunyaev surface-flux factor.
+
+    The zero-torque inner boundary is the equatorial Kerr ISCO associated
+    with ``spin`` unless ``isco_rg`` is supplied explicitly. Values at and
+    inside the ISCO are exactly zero.
+    """
+
+    radius = _floating_tensor(radius_rg)
+    spin = torch.as_tensor(spin, device=radius.device, dtype=radius.dtype)
+    radius, spin = torch.broadcast_tensors(radius, spin)
+    if isco_rg is None:
+        isco = kerr_isco_radius(spin)
+    else:
+        isco = torch.as_tensor(isco_rg, device=radius.device, dtype=radius.dtype)
+        isco = torch.broadcast_to(isco, radius.shape)
+    safe_radius = radius.clamp_min(torch.finfo(radius.dtype).tiny)
+    factor = safe_radius.pow(-3.0) * (
+        1.0 - torch.sqrt((isco / safe_radius).clamp_min(0.0))
+    )
+    return torch.where(
+        radius > isco,
+        factor.clamp_min(0.0),
+        torch.zeros_like(factor),
     )

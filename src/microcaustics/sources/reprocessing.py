@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
-from ..relativity import ObserverTransfer
-from ..relativity.kerr import kerr_radiative_efficiency
+from ..relativity import ObserverTransfer, kerr_isco_radius
 from ..relativity.lamppost import AxisLamppostProfile
 from .base import SourceGeometry, _as_times
 from .thin_disk import (
@@ -18,7 +17,14 @@ from .thin_disk import (
     _H,
     _K_B,
     _M_SUN,
+    _NOVIKOV_THORNE,
+    RadiativeEfficiency,
+    ViscousFluxProfile,
+    _prescription_metadata,
+    _prescription_name,
+    _radiative_efficiency,
     _thin_disk_temperature4_coefficient,
+    _validate_viscous_prescriptions,
     thin_disk_temperature4,
 )
 from .transferred_disk import _transferred_brightness_from_temperature4
@@ -29,6 +35,9 @@ def lamppost_irradiation_efficiency(
     lamp_fraction: float,
     eddington_ratio: float,
     spin,
+    *,
+    viscous_flux_profile: ViscousFluxProfile = _NOVIKOV_THORNE,
+    radiative_efficiency: RadiativeEfficiency = None,
 ) -> torch.Tensor:
     """Return the dimensionless lamppost heating normalization.
 
@@ -36,18 +45,24 @@ def lamppost_irradiation_efficiency(
     assigned to the lamppost. Dividing by the Eddington ratio converts that
     fraction to the temperature-scale normalization used by
     :meth:`ThermalReprocessingSource.from_axis_lamppost`. The radiative
-    efficiency is evaluated self-consistently at the Kerr ISCO.
+    efficiency follows the selected viscous profile unless it is overridden.
     """
 
     if not math.isfinite(float(lamp_fraction)) or float(lamp_fraction) < 0.0:
         raise ValueError("lamp_fraction must be finite and non-negative")
     if not math.isfinite(float(eddington_ratio)) or float(eddington_ratio) <= 0.0:
         raise ValueError("eddington_ratio must be finite and positive")
-    return (
-        float(lamp_fraction)
-        * kerr_radiative_efficiency(spin)
-        / float(eddington_ratio)
+    spin_tensor = torch.as_tensor(spin)
+    if not spin_tensor.is_floating_point():
+        spin_tensor = spin_tensor.to(torch.get_default_dtype())
+    isco = kerr_isco_radius(spin_tensor)
+    efficiency = _radiative_efficiency(
+        radiative_efficiency,
+        viscous_flux_profile,
+        spin_tensor,
+        isco,
     )
+    return float(lamp_fraction) * efficiency / float(eddington_ratio)
 
 
 @dataclass(frozen=True)
@@ -72,11 +87,23 @@ class ThermalReprocessingSource:
     source_redshift: float | torch.Tensor
     color_correction: float | torch.Tensor = 1.0
     temperature_slope_beta: float | torch.Tensor = 0.75
+    viscous_flux_profile: ViscousFluxProfile = _NOVIKOV_THORNE
+    radiative_efficiency: RadiativeEfficiency = None
     name: str = "thermal_reprocessing"
     heating_metadata: Mapping[str, object] | None = None
     is_time_static: bool = False
+    _linear_response_cache: dict = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
+        _validate_viscous_prescriptions(
+            self.viscous_flux_profile,
+            self.radiative_efficiency,
+        )
         if self.transfer.shape != self.geometry.shape:
             raise ValueError("observer transfer and source geometry shapes must match")
         response = torch.as_tensor(self.response_temperature4)
@@ -146,6 +173,8 @@ class ThermalReprocessingSource:
         source_redshift,
         irradiation_efficiency: float | None = None,
         lamp_fraction: float | None = None,
+        viscous_flux_profile: ViscousFluxProfile = _NOVIKOV_THORNE,
+        radiative_efficiency: RadiativeEfficiency = None,
         **kwargs,
     ) -> ThermalReprocessingSource:
         """Construct a disk from a validated axial Kerr lamppost profile.
@@ -153,9 +182,10 @@ class ThermalReprocessingSource:
         ``irradiation_efficiency`` multiplies the common accretion temperature
         scale and the profile's conservative proper-area illumination. As a
         physical convenience, ``lamp_fraction`` computes that coefficient
-        from the Kerr radiative efficiency and ``eddington_ratio``. Supply at
-        most one of the two. If neither is supplied, the coefficient is one.
-        No hidden rescaling to a requested variability amplitude is performed.
+        from the selected disk radiative efficiency and ``eddington_ratio``.
+        Supply at most one of the two. If neither is supplied, the coefficient
+        is one. No hidden rescaling to a requested variability amplitude is
+        performed.
         """
 
         if transfer.relative_delay_days is None:
@@ -169,6 +199,8 @@ class ThermalReprocessingSource:
                 lamp_fraction,
                 float(torch.as_tensor(eddington_ratio).detach().cpu()),
                 spin,
+                viscous_flux_profile=viscous_flux_profile,
+                radiative_efficiency=radiative_efficiency,
             )
         else:
             efficiency = 1.0 if irradiation_efficiency is None else irradiation_efficiency
@@ -206,6 +238,8 @@ class ThermalReprocessingSource:
             black_hole_mass_solar,
             eddington_ratio,
             spin,
+            viscous_flux_profile=viscous_flux_profile,
+            radiative_efficiency=radiative_efficiency,
             device=radius.device,
             dtype=radius.dtype,
         )
@@ -265,6 +299,8 @@ class ThermalReprocessingSource:
             eddington_ratio,
             spin,
             source_redshift,
+            viscous_flux_profile=viscous_flux_profile,
+            radiative_efficiency=radiative_efficiency,
             heating_metadata={
                 "model": "axis_kerr_lamppost",
                 "source_height_rg": profile.rays.source_height_rg,
@@ -287,6 +323,8 @@ class ThermalReprocessingSource:
             eddington_ratio=self.eddington_ratio,
             spin=self.spin,
             temperature_slope_beta=self.temperature_slope_beta,
+            viscous_flux_profile=self.viscous_flux_profile,
+            radiative_efficiency=self.radiative_efficiency,
         )
         return temperature4
 
@@ -347,6 +385,25 @@ class ThermalReprocessingSource:
             raise ValueError("driver_amplitude must be finite and non-negative")
         device = self.transfer.radius_rg.device if device is None else device
         dtype = self.transfer.radius_rg.dtype if dtype is None else dtype
+        device = torch.device(device)
+        if normalize:
+            weights = self.linear_response_weights(
+                driver_amplitude=driver_amplitude,
+                normalize=False,
+                dtype=dtype,
+                device=device,
+            )
+            return weights / weights.sum(dim=(0, 1), keepdim=True).clamp_min(
+                1.0e-30
+            )
+        cache_key = (float(driver_amplitude), device, dtype)
+        if not torch.is_grad_enabled():
+            entry = self._linear_response_cache.get(cache_key)
+            if entry is not None:
+                cached, ready = entry
+                if ready is not None:
+                    torch.cuda.current_stream(device).wait_event(ready)
+                return cached
         transfer = self.transfer.to(device=device, dtype=dtype)
         static = self._static_temperature4(device=device, dtype=dtype)
         response = self.response_temperature4.to(device=device, dtype=dtype)
@@ -399,11 +456,92 @@ class ThermalReprocessingSource:
             weights,
             torch.zeros_like(weights),
         )
-        if normalize:
-            weights = weights / weights.sum(dim=(0, 1), keepdim=True).clamp_min(
-                1.0e-30
-            )
+        if not torch.is_grad_enabled():
+            ready = None
+            if device.type == "cuda":
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(device))
+            self._linear_response_cache[cache_key] = (weights, ready)
         return weights
+
+    def mean_response_delays(
+        self,
+        *,
+        magnification: torch.Tensor | None = None,
+        driver_amplitude: float = 1.0,
+    ) -> torch.Tensor:
+        """Return the exact response-weighted mean delay in each band.
+
+        This first-moment calculation avoids constructing a binned transfer
+        function. Repeated no-gradient calls reuse the source's invariant
+        linear-response weights.
+        """
+
+        weights = self.linear_response_weights(
+            driver_amplitude=driver_amplitude,
+            normalize=False,
+        )
+        if magnification is not None:
+            magnification = torch.as_tensor(
+                magnification,
+                device=weights.device,
+                dtype=weights.dtype,
+            )
+            if magnification.shape != self.geometry.shape:
+                raise ValueError("magnification must match the source geometry")
+            weights = weights * magnification[..., None]
+        delay = self.delay_days.to(device=weights.device, dtype=weights.dtype)
+        valid = self.transfer.hit.to(weights.device) & torch.isfinite(delay)
+        safe_delay = torch.where(valid, delay, torch.zeros_like(delay))
+        weights = torch.where(valid[..., None], weights, torch.zeros_like(weights))
+        normalizer = weights.sum(dim=(0, 1)).clamp_min(1.0e-30)
+        return (weights * safe_delay[..., None]).sum(dim=(0, 1)) / normalizer
+
+    def batched_mean_response_delays(
+        self,
+        *,
+        magnification: torch.Tensor,
+        driver_amplitude: float = 1.0,
+        spatial_chunk_size: int = 262_144,
+    ) -> torch.Tensor:
+        """Return exact mean delays for ``[batch, y, x]`` magnifications."""
+
+        if spatial_chunk_size < 1:
+            raise ValueError("spatial_chunk_size must be positive")
+        weights = self.linear_response_weights(
+            driver_amplitude=driver_amplitude,
+            normalize=False,
+        )
+        magnification = torch.as_tensor(
+            magnification,
+            device=weights.device,
+            dtype=weights.dtype,
+        )
+        if magnification.ndim != 3 or magnification.shape[1:] != self.geometry.shape:
+            raise ValueError("magnification must have shape [batch, y, x]")
+        delay = self.delay_days.to(device=weights.device, dtype=weights.dtype)
+        valid = self.transfer.hit.to(weights.device) & torch.isfinite(delay)
+        positions = torch.nonzero(valid.reshape(-1)).reshape(-1)
+        delay = delay.reshape(-1)[positions]
+        weights = weights.reshape(-1, weights.shape[-1])[positions]
+        magnification = magnification.reshape(magnification.shape[0], -1)
+        numerator = torch.zeros(
+            (magnification.shape[0], weights.shape[-1]),
+            device=weights.device,
+            dtype=weights.dtype,
+        )
+        denominator = torch.zeros_like(numerator)
+        for start in range(0, positions.numel(), spatial_chunk_size):
+            stop = min(positions.numel(), start + spatial_chunk_size)
+            contribution = (
+                magnification[:, positions[start:stop], None]
+                * weights[None, start:stop]
+            )
+            denominator.add_(contribution.sum(dim=1))
+            numerator.add_(
+                (contribution * delay[None, start:stop, None]).sum(dim=1)
+            )
+        return numerator / denominator.clamp_min(1.0e-30)
 
     def transfer_function(
         self,
@@ -451,6 +589,75 @@ class ThermalReprocessingSource:
             output = output / output.sum(dim=0, keepdim=True).clamp_min(1.0e-30)
         return output
 
+    def batched_transfer_function(
+        self,
+        delay_edges_days: torch.Tensor | Sequence[float],
+        *,
+        magnification: torch.Tensor,
+        driver_amplitude: float = 1.0,
+        normalize: bool = True,
+        spatial_chunk_size: int = 262_144,
+    ) -> torch.Tensor:
+        """Bin several magnification-weighted responses in bounded chunks.
+
+        ``magnification`` has shape ``[batch, y, x]``. Source-dependent
+        response weights and delay-bin assignments are constructed once, and
+        the spatial chunk bounds the temporary ``[batch, pixel, band]``
+        product independently of temporal batch size.
+        """
+
+        if spatial_chunk_size < 1:
+            raise ValueError("spatial_chunk_size must be positive")
+        weights = self.linear_response_weights(
+            driver_amplitude=driver_amplitude,
+            normalize=False,
+        )
+        magnification = torch.as_tensor(
+            magnification,
+            device=weights.device,
+            dtype=weights.dtype,
+        )
+        if magnification.ndim != 3 or magnification.shape[1:] != self.geometry.shape:
+            raise ValueError("magnification must have shape [batch, y, x]")
+        edges = torch.as_tensor(
+            delay_edges_days,
+            device=weights.device,
+            dtype=weights.dtype,
+        )
+        if edges.ndim != 1 or edges.numel() < 2 or not bool(
+            torch.all(edges[1:] > edges[:-1])
+        ):
+            raise ValueError("delay_edges_days must be strictly increasing")
+        delay = self.delay_days.to(device=weights.device, dtype=weights.dtype)
+        valid = self.transfer.hit.to(weights.device) & torch.isfinite(delay)
+        indices = torch.bucketize(delay.reshape(-1), edges, right=True) - 1
+        in_range = valid.reshape(-1) & (indices >= 0) & (indices < edges.numel() - 1)
+        positions = torch.nonzero(in_range).reshape(-1)
+        indices = indices[positions]
+        weights = weights.reshape(-1, weights.shape[-1])[positions]
+        magnification = magnification.reshape(magnification.shape[0], -1)
+        output = torch.zeros(
+            (magnification.shape[0], edges.numel() - 1, weights.shape[-1]),
+            device=weights.device,
+            dtype=weights.dtype,
+        )
+        for start in range(0, positions.numel(), spatial_chunk_size):
+            stop = min(positions.numel(), start + spatial_chunk_size)
+            chunk_positions = positions[start:stop]
+            contribution = (
+                magnification[:, chunk_positions, None]
+                * weights[None, start:stop]
+            )
+            scatter_indices = indices[None, start:stop, None].expand(
+                magnification.shape[0],
+                stop - start,
+                weights.shape[-1],
+            )
+            output.scatter_add_(1, scatter_indices, contribution)
+        if normalize:
+            output = output / output.sum(dim=1, keepdim=True).clamp_min(1.0e-30)
+        return output
+
     def metadata(self) -> Mapping[str, object]:
         """Return source, driver, and transfer provenance without map arrays."""
 
@@ -466,6 +673,23 @@ class ThermalReprocessingSource:
             "source_redshift": scalar(self.source_redshift),
             "color_correction": scalar(self.color_correction),
             "temperature_slope_beta": scalar(self.temperature_slope_beta),
+            "viscous_flux_profile": _prescription_name(
+                self.viscous_flux_profile
+            ),
+            "viscous_flux_profile_metadata": _prescription_metadata(
+                self.viscous_flux_profile
+            ),
+            "radiative_efficiency": float(
+                _radiative_efficiency(
+                    self.radiative_efficiency,
+                    self.viscous_flux_profile,
+                    torch.as_tensor(self.spin, dtype=torch.float64),
+                    kerr_isco_radius(torch.as_tensor(self.spin, dtype=torch.float64)),
+                )
+            ),
+            "radiative_efficiency_prescription": _prescription_name(
+                self.radiative_efficiency
+            ),
             "signal": dict(self.signal.metadata()),
             "observer_transfer": dict(self.transfer.metadata),
             "brightness_units": "Jy m^-2 projected source plane",

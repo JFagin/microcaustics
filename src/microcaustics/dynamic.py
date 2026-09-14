@@ -594,8 +594,15 @@ class DynamicMapScheduler:
                 self.source_grid,
                 self.method,
             )
+            fused_component_scouts = batched_scout is not None
             if batched_scout is not None:
-                endpoint_cells, fine_ny, fine_nx, scout_metadata_rows = (
+                (
+                    endpoint_cells,
+                    fine_ny,
+                    fine_nx,
+                    scout_metadata_rows,
+                    anchor_cells,
+                ) = (
                     batched_scout
                 )
             else:
@@ -620,6 +627,28 @@ class DynamicMapScheduler:
                 assert fine_shape is not None
                 fine_ny, fine_nx = fine_shape
                 endpoint_cells = torch.unique(torch.cat(all_cells))
+                anchor_cells = tuple(all_cells)
+            cells_by_anchor = dict(
+                zip(scout_anchor_indices, anchor_cells, strict=True)
+            )
+            interval_cells = {
+                pair: torch.unique(
+                    torch.cat(tuple(cells_by_anchor[index] for index in set(pair)))
+                )
+                for pair in interval_pairs
+            }
+            frame_scout_cells = tuple(
+                interval_cells[
+                    (
+                        (index // refresh) * refresh,
+                        min(
+                            len(self.times) - 1,
+                            ((index // refresh) + 1) * refresh - 1,
+                        ),
+                    )
+                ]
+                for index in real_indices
+            )
             if (
                 self.method.dual_scout_scalar_correction
                 and scalar_correction is None
@@ -647,6 +676,7 @@ class DynamicMapScheduler:
                     far_fields,
                     endpoint_cells,
                     (fine_ny, fine_nx),
+                    frame_scout_cells if fused_component_scouts else None,
                 )
             far_field_preparation_seconds = far_fields_prepared - preparation_started
             scout_preparation_seconds = scouts_prepared - far_fields_prepared
@@ -780,3 +810,270 @@ def dynamic_maps(
         DynamicConfig() if config is None else config,
         far_field_batch_observer=_far_field_batch_observer,
     ).maps()
+
+
+@torch.no_grad()
+def _cross_system_tiled_ipm_maps(
+    requests,
+    *,
+    caustic_requests=None,
+):
+    """Generate compatible independent dynamic map sequences in ragged queues.
+
+    This is the map engine used by independent light-curve batching. Temporal
+    states from all systems share launches, but every state retains its own
+    far-field coefficients and conservative scout cells. The function is
+    intentionally internal until non-IPM backends have an equivalent fused
+    implementation.
+    """
+
+    requests = tuple(requests)
+    if not requests:
+        return (), None
+    caustic_requests = (
+        None if caustic_requests is None else tuple(caustic_requests)
+    )
+    if caustic_requests is not None and len(caustic_requests) != len(requests):
+        raise ValueError("caustic requests must match cross-system map requests")
+    first_simulation, first_region, first_grid, times, method, schedule = requests[0]
+    times = tuple(float(value) for value in times)
+    if not times:
+        return tuple(() for _ in requests), (
+            None if caustic_requests is None else tuple(() for _ in requests)
+        )
+    if not isinstance(method, IPMConfig) or not method.tiled:
+        raise ValueError("cross-system fusion requires tiled IPM")
+    if not schedule.fused_temporal_ipm:
+        raise ValueError("cross-system fusion requires fused_temporal_ipm")
+    first_runtime = first_simulation.runtime
+    for simulation, region, grid, other_times, other_method, other_schedule in requests[1:]:
+        if (
+            region != first_region
+            or grid != first_grid
+            or tuple(float(value) for value in other_times) != times
+            or other_method != method
+            or other_schedule != schedule
+            or simulation.macro_lens != first_simulation.macro_lens
+            or simulation.runtime.device != first_runtime.device
+            or simulation.runtime.dtype != first_runtime.dtype
+            or simulation.runtime.backend != first_runtime.backend
+        ):
+            raise ValueError("cross-system IPM requests are not numerically compatible")
+
+    from .solvers.far_field import temporal_taylor_far_field_window
+    from .solvers.ipm import (
+        _source_scout_union_temporal,
+        dual_scout_scalar_correction,
+        temporal_batch_ipm,
+    )
+
+    batch_size = min(
+        len(times),
+        int(schedule.temporal_batch_size)
+        if schedule.temporal_batch_size is not None
+        else (40 if first_runtime.device.type == "cuda" else 1),
+    )
+    refresh = int(schedule.scout_refresh_frames)
+    outputs: list[list[MagnificationMap]] = [[] for _ in requests]
+    label_outputs = (
+        None
+        if caustic_requests is None
+        else [[] for _ in requests]
+    )
+    label_state = (
+        None
+        if caustic_requests is None
+        else [[None, None, None, None] for _ in requests]
+    )
+    scalar_corrections: list[torch.Tensor | None] = [None] * len(requests)
+    correction_metadata: list[dict[str, object]] = [{} for _ in requests]
+
+    for batch_start in range(0, len(times), batch_size):
+        batch_stop = min(len(times), batch_start + batch_size)
+        real_indices = list(range(batch_start, batch_stop))
+        interval_pairs = sorted(
+            {
+                (
+                    (index // refresh) * refresh,
+                    min(len(times) - 1, ((index // refresh) + 1) * refresh - 1),
+                )
+                for index in real_indices
+            }
+        )
+        anchor_indices = sorted(
+            set(
+                endpoint
+                for pair in interval_pairs
+                for endpoint in (pair if schedule.endpoint_union else pair[:1])
+            )
+            if schedule.endpoint_union
+            else set(real_indices)
+        )
+        all_far_fields = []
+        all_cells = []
+        owners = []
+        far_by_system = []
+        for simulation, region, _grid, _, _, _ in requests:
+            requested_indices = sorted(set(real_indices) | set(anchor_indices))
+            far_fields, _ = temporal_taylor_far_field_window(
+                simulation,
+                region,
+                method.far_field_approx,
+                times,
+                requested_indices,
+            )
+            far_by_index = dict(zip(requested_indices, far_fields, strict=True))
+            far_by_system.append(far_by_index)
+
+        # All systems use the same physical scouting lattice. Concatenating
+        # their independently built far fields lets the existing temporal scout
+        # issue one tagged GPU query while still returning one cell set per
+        # system and anchor; unlike a union mask, no cells cross ownership.
+        scout = _source_scout_union_temporal(
+            first_simulation,
+            tuple(
+                far_by_index[index]
+                for far_by_index in far_by_system
+                for index in anchor_indices
+            ),
+            first_region,
+            first_grid,
+            method,
+        )
+        if scout is None:
+            raise RuntimeError("cross-system fusion requires the fused source scout")
+        _, fine_ny, fine_nx, _scout_rows, packed_anchor_cells = scout
+
+        for system_index, (
+            (simulation, region, grid, _, _, _),
+            far_by_index,
+        ) in enumerate(zip(requests, far_by_system, strict=True)):
+            anchor_offset = system_index * len(anchor_indices)
+            anchor_cells = packed_anchor_cells[
+                anchor_offset : anchor_offset + len(anchor_indices)
+            ]
+            cells_by_anchor = dict(zip(anchor_indices, anchor_cells, strict=True))
+            interval_cells = {
+                pair: torch.unique(
+                    torch.cat(tuple(cells_by_anchor[index] for index in set(pair)))
+                )
+                for pair in interval_pairs
+            }
+            frame_cells = tuple(
+                interval_cells[
+                    (
+                        (index // refresh) * refresh,
+                        min(len(times) - 1, ((index // refresh) + 1) * refresh - 1),
+                    )
+                ]
+                for index in real_indices
+            )
+            if method.dual_scout_scalar_correction and scalar_corrections[system_index] is None:
+                scalar_corrections[system_index], correction_metadata[system_index] = (
+                    dual_scout_scalar_correction(
+                        simulation,
+                        far_by_index[0],
+                        region,
+                        grid,
+                        method,
+                        time_days=times[0],
+                    )
+                )
+            all_far_fields.extend(far_by_index[index] for index in real_indices)
+            all_cells.extend(frame_cells)
+            owners.extend((system_index, index) for index in real_indices)
+
+        corrections = torch.stack(
+            [
+                torch.as_tensor(
+                    0.0 if scalar_corrections[owner] is None else scalar_corrections[owner],
+                    device=first_runtime.device,
+                    dtype=first_runtime.dtype,
+                )
+                for owner, _ in owners
+            ]
+        )[:, None, None]
+        fused = temporal_batch_ipm(
+            first_simulation,
+            first_region,
+            first_grid,
+            method,
+            [times[index] for _, index in owners],
+            far_fields=all_far_fields,
+            selected_cell_indices_by_frame=all_cells,
+            selected_cell_shape=(fine_ny, fine_nx),
+            selection_metadata={
+                "cross_system_solver_fused": True,
+                "cross_system_batch_size": len(requests),
+            },
+            scalar_correction=corrections,
+        )
+        if caustic_requests is not None:
+            from .caustics.production import (
+                caustic_fields_from_far_fields,
+                label_caustic_fields,
+            )
+
+            first_lens_grid, first_caustic, _, _, _ = caustic_requests[0]
+            for lens_grid, config, _, _, _ in caustic_requests[1:]:
+                if lens_grid != first_lens_grid or config != first_caustic:
+                    raise ValueError(
+                        "fused caustic requests must share their grid and configuration"
+                    )
+            fields = caustic_fields_from_far_fields(
+                first_simulation,
+                first_lens_grid,
+                [times[index] for _, index in owners],
+                first_caustic,
+                far_fields=all_far_fields,
+                selected_cell_indices_by_frame=all_cells,
+                selected_cell_shape=(fine_ny, fine_nx),
+                source_region=first_grid.region,
+            )
+            frame_count = len(real_indices)
+            for owner, (_, config, diagnostic_grid, include_distance_map, _) in enumerate(
+                caustic_requests
+            ):
+                state = label_state[owner]
+                labeled, *next_state = label_caustic_fields(
+                    fields[owner * frame_count : (owner + 1) * frame_count],
+                    first_grid.region,
+                    config,
+                    previous_aligned_gauges=state[0],
+                    previous_gauge_distances_uas=state[1],
+                    previous_center_label=state[2],
+                    previous_center_distance_uas=state[3],
+                    diagnostic_grid=diagnostic_grid,
+                    include_distance_map=include_distance_map,
+                )
+                label_state[owner] = next_state
+                label_outputs[owner].extend(labeled)
+        for fused_index, (owner, frame_index) in enumerate(owners):
+            item = fused[fused_index]
+            outputs[owner].append(
+                _scheduled_map(
+                    item,
+                    time_days=times[frame_index],
+                    metadata={
+                        "dynamic_frame_index": frame_index,
+                        "dynamic_frame_count": len(times),
+                        "dynamic_static_map_reuse": False,
+                        "dynamic_scout_reuse_approximate": bool(
+                            schedule.endpoint_union
+                            and any(left != right for left, right in interval_pairs)
+                        ),
+                        "dynamic_temporal_batch_size": batch_size,
+                        "dynamic_temporal_batch_index": batch_start // batch_size,
+                        "cross_system_solver_fused": True,
+                        "cross_system_index": owner,
+                        "cross_system_compact_sparse_nodes": bool(
+                            item.metadata.get("compact_sparse_nodes", False)
+                        ),
+                    },
+                )
+            )
+    return tuple(tuple(row) for row in outputs), (
+        None
+        if label_outputs is None
+        else tuple(tuple(row) for row in label_outputs)
+    )

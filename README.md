@@ -55,7 +55,7 @@ can also be supplied directly. The required circular stellar field is normally
 determined automatically from the requested source region, light-loss
 tolerance, and safety scale.
 
-The package includes general-relativistic Page--Thorne accretion disks with
+The package includes general-relativistic Novikov--Thorne accretion disks with
 full Kerr ray tracing, relativistic redshifts, observer delays, lamp-post
 heating, multiband disk images, and intrinsic source evolution. It can
 calculate steady and microlensed transfer functions, continuum light curves,
@@ -160,6 +160,8 @@ strict_backend=True)`. The default CUDA memory ceiling is 95 percent, and
 lossless OOM recovery reduces chunks or splits batches when necessary. See the
 [portability and troubleshooting guide](docs/portability_and_troubleshooting.md)
 for cache, compiler, first-call timing, and out-of-memory guidance.
+Potentially slow compilation events are reported by default; set
+`warn_on_compile=False` in `RuntimeConfig` to silence them.
 
 ## Tutorial notebooks
 
@@ -192,7 +194,7 @@ The complete notebook guide is organized into five tracks.
 |---|---|
 | Getting started | [Static maps and numerical methods](examples/notebooks/getting_started/00_static_maps_and_numerical_methods.ipynb), [Q2237 production light curves](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb), and [dynamic maps and light curves](examples/notebooks/getting_started/02_dynamic_maps_and_light_curves.ipynb) |
 | Methods | [Stellar populations and mass functions](examples/notebooks/methods/00_stellar_populations_and_mass_functions.ipynb), [far-field approximation](examples/notebooks/methods/01_far_field_approximation.ipynb), and [caustics and labels](examples/notebooks/methods/02_caustics_and_labels.ipynb) |
-| Source models | [Relativistic disks and reverberation](examples/notebooks/source_models/00_relativistic_disks_and_reverberation.ipynb), [expanding supernovae](examples/notebooks/source_models/01_expanding_supernovae.ipynb), and [custom sources and variability](examples/notebooks/source_models/02_custom_sources_and_variability.ipynb) |
+| Source models | [Relativistic disks and reverberation](examples/notebooks/source_models/00_relativistic_disks_and_reverberation.ipynb), [expanding supernovae](examples/notebooks/source_models/01_expanding_supernovae.ipynb), [custom sources and variability](examples/notebooks/source_models/02_custom_sources_and_variability.ipynb), and [spectral microlensing](examples/notebooks/source_models/03_spectral_microlensing.ipynb) |
 | Workflows | [Multi-image light curves and observations](examples/notebooks/workflows/00_multi_image_light_curves_and_observations.ipynb), [realistic strong-lens images](examples/notebooks/workflows/01_realistic_strong_lens_image.ipynb), [end-to-end lensed quasars](examples/notebooks/workflows/02_end_to_end_lensed_quasar.ipynb), [streaming and export](examples/notebooks/workflows/03_streaming_and_exporting_results.ipynb), and [simulation datasets](examples/notebooks/workflows/04_simulation_datasets.ipynb) |
 | Validation | [Weisenbach IPM](examples/notebooks/validation/00_weisenbach_ipm_visual_validation.ipynb), [SIM5 GR](examples/notebooks/validation/01_sim5_gr_visual_validation.ipynb), [accuracy and performance](examples/notebooks/validation/02_accuracy_and_performance.ipynb), and [analytic single-point lens](examples/notebooks/validation/03_single_point_lens_validation.ipynb) |
 
@@ -249,7 +251,13 @@ figure, ax = mcp.plot_magnification_map(
 ```
 
 This returns an unconvolved map using IPM with the Taylor far-field
-approximation. Use `method="irs"` in the map call for inverse ray shooting.
+approximation. Use `method="irs"` in the map call for Cartesian inverse ray
+shooting. For direct numerical control, pass either
+`mc.IRSConfig(rays=10_000_000, sampling="cartesian")` or
+`mc.IRSConfig(rays=10_000_000, sampling="random", seed=0)` as `method`.
+Cartesian sampling is deterministic and remains the default. Random sampling
+uses the same ray coordinates at every epoch so sampling noise is not mistaken
+for physical variability.
 The integration domain changes which lens-plane cells are sampled, not the
 underlying circular stellar population. More pixels alone do not improve
 sampling accuracy, so adjust `rays` as well when resolving finer structure.
@@ -382,6 +390,7 @@ source = mc.KerrDiskModel(
     bands_angstrom={"u": 3671, "g": 4827, "r": 6223,
                      "i": 7546, "z": 8691, "y": 9712},
     spin=0.74,
+    viscous_flux_profile="novikov-thorne",  # default; "shakura-sunyaev" is built in
     inclination_deg=10.0,
     position_angle_deg=0.0,
     lamp_fraction=0.1,
@@ -626,6 +635,9 @@ labels = mc.CausticConfig(
     far_field_approx=far_field,
     # Labels inherit the shared 30-frame map batch. LC-only calls use the
     # 49-frame production preset because they omit detA and marching squares.
+    discovery_downsample_ratio=16,  # 8192-pixel detA -> 512-pixel discovery
+    discovery_near_zero_quantile=0.05,  # retain low-|detA| coarse cells
+    discovery_dilation_cells=2,     # pad coarse critical-curve candidates
     anchor_count=9,              # more points add alignment redundancy
     gauge_count=9,
     minimum_determinant_sign_pixels=4,  # remove unresolved sign islands
@@ -679,9 +691,13 @@ next_result = system.light_curve(
 `system.light_curves(...)` batches multiple sources or trajectories through a
 shared map sequence. This is what `light_curve_batch_size` controls.
 `batched_system_maps(...)` batches unrelated static systems without sharing
-their stars. `batched_system_light_curves(...)` runs complete independent
-systems concurrently. All three interfaces reuse compatible compiled kernels
-instead of recompiling for every realization.
+their stars. `batched_system_light_curves(...)` accepts any mixture of single,
+double, quad, or other multi-image systems. It flattens their independent
+macroimage calculations for execution and restores the original system
+grouping afterward. Compatible production Triton jobs also share one
+ownership-tagged cross-system map and label queue. Each realization keeps its
+own scout cells; incompatible images automatically retain private-stream
+execution. All three interfaces reuse compatible compiled kernels.
 
 Independent stellar realizations of the same macroimage can be generated
 together. Each seed produces a new star field. Compatible Triton or
@@ -707,12 +723,34 @@ batch = mc.batched_system_light_curves(
     rays=10_000_000,
     temporal_batch_size=30,
     scout_refresh_frames=10,
-    curves_per_batch=3,  # complete independent systems, not shared maps
+    curves_per_batch=3,  # individual macroimage curves, not systems
     include_labels=True,
 )
 curves = batch.light_curves
 print(curves[0].magnitude.shape, batch.executed_batch_sizes)
 ```
+
+Large datasets can be streamed through a bounded background writer. A directory
+produces flat per-image files plus a manifest; a `.npz` path produces one
+combined archive. Neither mode retains all curves in accelerator memory.
+
+```python
+saved = mc.batched_system_light_curves(
+    systems,
+    duration_days=3650,
+    map_cadence_days=25,
+    source_cadence_days=1,
+    curves_per_batch=3,
+    output_path="training_curves.npz",  # or a directory
+)
+first_system = saved.load_system(0)
+```
+
+Flat-directory jobs can pass `resume=True` after interruption; systems whose
+expected image files are complete are reused. `overwrite=True` starts a fresh
+logical output and replaces matching files. Combined archives are finalized
+atomically and do not support partial resume. Resume assumes the same ordered
+inputs and numerical configuration as the original call.
 
 Pass `profile=True` to collect batch wall time and `batch.seconds_per_curve`.
 They are unavailable by default, without timing-only device synchronization.
@@ -766,9 +804,10 @@ The main accuracy and throughput controls in the example are listed below.
 | `scout_refresh_frames` | Number of dynamic epochs sharing an endpoint-union scout selection |
 | `temporal_batch_size` | Number of consecutive maps processed by one fused temporal batch |
 | `light_curve_batch_size` | Number of sources or trajectories sampled from one shared map sequence |
-| `curves_per_batch` | Number of complete independent systems run concurrently on one GPU |
+| `curves_per_batch` | Number of independent macroimage light curves run concurrently on one GPU |
 | `cell_chunk_size` | Maximum spatial work chunk before automatic memory backoff |
 | `caustic_grid_shape` | Resolution of determinant, critical-curve, and source-center-label products |
+| `discovery_downsample_ratio` | Coarsening of the critical-curve discovery grid before sparse full-resolution determinant evaluation |
 
 The production far-field configuration uses a `16 x 16` partition to decide
 which stars are evaluated exactly. Each partition cell contains an `8 x 8`
@@ -971,8 +1010,11 @@ microlensing-weighted transfer functions, and Rubin OpSim sampling. See
 The survey notebook reads a local OpSim SQLite database from
 `MICROCAUSTICS_LSST_OPSIM`. Rubin's
 [`rubin_sim` data guide](https://rubin-sim.lsst.io/data-download.html) describes
-the baseline-database download. A deterministic illustrative cadence is used
-when that variable is not set.
+the baseline-database download. `RubinOpSimCadenceIndex` loads that database
+once per process and provides `sample(seed=..., survey="wfd" | "ddf")` plus
+coordinate-based selection with `at_sky_position`. A deterministic
+illustrative cadence is used when that variable is not set. See
+[`docs/observations.md`](docs/observations.md).
 Instrument-independent macro-image scenes can use `caustics.LensSource`. See
 [`docs/macro_image_rendering.md`](docs/macro_image_rendering.md).
 

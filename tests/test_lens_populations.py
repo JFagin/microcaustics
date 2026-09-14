@@ -150,7 +150,7 @@ class LensPopulationTests(unittest.TestCase):
         )
 
     def test_light_loss_rectangle_handles_rotated_shear_coordinates(self) -> None:
-        macro = mc.MacroLens(0.31, 0.22, shear_angle_rad=0.37)
+        macro = mc.MacroLens(0.31, 0.22, shear_angle_deg=math.degrees(0.37))
         source = mc.PlaneRegion((1.4, 2.2), center_uas=(0.13, -0.27))
         distances = mc.LensingDistances(1.0e25, 2.0e25, 1.2e25)
         mass_function = mc.PowerLawMassFunction(0.1, 1.0, 2.0)

@@ -348,7 +348,7 @@ def uas_to_einstein_units(
     return torch.as_tensor(values, device=radius.device, dtype=radius.dtype) / radius
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class MacroLens:
     """Local convergence and shear at one macroimage.
 
@@ -362,35 +362,15 @@ class MacroLens:
     shear_angle_deg: float = 0.0
     smooth_matter_fraction: float = 0.0
 
-    def __init__(
-        self,
-        convergence: float,
-        shear: float,
-        shear_angle_deg: float = 0.0,
-        smooth_matter_fraction: float = 0.0,
-        *,
-        shear_angle_rad: float | None = None,
-    ) -> None:
-        """Create a local macro lens using a shear angle in degrees.
-
-        ``shear_angle_rad`` is retained as a compatibility-only keyword for
-        lower-level validation code. New user code should always use
-        ``shear_angle_deg``.
-        """
-
-        if shear_angle_rad is not None:
-            if float(shear_angle_deg) != 0.0:
-                raise ValueError("supply only shear_angle_deg or shear_angle_rad")
-            shear_angle_deg = math.degrees(float(shear_angle_rad))
-        object.__setattr__(self, "convergence", float(convergence))
-        object.__setattr__(self, "shear", float(shear))
-        object.__setattr__(self, "shear_angle_deg", float(shear_angle_deg))
-        object.__setattr__(
-            self, "smooth_matter_fraction", float(smooth_matter_fraction)
-        )
-        self.__post_init__()
-
     def __post_init__(self) -> None:
+        object.__setattr__(self, "convergence", float(self.convergence))
+        object.__setattr__(self, "shear", float(self.shear))
+        object.__setattr__(self, "shear_angle_deg", float(self.shear_angle_deg))
+        object.__setattr__(
+            self,
+            "smooth_matter_fraction",
+            float(self.smooth_matter_fraction),
+        )
         if self.convergence < 0:
             raise ValueError("convergence must be non-negative")
         if self.shear < 0:
@@ -626,22 +606,32 @@ class PointMassField:
         assert self.velocity_y_uas_per_day is not None
         moved_x = self.x_uas + time * self.velocity_x_uas_per_day
         moved_y = self.y_uas + time * self.velocity_y_uas_per_day
-        if self._einstein_radius_uas is None:
-            return PointMassField(
-                moved_x,
-                moved_y,
-                self.mass_solar,
-                velocity_x_uas_per_day=self.velocity_x_uas_per_day,
-                velocity_y_uas_per_day=self.velocity_y_uas_per_day,
-            )
-        return PointMassField._from_einstein_radii(
-            moved_x,
-            moved_y,
-            self._einstein_radius_uas,
-            mass_solar=self.mass_solar,
-            velocity_x_uas_per_day=self.velocity_x_uas_per_day,
-            velocity_y_uas_per_day=self.velocity_y_uas_per_day,
+        # Motion changes only the two position arrays. Re-running ``__post_init__``
+        # here would validate the same masses, Einstein radii, and velocities at
+        # every epoch; on CUDA, each positivity check would also force a device
+        # synchronization. The parent field has already established all shape,
+        # dtype, device, and positivity invariants, and the two tensor operations
+        # above preserve the position invariants.
+        instance = object.__new__(PointMassField)
+        object.__setattr__(instance, "x_uas", moved_x)
+        object.__setattr__(instance, "y_uas", moved_y)
+        object.__setattr__(instance, "mass_solar", self.mass_solar)
+        object.__setattr__(
+            instance,
+            "velocity_x_uas_per_day",
+            self.velocity_x_uas_per_day,
         )
+        object.__setattr__(
+            instance,
+            "velocity_y_uas_per_day",
+            self.velocity_y_uas_per_day,
+        )
+        object.__setattr__(
+            instance,
+            "_einstein_radius_uas",
+            self._einstein_radius_uas,
+        )
+        return instance
 
     def to(
         self,

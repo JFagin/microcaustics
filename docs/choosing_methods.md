@@ -5,8 +5,12 @@ chunk tuning comes last because it changes throughput, not the calculation.
 
 ## Map-only calculations
 
-- Use `IRSConfig` for a familiar uniform inverse-ray-shooting reference or
-  when Poisson sampling is part of the intended calculation.
+- Use `IRSConfig(sampling="cartesian")` for deterministic Cartesian inverse ray
+  shooting. This is the package default.
+- Use `IRSConfig(sampling="random", seed=...)` for a conventional Monte Carlo
+  inverse-ray-shooting control. The fixed seed preserves the same ray sample
+  across dynamic frames and prevents shot noise from producing artificial
+  variability.
 - Use full-field `IPMConfig(tiled=False)` for polygon mapping over every
   lens-plane cell.
 - Use tiled `IPMConfig(tiled=True)` when the requested source field occupies a
@@ -18,6 +22,15 @@ chunk tuning comes last because it changes throughput, not the calculation.
 
 IRS and IPM return absolute, source-independent magnification maps on the same
 `PlaneGrid`. A source is required only for finite-source photometry.
+
+## IRS controls
+
+`rays` is the requested Monte Carlo count for random IRS. Cartesian IRS uses a
+nearly equal rectangular lattice chosen to match the lens-plane aspect ratio,
+so its metadata records both the requested and actual counts. `ray_chunk_size`
+changes memory use without changing either ray set. Both sampling modes support
+full and rectangular integration domains and may use either exact point-mass
+deflections or the same local-exact far-field approximation as IPM.
 
 ## IPM controls
 

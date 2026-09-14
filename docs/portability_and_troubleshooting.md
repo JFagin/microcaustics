@@ -89,3 +89,9 @@ strict Triton execution succeeds on CUDA float32, compiler caches are local,
 timings exclude first-call work, and the calculation did not select a direct
 reference path. Full-field methods, float64, labels, and diagnostic maps
 intentionally cost more than a tiled float32 light-curve-only workflow.
+
+Package-managed compilation warnings are enabled by default. They identify the
+component, backend, device, and dtype before a potentially slow first call or
+new specialization. Disable them for a runtime with
+`RuntimeConfig(warn_on_compile=False)`, or filter the public
+`microcaustics.CompilationWarning` category through Python's `warnings` module.

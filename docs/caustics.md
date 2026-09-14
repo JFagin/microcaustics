@@ -56,6 +56,7 @@ low-level simulation API.
 caustic_config = mc.CausticConfig(
     far_field_approx=ipm.far_field_approx,
     temporal_batch_size=32,  # optional label-specific override
+    discovery_downsample_ratio=16,  # 8192-pixel detA -> 512-pixel discovery
 )
 
 frames = simulation.dynamic_labeled_caustics(
@@ -70,7 +71,14 @@ crossings = [frame.labels.center_crossing for frame in frames]
 
 The determinant grid controls caustic resolution and is independent of the
 magnification-map grid. The paper calculation uses an 8192-pixel long axis.
-Smaller grids are useful for examples and tests.
+Smaller grids are useful for examples and tests. In the source-scouted path,
+a coarse determinant grid first finds sign changes and unusually small
+absolute determinant values. Only those candidates are retained for sparse
+evaluation at the requested determinant resolution. The default
+`discovery_downsample_ratio=16` therefore uses a 512-pixel discovery grid with
+an 8192-pixel determinant grid. Advanced users can lower the ratio for denser
+discovery or raise it for a cheaper coarse pass. The final determinant-grid
+resolution does not change.
 
 ## Sharing work with maps and light curves
 

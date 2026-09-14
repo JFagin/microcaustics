@@ -44,9 +44,7 @@ def _evaluate_far_field_deflection(
         value_imag = product_imag + coefficient_imag[..., index]
     dx = query_x[:, None] - local_x
     dy = query_y[:, None] - local_y
-    weight = local_mass / (dx.square() + dy.square()).clamp_min(
-        minimum_radius_squared
-    )
+    weight = local_mass / (dx.square() + dy.square()).clamp_min(minimum_radius_squared)
     return (
         value_real + (dx * weight).sum(dim=1),
         value_imag + (dy * weight).sum(dim=1),
@@ -77,14 +75,18 @@ def _evaluate_far_field_jacobian(
         value_imag = product_imag + coefficient_imag[..., index]
     dx = query_x[:, None] - local_x
     dy = query_y[:, None] - local_y
-    inverse_r4 = (dx.square() + dy.square()).clamp_min(
-        minimum_radius_squared
-    ).square().reciprocal()
+    inverse_r4 = (
+        (dx.square() + dy.square())
+        .clamp_min(minimum_radius_squared)
+        .square()
+        .reciprocal()
+    )
     weight = local_mass * inverse_r4
     return (
         value_real + ((dy.square() - dx.square()) * weight).sum(dim=1),
         value_imag + (-2.0 * dx * dy * weight).sum(dim=1),
     )
+
 
 if TYPE_CHECKING:
     from ..simulation import MicrolensingSimulation
@@ -128,7 +130,9 @@ class TaylorFarFieldApproximation:
         """Build local-star packs and far-field coefficients."""
 
         if not config.enabled:
-            raise ValueError("far-field approximation requires FarFieldApproxConfig(enabled=True)")
+            raise ValueError(
+                "far-field approximation requires FarFieldApproxConfig(enabled=True)"
+            )
         if int(star_chunk_size) < 1:
             raise ValueError("star_chunk_size must be positive")
         self.simulation = simulation
@@ -196,6 +200,8 @@ class TaylorFarFieldApproximation:
         n_stars = len(field)
         mask_grid = None
         if self._local_override is None:
+            # Partition stars into an exact near field for every cell. Chunking
+            # bounds the otherwise cell-by-star temporary boolean matrix.
             mask_grid = torch.empty(
                 (n_cells, n_stars),
                 device=runtime.device,
@@ -207,8 +213,7 @@ class TaylorFarFieldApproximation:
                 1,
                 min(
                     n_cells,
-                    (32 * 1024**2)
-                    // max(2 * element_size * elements_per_cell, 1),
+                    (32 * 1024**2) // max(2 * element_size * elements_per_cell, 1),
                 ),
             )
             star_x = field.x_uas[None]
@@ -248,9 +253,7 @@ class TaylorFarFieldApproximation:
                 local_counts_tensor,
                 override_maximum_local,
                 override_mean_local,
-            ) = (
-                self._local_override
-            )
+            ) = self._local_override
             expected_prefix = (n_cells,)
             if (
                 tuple(local_x.shape[:1]) != expected_prefix
@@ -268,6 +271,8 @@ class TaylorFarFieldApproximation:
             self.config.taylor_order + 1,
         )
         if self._coefficient_override is None:
+            # Accumulate each cell's far stars at its center, then translate the
+            # expansion to the denser query nodes used within that cell.
             center_real_all = torch.empty(
                 (n_cells, self.config.center_translation_order + 1),
                 device=runtime.device,
@@ -353,6 +358,8 @@ class TaylorFarFieldApproximation:
             self.coefficient_imag = override_imag.contiguous()
             self.coefficient_build_backend = "precomputed"
         if self._local_override is None:
+            # Pack ragged near-field stars into dense rows plus explicit counts;
+            # fused evaluators can then avoid Python lists and per-cell launches.
             max_local = max(1, max_local_count)
             local_shape = (n_cells, max_local)
             self.local_x = torch.zeros(
@@ -393,13 +400,7 @@ class TaylorFarFieldApproximation:
             mean_local_stars=(
                 float(override_mean_local)
                 if self._local_override is not None
-                else float(
-                    local_counts_tensor
-                    .to(torch.float64)
-                    .mean()
-                    .detach()
-                    .cpu()
-                )
+                else float(local_counts_tensor.to(torch.float64).mean().detach().cpu())
             ),
             build_seconds=perf_counter() - started,
         )
@@ -420,17 +421,30 @@ class TaylorFarFieldApproximation:
         self,
         x: torch.Tensor,
         y: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Resolve spatial cells, expansion nodes, and node offsets."""
 
         xmin, xmax, ymin, ymax = self.region.bounds_uas
         scale = max(abs(xmin), abs(xmax), abs(ymin), abs(ymax), 1.0)
         tolerance = 32.0 * torch.finfo(x.dtype).eps * scale
-        if bool(torch.any(
-            (x < xmin - tolerance) | (x > xmax + tolerance)
-            | (y < ymin - tolerance) | (y > ymax + tolerance)
-        )):
-            raise ValueError("far-field approximation queries must lie inside its lens-plane region")
+        if bool(
+            torch.any(
+                (x < xmin - tolerance)
+                | (x > xmax + tolerance)
+                | (y < ymin - tolerance)
+                | (y > ymax + tolerance)
+            )
+        ):
+            raise ValueError(
+                "far-field approximation queries must lie inside its lens-plane region"
+            )
         ix = torch.floor((x - xmin) / self.cell_dx).long().clamp(0, self.nx - 1)
         iy = torch.floor((y - ymin) / self.cell_dy).long().clamp(0, self.ny - 1)
         local_x = ((x - self.x_edges[ix]) / self.cell_dx).clamp(0.0, 1.0)
@@ -438,8 +452,12 @@ class TaylorFarFieldApproximation:
         nodes = int(self.config.nodes_per_cell_axis)
         node_x = torch.floor(local_x * nodes).long().clamp(0, nodes - 1)
         node_y = torch.floor(local_y * nodes).long().clamp(0, nodes - 1)
-        expansion_x = self.x_edges[ix] + (node_x.to(x.dtype) + 0.5) * (self.cell_dx / nodes)
-        expansion_y = self.y_edges[iy] + (node_y.to(y.dtype) + 0.5) * (self.cell_dy / nodes)
+        expansion_x = self.x_edges[ix] + (node_x.to(x.dtype) + 0.5) * (
+            self.cell_dx / nodes
+        )
+        expansion_y = self.y_edges[iy] + (node_y.to(y.dtype) + 0.5) * (
+            self.cell_dy / nodes
+        )
         return ix, iy, node_x, node_y, expansion_x, expansion_y
 
     def deflection(self, x_uas, y_uas) -> tuple[torch.Tensor, torch.Tensor]:
@@ -476,9 +494,7 @@ class TaylorFarFieldApproximation:
                 self.local_mass[flat_cell],
                 minimum,
             )
-            self.last_query_backend = (
-                "torch-compile" if compiled else "torch-eager"
-            )
+            self.last_query_backend = "torch-compile" if compiled else "torch-eager"
         else:
             alpha_x, alpha_y = evaluate_complex_taylor(
                 coefficients_real,
@@ -517,11 +533,15 @@ class TaylorFarFieldApproximation:
             except Exception as error:
                 if runtime.strict_backend:
                     raise
-                warn_backend_fallback("Triton far-field approximation ray tracing", error)
+                warn_backend_fallback(
+                    "Triton far-field approximation ray tracing", error
+                )
                 self._triton_disabled_reason = f"{type(error).__name__}: {error}"
         alpha_x, alpha_y = self.deflection(x, y)
         macro = self.simulation.macro_lens
-        angle = torch.as_tensor(2.0 * macro.shear_angle_rad, device=runtime.device, dtype=runtime.dtype)
+        angle = torch.as_tensor(
+            2.0 * macro.shear_angle_rad, device=runtime.device, dtype=runtime.dtype
+        )
         gamma1 = macro.shear * torch.cos(angle)
         gamma2 = macro.shear * torch.sin(angle)
         sheet = macro.smooth_convergence
@@ -558,7 +578,9 @@ class TaylorFarFieldApproximation:
             except Exception as error:
                 if runtime.strict_backend:
                     raise
-                warn_backend_fallback("Triton far-field approximation determinant", error)
+                warn_backend_fallback(
+                    "Triton far-field approximation determinant", error
+                )
                 self._triton_disabled_reason = f"{type(error).__name__}: {error}"
         flat_x, flat_y = x.reshape(-1), y.reshape(-1)
         ix, iy, node_x, node_y, expansion_x, expansion_y = self._indices(flat_x, flat_y)
@@ -594,9 +616,7 @@ class TaylorFarFieldApproximation:
                 self.local_mass[flat_cell],
                 minimum,
             )
-            self.last_query_backend = (
-                "torch-compile" if compiled else "torch-eager"
-            )
+            self.last_query_backend = "torch-compile" if compiled else "torch-eager"
         else:
             point_xx, point_xy = evaluate_complex_taylor(
                 derivative_real,
@@ -616,13 +636,13 @@ class TaylorFarFieldApproximation:
                     .reciprocal()
                 )
                 weight = self.local_mass[int(cell)][None] * inverse_r4
-                point_xx[query] += (
-                    (dy.square() - dx.square()) * weight
-                ).sum(dim=1)
+                point_xx[query] += ((dy.square() - dx.square()) * weight).sum(dim=1)
                 point_xy[query] += (-2.0 * dx * dy * weight).sum(dim=1)
             self.last_query_backend = "torch-eager"
         macro = self.simulation.macro_lens
-        angle = torch.as_tensor(2.0 * macro.shear_angle_rad, device=runtime.device, dtype=runtime.dtype)
+        angle = torch.as_tensor(
+            2.0 * macro.shear_angle_rad, device=runtime.device, dtype=runtime.dtype
+        )
         gamma1 = macro.shear * torch.cos(angle)
         gamma2 = macro.shear * torch.sin(angle)
         alpha_xx = macro.smooth_convergence + gamma1 + point_xx
@@ -702,9 +722,7 @@ def _batched_local_star_packs(
         counts_host = counts.detach().cpu()
         maximum = max(1, int(counts_host.max()))
         local_shape = (stop - start, cells, maximum)
-        local_x = torch.zeros(
-            local_shape, device=runtime.device, dtype=runtime.dtype
-        )
+        local_x = torch.zeros(local_shape, device=runtime.device, dtype=runtime.dtype)
         local_y = torch.zeros_like(local_x)
         local_mass = torch.zeros_like(local_x)
         frame, cell, star = torch.nonzero(mask, as_tuple=True)
@@ -772,9 +790,7 @@ def temporal_taylor_far_fields(
         and runtime.device.type == "cuda"
         and runtime.dtype == torch.float32
     ):
-        from .triton_taylor import (
-            center_coefficients_rounded_local_batch_triton,
-        )
+        from .triton_taylor import center_coefficients_and_local_packs_batch_triton
 
         try:
             fov_y, fov_x = region.field_of_view_uas
@@ -787,21 +803,29 @@ def temporal_taylor_far_fields(
                 * max(cell_dx, cell_dy)
                 * (1.0 + 16.0 * torch.finfo(runtime.dtype).eps)
             )
-            center_real, center_imag = (
-                center_coefficients_rounded_local_batch_triton(
-                    torch.stack([state.x_uas for state in states]),
-                    torch.stack([state.y_uas for state in states]),
-                    states[0].einstein_radius_uas.square(),
-                    nx=nx,
-                    ny=ny,
-                    xmin=region.bounds_uas[0],
-                    ymin=region.bounds_uas[2],
-                    cell_dx=cell_dx,
-                    cell_dy=cell_dy,
-                    exact_radius=membership_radius,
-                    order=config.center_translation_order,
-                )
+            (
+                center_real,
+                center_imag,
+                local_x,
+                local_y,
+                local_mass,
+                local_counts,
+                local_overflow,
+            ) = center_coefficients_and_local_packs_batch_triton(
+                torch.stack([state.x_uas for state in states]),
+                torch.stack([state.y_uas for state in states]),
+                states[0].einstein_radius_uas.square(),
+                nx=nx,
+                ny=ny,
+                xmin=region.bounds_uas[0],
+                ymin=region.bounds_uas[2],
+                cell_dx=cell_dx,
+                cell_dy=cell_dy,
+                exact_radius=membership_radius,
+                order=config.center_translation_order,
             )
+            counts_host = local_counts.detach().cpu()
+            overflow_host = local_overflow.detach().cpu()
             nodes = int(config.nodes_per_cell_axis)
             offset_x = (
                 (torch.arange(nodes, device=runtime.device, dtype=runtime.dtype) + 0.5)
@@ -835,15 +859,34 @@ def temporal_taylor_far_fields(
                 index: (node_real[position], node_imag[position])
                 for position, index in enumerate(frame_indices)
             }
-            packed = _batched_local_star_packs(
-                simulation,
-                region,
-                config,
-                states,
-            )
+            if bool(torch.any(overflow_host)):
+                packed = _batched_local_star_packs(
+                    simulation,
+                    region,
+                    config,
+                    states,
+                )
+            else:
+                maximum = max(1, int(counts_host.max()))
+                # The fused evaluator treats these packs as dense contiguous
+                # rows, so compact the fixed-capacity Triton workspace before
+                # handing it to the per-frame approximation objects.
+                local_x = local_x[..., :maximum].contiguous()
+                local_y = local_y[..., :maximum].contiguous()
+                local_mass = local_mass[..., :maximum].contiguous()
+                packed = tuple(
+                    (
+                        local_x[index],
+                        local_y[index],
+                        local_mass[index],
+                        local_counts[index],
+                        int(counts_host[index].max()),
+                        float(counts_host[index].to(torch.float64).mean()),
+                    )
+                    for index in range(len(states))
+                )
             local_overrides = {
-                index: packed[position]
-                for position, index in enumerate(frame_indices)
+                index: packed[position] for position, index in enumerate(frame_indices)
             }
             batched_accumulator = True
         except Exception as error:
@@ -942,13 +985,17 @@ class BatchedTaylorFarFieldApproximation:
                 or item.ny != self.ny
                 or item.simulation.macro_lens != self.simulation.macro_lens
             ):
-                raise ValueError("temporal far-field approximations must share geometry and lens model")
+                raise ValueError(
+                    "temporal far-field approximations must share geometry and lens model"
+                )
         self.frame_count = len(self.far_fields)
         maximum_local = max(int(item.local_x.shape[-1]) for item in self.far_fields)
         cells = self.nx * self.ny
         runtime = self.simulation.runtime
         local_shape = (self.frame_count, cells, maximum_local)
-        self.local_x = torch.zeros(local_shape, device=runtime.device, dtype=runtime.dtype)
+        self.local_x = torch.zeros(
+            local_shape, device=runtime.device, dtype=runtime.dtype
+        )
         self.local_y = torch.zeros_like(self.local_x)
         self.local_mass = torch.zeros_like(self.local_x)
         for frame, item in enumerate(self.far_fields):
@@ -978,11 +1025,17 @@ class BatchedTaylorFarFieldApproximation:
         xmin, xmax, ymin, ymax = self.region.bounds_uas
         scale = max(abs(xmin), abs(xmax), abs(ymin), abs(ymax), 1.0)
         tolerance = 32.0 * torch.finfo(x.dtype).eps * scale
-        if bool(torch.any(
-            (x < xmin - tolerance) | (x > xmax + tolerance)
-            | (y < ymin - tolerance) | (y > ymax + tolerance)
-        )):
-            raise ValueError("far-field approximation queries must lie inside its lens-plane region")
+        if bool(
+            torch.any(
+                (x < xmin - tolerance)
+                | (x > xmax + tolerance)
+                | (y < ymin - tolerance)
+                | (y > ymax + tolerance)
+            )
+        ):
+            raise ValueError(
+                "far-field approximation queries must lie inside its lens-plane region"
+            )
 
     def raytrace(self, x_uas, y_uas) -> tuple[torch.Tensor, torch.Tensor]:
         """Map one shared ray-coordinate array through every temporal frame."""
@@ -1000,7 +1053,9 @@ class BatchedTaylorFarFieldApproximation:
             except Exception as error:
                 if runtime.strict_backend:
                     raise
-                warn_backend_fallback("batched Triton far-field approximation ray tracing", error)
+                warn_backend_fallback(
+                    "batched Triton far-field approximation ray tracing", error
+                )
         mapped = [item.raytrace(x, y) for item in self.far_fields]
         return (
             torch.stack([value[0] for value in mapped]),
@@ -1022,11 +1077,15 @@ class BatchedTaylorFarFieldApproximation:
 
         runtime = self.simulation.runtime
         x_rows = tuple(
-            torch.as_tensor(value, device=runtime.device, dtype=runtime.dtype).reshape(-1)
+            torch.as_tensor(value, device=runtime.device, dtype=runtime.dtype).reshape(
+                -1
+            )
             for value in x_by_frame
         )
         y_rows = tuple(
-            torch.as_tensor(value, device=runtime.device, dtype=runtime.dtype).reshape(-1)
+            torch.as_tensor(value, device=runtime.device, dtype=runtime.dtype).reshape(
+                -1
+            )
             for value in y_by_frame
         )
         if len(x_rows) != self.frame_count or len(y_rows) != self.frame_count:
@@ -1064,7 +1123,9 @@ class BatchedTaylorFarFieldApproximation:
             except Exception as error:
                 if runtime.strict_backend:
                     raise
-                warn_backend_fallback("ragged Triton far-field approximation ray tracing", error)
+                warn_backend_fallback(
+                    "ragged Triton far-field approximation ray tracing", error
+                )
         mapped = tuple(
             item.raytrace(x, y)
             for item, x, y in zip(self.far_fields, x_rows, y_rows, strict=True)
@@ -1160,7 +1221,62 @@ class BatchedTaylorFarFieldApproximation:
             except Exception as error:
                 if runtime.strict_backend:
                     raise
-                warn_backend_fallback("batched Triton far-field approximation determinant", error)
+                warn_backend_fallback(
+                    "batched Triton far-field approximation determinant", error
+                )
         return torch.stack(
             [item.jacobian_determinant(x, y) for item in self.far_fields]
         )
+
+    def jacobian_determinant_indexed_flat(
+        self,
+        x_uas: torch.Tensor,
+        y_uas: torch.Tensor,
+        frame_index: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate a compact determinant queue tagged by temporal frame."""
+
+        runtime = self.simulation.runtime
+        x = torch.as_tensor(x_uas, device=runtime.device, dtype=runtime.dtype).reshape(
+            -1
+        )
+        y = torch.as_tensor(y_uas, device=runtime.device, dtype=runtime.dtype).reshape(
+            -1
+        )
+        frames = torch.as_tensor(
+            frame_index, device=runtime.device, dtype=torch.int32
+        ).reshape(-1)
+        if x.shape != y.shape or x.shape != frames.shape:
+            raise ValueError("flat x, y, and frame-index queues must match")
+        if x.numel() == 0:
+            return x.clone()
+        self._validate_points(x, y)
+        if bool(torch.any((frames < 0) | (frames >= self.frame_count))):
+            raise ValueError("flat queue frame indices are out of range")
+        if self._use_triton():
+            from .triton_taylor import evaluate_far_field_p4_indexed_triton
+
+            try:
+                return evaluate_far_field_p4_indexed_triton(
+                    self,
+                    x,
+                    y,
+                    frames,
+                    jacobian=True,
+                )
+            except Exception as error:
+                if runtime.strict_backend:
+                    raise
+                warn_backend_fallback(
+                    "indexed Triton far-field approximation determinant",
+                    error,
+                )
+        determinant = torch.empty_like(x)
+        for frame, far_field in enumerate(self.far_fields):
+            selected = frames == frame
+            if not bool(torch.any(selected)):
+                continue
+            determinant[selected] = far_field.jacobian_determinant(
+                x[selected], y[selected]
+            )
+        return determinant

@@ -181,9 +181,14 @@ def test_shared_multirate_batch_reuses_maps_and_matches_individual_curves(dtype)
         requests=requests,
         light_curve_batch_size=2,
         map_observer=lambda i, m: epochs.append(m.time_days),
+        keep_maps_at_days=[0.0, 4.0],
         **settings,
     )
     assert epochs == [0, 2, 4]
+    assert result[0].map_times_days.tolist() == [0.0, 4.0]
+    assert result[1].map_times_days.tolist() == [0.0, 4.0]
+    assert result[0].maps[0] is result[1].maps[0]
+    assert result[0].maps[1] is result[1].maps[1]
     assert all(r.distances is None for r in requests)
     for actual, reference in zip(result, expected, strict=True):
         torch.testing.assert_close(actual.flux, reference.flux, rtol=2e-5, atol=1e-12)

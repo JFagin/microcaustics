@@ -92,7 +92,7 @@ class DocumentationIntegrityTests(unittest.TestCase):
             for node in tree.body:
                 if not isinstance(
                     node,
-                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                    ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
                 ) or node.name.startswith("_"):
                     continue
                 if not ast.get_docstring(node):
@@ -101,7 +101,7 @@ class DocumentationIntegrityTests(unittest.TestCase):
                     continue
                 for child in node.body:
                     if (
-                        isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
                         and not child.name.startswith("_")
                         and not ast.get_docstring(child)
                     ):

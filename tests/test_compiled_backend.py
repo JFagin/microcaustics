@@ -47,7 +47,7 @@ def _simulation(backend: str, *, strict: bool) -> mc.MicrolensingSimulation:
         mc.MacroLens(
             0.23,
             0.11,
-            shear_angle_rad=0.17,
+            shear_angle_deg=9.740282517223996,
             smooth_matter_fraction=0.3,
         ),
         mc.PointMassField._from_einstein_radii(
@@ -119,26 +119,34 @@ class CompiledBackendCudaTests(unittest.TestCase):
         self.assertEqual(compiled_tree.last_query_backend, "torch-compile")
 
         grid = mc.PlaneGrid((24, 25), (1.8, 1.9))
-        method = mc.IRSConfig(
-            rays=4_096,
-            ray_chunk_size=4_096,
-            star_chunk_size=4,
-            far_field_approx=mc.FarFieldApproxConfig(enabled=False),
-        )
-        eager_map = eager.magnification_map(region, grid, method=method)
-        compiled_map = compiled.magnification_map(region, grid, method=method)
-        torch.testing.assert_close(
-            compiled_map.values,
-            eager_map.values,
-            rtol=0.0,
-            atol=0.0,
-        )
-        self.assertEqual(compiled_map.metadata["requested_backend"], "torch-compile")
-        self.assertEqual(compiled_map.metadata["effective_backend"], "torch-compile")
-        self.assertEqual(
-            compiled_map.metadata["backend_components"],
-            {"raytrace": "torch-compile", "deposition": "torch-compile"},
-        )
+        for sampling in ("cartesian", "random"):
+            with self.subTest(sampling=sampling):
+                method = mc.IRSConfig(
+                    rays=4_096,
+                    sampling=sampling,
+                    seed=3,
+                    ray_chunk_size=4_096,
+                    star_chunk_size=4,
+                    far_field_approx=mc.FarFieldApproxConfig(enabled=False),
+                )
+                eager_map = eager.magnification_map(region, grid, method=method)
+                compiled_map = compiled.magnification_map(region, grid, method=method)
+                torch.testing.assert_close(
+                    compiled_map.values,
+                    eager_map.values,
+                    rtol=0.0,
+                    atol=0.0,
+                )
+                self.assertEqual(
+                    compiled_map.metadata["requested_backend"], "torch-compile"
+                )
+                self.assertEqual(
+                    compiled_map.metadata["effective_backend"], "torch-compile"
+                )
+                self.assertEqual(
+                    compiled_map.metadata["backend_components"],
+                    {"raytrace": "torch-compile", "deposition": "torch-compile"},
+                )
 
     def test_ipm_reports_partial_compile_for_portable_exact_rasterizer(self) -> None:
         simulation = _simulation("torch-compile", strict=True)

@@ -54,7 +54,7 @@ class SourceGeometry:
             "pixel_scale_m" if self.pixel_scale_m is not None else "field_of_view_uas"
         )
         values = getattr(self, name)
-        values = (values, values) if isinstance(values, (int, float)) else tuple(values)
+        values = (values, values) if isinstance(values, int | float) else tuple(values)
         if len(values) != 2 or any(
             not math.isfinite(value) or value <= 0 for value in values
         ):

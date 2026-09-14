@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 import torch
 
@@ -15,7 +16,7 @@ def _moving_simulation(*, device: str = "cpu", backend: str = "torch-eager"):
         mc.MacroLens(
             0.18,
             0.09,
-            shear_angle_rad=0.17,
+            shear_angle_deg=9.740282517223996,
             smooth_matter_fraction=0.2,
         ),
         mc.PointMassField._from_einstein_radii(
@@ -81,7 +82,7 @@ class PublicWorkflowTests(unittest.TestCase):
                 mc.MacroLens(
                     0.18,
                     0.09,
-                    shear_angle_rad=0.17,
+                    shear_angle_deg=9.740282517223996,
                     smooth_matter_fraction=0.2,
                 ),
                 field,
@@ -118,7 +119,7 @@ class PublicWorkflowTests(unittest.TestCase):
         macro = mc.MacroLens(
             0.18,
             0.09,
-            shear_angle_rad=0.17,
+            shear_angle_deg=9.740282517223996,
             smooth_matter_fraction=0.2,
         )
         runtime = mc.RuntimeConfig(device="cpu", backend="torch-eager")
@@ -260,17 +261,22 @@ class PublicWorkflowTests(unittest.TestCase):
             self.times,
             self.distances,
         )
-        streamed = simulation.light_curve(
-            self.lens_region,
-            self.source_grid,
-            self.times,
-            source,
-            self.distances,
-            method=method,
-            schedule=schedule,
-        )
+        with patch(
+            "microcaustics.photometry._source_offsets_uas",
+            side_effect=AssertionError("aligned sources must not allocate offsets"),
+        ):
+            streamed = simulation.light_curve(
+                self.lens_region,
+                self.source_grid,
+                self.times,
+                source,
+                self.distances,
+                method=method,
+                schedule=schedule,
+            )
         torch.testing.assert_close(streamed.flux, explicit.flux)
         self.assertTrue(streamed.metadata["map_aligned_source_fast_path"])
+        self.assertTrue(streamed.metadata["coherent_source_factorized"])
 
     def test_spatial_chunk_and_temporal_batch_do_not_change_maps(self) -> None:
         simulation = _moving_simulation()

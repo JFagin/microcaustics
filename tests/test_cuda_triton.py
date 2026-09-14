@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -197,6 +198,7 @@ class TritonTaylorTests(unittest.TestCase):
             batched_caustic_crossings_distances_triton,
             batched_sparse_marching_squares_zero_triton,
             marching_squares_zero_triton,
+            ragged_sparse_marching_squares_zero_triton,
             sparse_marching_squares_zero_triton,
         )
 
@@ -282,6 +284,55 @@ class TritonTaylorTests(unittest.TestCase):
                 torch.tensor(lengths, device="cuda"),
             ),
         )
+
+        # Ragged temporal queues preserve the same per-frame geometry without
+        # padding either frame to the other's active-cell count.
+        ragged_signs = torch.tensor(
+            [
+                [1.0, -1.0, -1.0, -1.0],
+                [-1.0, 1.0, -1.0, -1.0],
+                [-1.0, -1.0, 1.0, -1.0],
+            ],
+            device="cuda",
+        )
+        ragged = ragged_sparse_marching_squares_zero_triton(
+            ragged_signs[:, 0],
+            ragged_signs[:, 1],
+            ragged_signs[:, 2],
+            ragged_signs[:, 3],
+            torch.full((3,), -0.5, device="cuda"),
+            torch.full((3,), 0.5, device="cuda"),
+            torch.full((3,), -0.5, device="cuda"),
+            torch.full((3,), 0.5, device="cuda"),
+            torch.zeros((4, 3), device="cuda", dtype=torch.bool),
+            torch.tensor([0, 1, 1], device="cuda"),
+            2,
+        )
+        ragged_rows, _, ragged_flat, _, ragged_frames, ragged_lengths = ragged
+        self.assertEqual(ragged_lengths, (1, 2))
+        torch.testing.assert_close(ragged_flat, torch.cat(ragged_rows))
+        torch.testing.assert_close(
+            ragged_frames,
+            torch.tensor([0, 1, 1], device="cuda", dtype=torch.int32),
+        )
+        for index, corners in enumerate(ragged_signs):
+            expected_row, _ = sparse_marching_squares_zero_triton(
+                corners[0:1],
+                corners[1:2],
+                corners[2:3],
+                corners[3:4],
+                torch.tensor([-0.5], device="cuda"),
+                torch.tensor([0.5], device="cuda"),
+                torch.tensor([-0.5], device="cuda"),
+                torch.tensor([0.5], device="cuda"),
+                torch.zeros((4, 1), device="cuda", dtype=torch.bool),
+            )
+            frame = 0 if index == 0 else 1
+            offset = 0 if index < 2 else 1
+            torch.testing.assert_close(
+                canonical(ragged_rows[frame][offset : offset + 1]),
+                canonical(expected_row),
+            )
 
         segments = torch.tensor(
             [
@@ -501,7 +552,7 @@ class TritonTaylorTests(unittest.TestCase):
         macro = mc.MacroLens(
             0.32,
             0.17,
-            shear_angle_rad=0.23,
+            shear_angle_deg=13.178029288008934,
             smooth_matter_fraction=0.35,
         )
         config = mc.FarFieldApproxConfig(
@@ -578,7 +629,7 @@ class TritonTaylorTests(unittest.TestCase):
             mc.MacroLens(
                 0.25,
                 0.12,
-                shear_angle_rad=0.17,
+                shear_angle_deg=9.740282517223996,
                 smooth_matter_fraction=0.2,
             ),
             field,
@@ -645,6 +696,32 @@ class TritonTaylorTests(unittest.TestCase):
             rtol=0,
             atol=3e-5,
         )
+        indexed_x = torch.cat((x[:127], x[127:301], x[301:]))
+        indexed_y = torch.cat((y[:127], y[127:301], y[301:]))
+        indexed_frames = torch.cat(
+            (
+                torch.zeros(127, device="cuda", dtype=torch.int32),
+                torch.ones(174, device="cuda", dtype=torch.int32),
+                torch.full((212,), 2, device="cuda", dtype=torch.int32),
+            )
+        )
+        expected_indexed_det = torch.cat(
+            (
+                expected_det[0, :127],
+                expected_det[1, 127:301],
+                expected_det[2, 301:],
+            )
+        )
+        torch.testing.assert_close(
+            batch.jacobian_determinant_indexed_flat(
+                indexed_x,
+                indexed_y,
+                indexed_frames,
+            ),
+            expected_indexed_det,
+            rtol=0,
+            atol=3e-5,
+        )
         from microcaustics.solvers import temporal_taylor_far_fields
 
         batch_config = mc.FarFieldApproxConfig(
@@ -680,6 +757,13 @@ class TritonTaylorTests(unittest.TestCase):
             rtol=2e-5,
             atol=1e-7,
         )
+        for actual, expected in zip(exact_batched, frames, strict=True):
+            torch.testing.assert_close(
+                actual.coefficient_imag,
+                expected.coefficient_imag,
+                rtol=2e-5,
+                atol=1e-7,
+            )
         for actual, expected in zip(exact_batched, frames, strict=True):
             torch.testing.assert_close(actual.local_x, expected.local_x)
             torch.testing.assert_close(actual.local_y, expected.local_y)
@@ -761,7 +845,7 @@ class TritonTaylorTests(unittest.TestCase):
             mc.MacroLens(
                 0.14,
                 0.07,
-                shear_angle_rad=0.2,
+                shear_angle_deg=11.459155902616466,
                 smooth_matter_fraction=0.25,
             ),
             mc.PointMassField._from_einstein_radii(
@@ -825,12 +909,16 @@ class TritonTaylorTests(unittest.TestCase):
     def test_biquadratic_v4_materializer_matches_portable_interpolation(self) -> None:
         """The compact Triton interpolation must preserve mapped r=2 geometry."""
 
-        from microcaustics.solvers import biquadratic_nodes
+        from microcaustics.solvers import interpolated_nodes
 
         generator = torch.Generator(device="cuda").manual_seed(31)
         node_x = torch.randn((37, 3, 3), device="cuda", generator=generator)
         node_y = torch.randn((37, 3, 3), device="cuda", generator=generator)
-        expected_x, expected_y = biquadratic_nodes(node_x, node_y, virtual_refinement=4)
+        expected_x, expected_y = interpolated_nodes(
+            node_x,
+            node_y,
+            virtual_refinement=4,
+        )
         actual_x, actual_y = materialize_biquadratic_v4_triton(node_x, node_y)
         torch.testing.assert_close(actual_x, expected_x, rtol=2e-6, atol=5e-7)
         torch.testing.assert_close(actual_y, expected_y, rtol=2e-6, atol=5e-7)
@@ -928,6 +1016,54 @@ class TritonTaylorTests(unittest.TestCase):
             rtol=0.0,
             atol=2.0e-6,
         )
+
+    @unittest.skipUnless(triton_ipm_available(), "CUDA Triton IPM is unavailable")
+    def test_indexed_direct_cell_raster_matches_ragged_launches(self) -> None:
+        """Ragged cell queues must accumulate into their tagged maps only."""
+
+        from microcaustics.solvers.triton_ipm import (
+            TritonRasterWorkspace,
+            accumulate_cells_triton,
+        )
+
+        grid = mc.PlaneGrid((17, 21), (3.4, 4.2))
+        dy, dx = grid.pixel_scale_uas
+        xmin, _, ymin, _ = grid.bounds_uas
+        coordinate = torch.linspace(0.0, 1.0, 5, device="cuda")
+        yy, xx = torch.meshgrid(coordinate, coordinate, indexing="ij")
+        base_x = torch.stack((-1.8 + xx, 0.1 + 0.8 * xx + 0.03 * yy))
+        base_y = torch.stack((-1.4 + yy, 0.2 + 0.9 * yy - 0.02 * xx))
+        rows_x = (base_x[:1], base_x + 0.07, base_x[:0], base_x - 0.04)
+        rows_y = (base_y[:1], base_y - 0.03, base_y[:0], base_y + 0.05)
+        kwargs = dict(
+            xmin=xmin,
+            ymin=ymin,
+            pixel_size_x=dx,
+            pixel_size_y=dy,
+            lens_area_per_triangle_uas2=0.002,
+        )
+        expected = torch.stack(
+            [
+                rasterize_cells_triton(x, y, shape=grid.shape, **kwargs)
+                if x.numel()
+                else torch.zeros(grid.shape, device="cuda")
+                for x, y in zip(rows_x, rows_y, strict=True)
+            ]
+        )
+        flat_x = torch.cat(rows_x)
+        flat_y = torch.cat(rows_y)
+        lengths = [len(row) for row in rows_x]
+        frames = torch.repeat_interleave(
+            torch.arange(4, device="cuda", dtype=torch.int32),
+            torch.tensor(lengths, device="cuda"),
+        )
+        workspace = TritonRasterWorkspace.create(
+            grid.shape, device=torch.device("cuda"), frames=4
+        )
+        accumulate_cells_triton(
+            workspace, flat_x, flat_y, cell_frame_index=frames, **kwargs
+        )
+        torch.testing.assert_close(workspace.result(), expected, rtol=0.0, atol=2e-6)
 
     @unittest.skipUnless(triton_ipm_available(), "CUDA Triton IPM is unavailable")
     def test_all_cell_controls_batch_maps_not_only_far_field(self) -> None:
@@ -1266,7 +1402,9 @@ class TritonTaylorTests(unittest.TestCase):
         )
         common = dict(
             include_labels=True,
-            method=_small_production_method(),
+            method=replace(
+                _small_production_method(), scout_trace_centers=False
+            ),
             schedule=_small_dynamic_schedule(),
             caustics=_small_caustic_config(),
         )
@@ -1283,6 +1421,13 @@ class TritonTaylorTests(unittest.TestCase):
             **common,
         )
         self.assertEqual(concurrent.executed_batch_sizes, (3,))
+        self.assertTrue(
+            all(
+                curve.metadata["cross_system_solver_fused"]
+                and curve.metadata["cross_system_compact_sparse_nodes"]
+                for curve in concurrent.light_curves
+            )
+        )
         for expected, actual in zip(
             serial.light_curves,
             concurrent.light_curves,

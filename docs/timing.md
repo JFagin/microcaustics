@@ -20,7 +20,9 @@ call also populates compatible compiled kernels.
 
 Independent-curve batching collects no wall time by default. Set
 `profile=True` on `batched_system_light_curves` to populate `wall_seconds` and
-`seconds_per_curve`. Otherwise both are `None`. Necessary CUDA stream
+`seconds_per_curve`. Disk-backed batches also report `compute_seconds`,
+`write_seconds`, and time spent waiting for the bounded writer queue. Otherwise
+these timing fields are `None`. Necessary CUDA stream
 dependencies remain in place regardless of profiling. Explicit concurrency
 tuning measures runtime and is therefore always profiled.
 

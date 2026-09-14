@@ -23,7 +23,13 @@ from ..runtime import ResolvedRuntime, RuntimeConfig, resolve_runtime
 from .analytic import GaussianSource
 from .base import PixelatedSource, SourceGeometry
 from .reprocessing import ThermalReprocessingSource
-from .thin_disk import ThinDiskSource, thin_disk_flux_radius_rg
+from .thin_disk import (
+    RadiativeEfficiency,
+    ThinDiskSource,
+    ViscousFluxProfile,
+    _validate_viscous_prescriptions,
+    thin_disk_flux_radius_rg,
+)
 from .transferred_disk import TransferredThinDiskSource
 
 if TYPE_CHECKING:
@@ -230,6 +236,8 @@ class ThinDiskModel:
     position_angle_deg: float = 0.0
     color_correction: float = 1.0
     temperature_slope_beta: float = 0.75
+    viscous_flux_profile: ViscousFluxProfile = "novikov-thorne"
+    radiative_efficiency: RadiativeEfficiency = None
     support_lamp_fraction: float = 0.0
     support_corona_height_above_isco_rg: float = 20.0
     relativity: str = "none"
@@ -240,6 +248,10 @@ class ThinDiskModel:
     name: str = "thin_disk"
 
     def __post_init__(self) -> None:
+        _validate_viscous_prescriptions(
+            self.viscous_flux_profile,
+            self.radiative_efficiency,
+        )
         wavelengths, names = _resolve_bands(
             self.wavelengths_angstrom,
             self.band_names,
@@ -306,6 +318,8 @@ class ThinDiskModel:
             observed_wavelength_angstrom=max(self.wavelengths_angstrom),
             source_redshift=self._redshift(distances),
             temperature_slope_beta=self.temperature_slope_beta,
+            viscous_flux_profile=self.viscous_flux_profile,
+            radiative_efficiency=self.radiative_efficiency,
             color_correction=self.color_correction,
             lamp_fraction=self.support_lamp_fraction,
             corona_height_above_isco_rg=(self.support_corona_height_above_isco_rg),
@@ -382,6 +396,8 @@ class ThinDiskModel:
             position_angle_deg=self.position_angle_deg,
             color_correction=self.color_correction,
             temperature_slope_beta=self.temperature_slope_beta,
+            viscous_flux_profile=self.viscous_flux_profile,
+            radiative_efficiency=self.radiative_efficiency,
             relativity=self.relativity,
             name=self.name,
         )
@@ -416,6 +432,8 @@ class KerrDiskModel:
     source_redshift: float | None = None
     color_correction: float = 1.0
     temperature_slope_beta: float = 0.75
+    viscous_flux_profile: ViscousFluxProfile = "novikov-thorne"
+    radiative_efficiency: RadiativeEfficiency = None
     lamp_fraction: float = 0.1
     corona_height_above_isco_rg: float = 20.0
     driving_signal: DrivingSignal | None = None
@@ -424,6 +442,7 @@ class KerrDiskModel:
     enclosed_flux_fraction: float | None = None
     source_margin: float | None = None
     compile_solver: bool = True
+    warn_on_compile: bool = True
     primary_repair_max_passes: int = 8
     lamppost_nalpha: int = 1024
     lamppost_radial_bins: int = 512
@@ -461,6 +480,8 @@ class KerrDiskModel:
             position_angle_deg=self.position_angle_deg,
             color_correction=self.color_correction,
             temperature_slope_beta=self.temperature_slope_beta,
+            viscous_flux_profile=self.viscous_flux_profile,
+            radiative_efficiency=self.radiative_efficiency,
             support_lamp_fraction=self.lamp_fraction,
             support_corona_height_above_isco_rg=(self.corona_height_above_isco_rg),
             grid=self.grid,
@@ -506,6 +527,8 @@ class KerrDiskModel:
             position_angle_deg=self.position_angle_deg,
             color_correction=self.color_correction,
             temperature_slope_beta=self.temperature_slope_beta,
+            viscous_flux_profile=self.viscous_flux_profile,
+            radiative_efficiency=self.radiative_efficiency,
             support_lamp_fraction=self.lamp_fraction,
             support_corona_height_above_isco_rg=(self.corona_height_above_isco_rg),
             grid=self.grid,
@@ -597,6 +620,9 @@ class KerrDiskModel:
                 self.compile_solver and resolved_runtime.device.type == "cuda"
             ),
             repair_max_passes=self.primary_repair_max_passes,
+            warn_on_compile=(
+                self.warn_on_compile and resolved_runtime.warn_on_compile
+            ),
         )
         # Keep the resolved angular field with standalone GR products so
         # plotting does not require rebuilding cosmological geometry.
@@ -630,6 +656,8 @@ class KerrDiskModel:
                 source_redshift=redshift,
                 color_correction=self.color_correction,
                 temperature_slope_beta=self.temperature_slope_beta,
+                viscous_flux_profile=self.viscous_flux_profile,
+                radiative_efficiency=self.radiative_efficiency,
                 name=self.name,
             )
         coordinates = add_observer_coordinates(
@@ -652,6 +680,9 @@ class KerrDiskModel:
             compile_solver=(
                 self.compile_solver and resolved_runtime.device.type == "cuda"
             ),
+            warn_on_compile=(
+                self.warn_on_compile and resolved_runtime.warn_on_compile
+            ),
         )
         return ThermalReprocessingSource.from_axis_lamppost(
             geometry,
@@ -665,6 +696,8 @@ class KerrDiskModel:
             lamp_fraction=self.lamp_fraction,
             color_correction=self.color_correction,
             temperature_slope_beta=self.temperature_slope_beta,
+            viscous_flux_profile=self.viscous_flux_profile,
+            radiative_efficiency=self.radiative_efficiency,
             name=self.name,
         )
 
@@ -723,7 +756,7 @@ class GaussianModel:
         width = self.sigma_m if self.sigma_uas is None else self.sigma_uas
         widths = (
             (float(width),)
-            if isinstance(width, (int, float))
+            if isinstance(width, int | float)
             else tuple(float(value) for value in width)
         )
         if not widths or any(

@@ -72,12 +72,14 @@ sequence shown below.
 - `source_models/00_relativistic_disks_and_reverberation` combines the Kerr
   disk, variable-disk and transfer-function animations, and continuum
   reverberation without microlensing. The remaining source notebooks cover
-  expanding supernovae and arbitrary custom sources.
+  expanding supernovae, arbitrary custom sources, spectral microlensing, and
+  selectable or user-defined viscous disk profiles.
 - `workflows/` covers multi-image observations, macro-image rendering, a full
   lensed-quasar calculation, streaming/export, and one consolidated dataset
   notebook with fixed-system and prior-sampled training sets. The dataset
   notebook directly executes `batched_system_light_curves` for independent
-  stellar realizations and also shows the multi-GPU command-line workflow.
+  stellar realizations. The same API batches mixed single- and multi-image
+  systems and can write either flat files or one combined NPZ archive.
 - `validation/` contains the independent Weisenbach and SIM5 comparisons,
   convergence/performance studies, and the analytic single-point-lens test.
 

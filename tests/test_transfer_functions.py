@@ -48,6 +48,30 @@ class ResponseSource:
         return values
 
 
+class BatchedResponseSource(ResponseSource):
+    @staticmethod
+    def batched_transfer_function(
+        edges,
+        *,
+        magnification,
+        driver_amplitude=1.0,
+        normalize=True,
+        spatial_chunk_size=262_144,
+    ):
+        del spatial_chunk_size
+        return torch.stack(
+            [
+                ResponseSource.transfer_function(
+                    edges,
+                    magnification=frame,
+                    driver_amplitude=driver_amplitude,
+                    normalize=normalize,
+                )
+                for frame in magnification
+            ]
+        )
+
+
 def simulation() -> mc.MicrolensingSimulation:
     return mc.MicrolensingSimulation.create(
         mc.MacroLens(0.0, 0.0),
@@ -150,6 +174,39 @@ class TransferFunctionTests(unittest.TestCase):
             result.mean_delays_days,
             through_simulation.mean_delays_days,
         )
+
+    def test_dynamic_series_batches_supported_response_sources(self) -> None:
+        solver = simulation()
+        common = dict(
+            simulation=solver,
+            lens_region=mc.PlaneRegion((2.0, 2.0)),
+            source_grid=mc.PlaneGrid((5, 5), (1.0, 1.0)),
+            times_days=[0.0, 1.0, 2.0],
+            source=BatchedResponseSource(),
+            distances=mc.LensingDistances(1.0e25, 2.0e25, 1.0e25),
+            delay_edges_days=[0.0, 1.0, 2.0],
+            method=mc.IPMConfig(
+                rays=25,
+                refinement=1,
+                virtual_refinement=1,
+                tiled=False,
+                far_field_approx=mc.FarFieldApproxConfig(enabled=False),
+            ),
+        )
+        batched = mc.streaming_microlensed_transfer_functions(
+            **common,
+            response_batch_size=2,
+        )
+        sequential = mc.streaming_microlensed_transfer_functions(
+            **common,
+            response_batch_size=1,
+        )
+        torch.testing.assert_close(batched.values, sequential.values)
+        torch.testing.assert_close(
+            batched.mean_delays_days,
+            sequential.mean_delays_days,
+        )
+        self.assertEqual(batched.metadata["response_batch_size"], 2)
 
 
 if __name__ == "__main__":

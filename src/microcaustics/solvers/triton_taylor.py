@@ -94,6 +94,64 @@ if triton is not None:
         tl.store(output_imag_ptr + output, accumulated_imag, mask=active_orders)
 
     @triton.jit
+    def _rounded_local_pack_kernel(
+        star_x_ptr,
+        star_y_ptr,
+        mass_ptr,
+        local_x_ptr,
+        local_y_ptr,
+        local_mass_ptr,
+        local_counts_ptr,
+        local_overflow_ptr,
+        n_stars,
+        cells_per_frame,
+        xmin,
+        ymin,
+        cell_dx,
+        cell_dy,
+        exact_radius2,
+        NY: tl.constexpr,
+        BLOCK_STARS: tl.constexpr,
+        MAX_LOCAL: tl.constexpr,
+    ):
+        packed_cell = tl.program_id(0)
+        frame = packed_cell // cells_per_frame
+        cell = packed_cell - frame * cells_per_frame
+        cell_x = cell // NY
+        cell_y = cell - cell_x * NY
+        left_x = xmin + cell_x * cell_dx
+        left_y = ymin + cell_y * cell_dy
+        right_x = left_x + cell_dx
+        right_y = left_y + cell_dy
+        local_count = tl.zeros((), tl.int32)
+        for start in tl.range(0, n_stars, BLOCK_STARS):
+            stars = start + tl.arange(0, BLOCK_STARS)
+            active = stars < n_stars
+            star_offset = frame * n_stars + stars
+            star_x = tl.load(star_x_ptr + star_offset, mask=active, other=0.0)
+            star_y = tl.load(star_y_ptr + star_offset, mask=active, other=0.0)
+            mass = tl.load(mass_ptr + star_offset, mask=active, other=0.0)
+            distance_x = tl.maximum(
+                tl.maximum(left_x - star_x, star_x - right_x), 0.0
+            )
+            distance_y = tl.maximum(
+                tl.maximum(left_y - star_y, star_y - right_y), 0.0
+            )
+            local = active & (
+                distance_x * distance_x + distance_y * distance_y <= exact_radius2
+            )
+            local_int = local.to(tl.int32)
+            local_rank = local_count + tl.cumsum(local_int, axis=0) - 1
+            store_local = local & (local_rank < MAX_LOCAL)
+            local_offset = packed_cell * MAX_LOCAL + local_rank
+            tl.store(local_x_ptr + local_offset, star_x, mask=store_local)
+            tl.store(local_y_ptr + local_offset, star_y, mask=store_local)
+            tl.store(local_mass_ptr + local_offset, mass, mask=store_local)
+            local_count += tl.sum(local_int, axis=0)
+        tl.store(local_counts_ptr + packed_cell, local_count)
+        tl.store(local_overflow_ptr + packed_cell, local_count > MAX_LOCAL)
+
+    @triton.jit
     def _far_field_p4_query_kernel(
         x_ptr,
         y_ptr,
@@ -424,6 +482,89 @@ def center_coefficients_rounded_local_batch_triton(
     return real, imag
 
 
+def center_coefficients_and_local_packs_batch_triton(
+    star_x: torch.Tensor,
+    star_y: torch.Tensor,
+    mass: torch.Tensor,
+    *,
+    nx: int,
+    ny: int,
+    xmin: float,
+    ymin: float,
+    cell_dx: float,
+    cell_dy: float,
+    exact_radius: float,
+    order: int,
+    local_capacity: int = 256,
+    star_block: int = 256,
+):
+    """Build temporal coefficients and local-star packs in one membership pass."""
+
+    if not triton_taylor_available():
+        raise RuntimeError("Triton Taylor coefficient construction is unavailable")
+    if star_x.device.type != "cuda" or star_x.dtype != torch.float32:
+        raise ValueError("Triton Taylor coefficient construction requires CUDA float32")
+    if star_x.ndim != 2 or star_y.shape != star_x.shape:
+        raise ValueError("batched star coordinates must share shape [frame, star]")
+    if mass.ndim == 1:
+        mass = mass[None].expand(star_x.shape[0], -1)
+    if mass.shape != star_x.shape:
+        raise ValueError("batched mass must have shape [star] or [frame, star]")
+    capacity = int(local_capacity)
+    if capacity < 1:
+        raise ValueError("local_capacity must be positive")
+    star_x = star_x.contiguous()
+    star_y = star_y.contiguous()
+    mass = mass.contiguous()
+    frames, stars = (int(value) for value in star_x.shape)
+    order_count = int(order) + 1
+    if not 1 <= order_count <= 16:
+        raise ValueError("order must lie in [0, 15]")
+    cells = int(nx) * int(ny)
+    real, imag = center_coefficients_rounded_local_batch_triton(
+        star_x,
+        star_y,
+        mass,
+        nx=nx,
+        ny=ny,
+        xmin=xmin,
+        ymin=ymin,
+        cell_dx=cell_dx,
+        cell_dy=cell_dy,
+        exact_radius=exact_radius,
+        order=order,
+        star_block=star_block,
+    )
+    local_shape = (frames, cells, capacity)
+    local_x = torch.zeros(local_shape, device=star_x.device, dtype=star_x.dtype)
+    local_y = torch.zeros_like(local_x)
+    local_mass = torch.zeros_like(local_x)
+    counts = torch.empty((frames, cells), device=star_x.device, dtype=torch.int32)
+    overflow = torch.empty_like(counts)
+    _rounded_local_pack_kernel[(frames * cells,)](
+        star_x,
+        star_y,
+        mass,
+        local_x,
+        local_y,
+        local_mass,
+        counts,
+        overflow,
+        stars,
+        cells,
+        float(xmin),
+        float(ymin),
+        float(cell_dx),
+        float(cell_dy),
+        float(exact_radius) ** 2,
+        NY=int(ny),
+        BLOCK_STARS=int(star_block),
+        MAX_LOCAL=capacity,
+        num_warps=4,
+    )
+    return real, imag, local_x, local_y, local_mass, counts, overflow
+
+
 def evaluate_far_field_p4_triton(
     far_field,
     x: torch.Tensor,
@@ -661,9 +802,10 @@ def evaluate_far_field_p4_indexed_triton(
     y: torch.Tensor,
     frame_index: torch.Tensor,
     *,
+    jacobian: bool = False,
     ray_block: int = 64,
     star_block: int = 32,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Evaluate a ragged ray queue whose entries select temporal frames.
 
     Unlike :func:`evaluate_far_field_p4_batch_triton`, coordinates need not
@@ -722,9 +864,9 @@ def evaluate_far_field_p4_indexed_triton(
         NODES=far_field_batch.config.nodes_per_cell_axis,
         RAY_BLOCK=int(ray_block),
         STAR_BLOCK=int(star_block),
-        DO_JACOBIAN=False,
+        DO_JACOBIAN=bool(jacobian),
         FRAME_INDEXED=True,
         GRID_COORDS=False,
         num_warps=4,
     )
-    return output_x, output_y
+    return output_x if jacobian else (output_x, output_y)

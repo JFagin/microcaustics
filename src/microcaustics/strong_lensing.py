@@ -194,14 +194,14 @@ class MacroImageSolution:
     shear: float
     shear_gamma1: float
     shear_gamma2: float
-    shear_angle_rad: float
+    shear_angle_deg: float
     source_residual_arcsec: float
 
     @property
-    def shear_angle_deg(self) -> float:
-        """Return the local shear position angle in degrees."""
+    def shear_angle_rad(self) -> float:
+        """Return the local shear position angle in radians."""
 
-        return math.degrees(self.shear_angle_rad)
+        return math.radians(self.shear_angle_deg)
 
     def local_macro_lens(
         self,
@@ -279,12 +279,15 @@ def solve_macroimages(
         if deduplication_tolerance_arcsec is None
         else float(deduplication_tolerance_arcsec)
     )
-    if min(
-        source_tolerance,
-        cluster_tolerance,
-        deduplication_tolerance,
-        refinement_tolerance_arcsec,
-    ) <= 0:
+    if (
+        min(
+            source_tolerance,
+            cluster_tolerance,
+            deduplication_tolerance,
+            refinement_tolerance_arcsec,
+        )
+        <= 0
+    ):
         raise ValueError("image-finding tolerances must be positive")
 
     axis = torch.linspace(
@@ -298,6 +301,8 @@ def solve_macroimages(
     flat_x, flat_y = grid_x.reshape(-1), grid_y.reshape(-1)
     traced_x, traced_y = model.raytrace(flat_x, flat_y)
     residual = torch.hypot(traced_x - beta_x, traced_y - beta_y)
+    # The grid is only a robust seed finder. Nearby selected pixels are merged
+    # before continuous root refinement so one image does not launch many fits.
     selected = residual < source_tolerance
     if not bool(torch.any(selected)):
         raise RuntimeError("no macroimage seeds found. Enlarge the field or tolerance")
@@ -346,6 +351,9 @@ def solve_macroimages(
         ):
             refined.append((fit_residual, float(fit.x[0]), float(fit.x[1])))
     refined.sort(key=lambda value: value[0])
+    # Keep the lowest-residual representative of each converged image. This
+    # second deduplication is required because separate seed clusters can flow
+    # to the same nonlinear root.
     unique = []
     for candidate in refined:
         if all(
@@ -380,6 +388,8 @@ def solve_macroimages(
     if not valid_delay:
         raise ValueError("macro-model time delays must be finite with shape [image]")
     relative_delay = absolute_delay - absolute_delay.min()
+    # Arrival-time ordering is the public deterministic order; user-provided
+    # names are assigned only after this physical ordering is established.
     ordering = torch.argsort(relative_delay).detach().cpu().tolist()
     if image_names is not None and len(image_names) != len(ordering):
         raise ValueError("image_names must match the number of solved macroimages")
@@ -406,7 +416,7 @@ def solve_macroimages(
                 shear=float(gamma[solution_index]),
                 shear_gamma1=float(gamma1[solution_index]),
                 shear_gamma2=float(gamma2[solution_index]),
-                shear_angle_rad=float(angle[solution_index]),
+                shear_angle_deg=math.degrees(float(angle[solution_index])),
                 source_residual_arcsec=float(unique[solution_index][0]),
             )
         )

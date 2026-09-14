@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -14,7 +15,7 @@ import microcaustics as mc
 
 
 class ObservationTests(unittest.TestCase):
-    def test_random_wfd_cadence_reads_op_sim_without_modifying_it(self) -> None:
+    def test_random_wfd_cadence_reuses_index_without_reopening_sqlite(self) -> None:
         """Exercise deterministic sky selection, filtering, and time ordering."""
 
         with tempfile.TemporaryDirectory(prefix="microcaustics-opsim-") as temporary:
@@ -45,28 +46,103 @@ class ObservationTests(unittest.TestCase):
             connection.commit()
             connection.close()
 
-            first = mc.sample_random_rubin_wfd_cadence(
-                path,
+            index = mc.RubinOpSimCadenceIndex.from_database(path)
+            first = index.sample(
                 seed=42,
+                survey="wfd",
                 radius_deg=0.5,
                 min_visits=4,
                 max_visits=10,
                 duration_days=4.0,
             )
-            second = mc.sample_random_rubin_wfd_cadence(
-                path,
-                seed=42,
-                radius_deg=0.5,
-                min_visits=4,
-                max_visits=10,
-                duration_days=4.0,
-            )
+            with patch(
+                "microcaustics.observations.sqlite3.connect",
+                side_effect=AssertionError("cached sampling reopened SQLite"),
+            ):
+                second = index.sample(
+                    seed=42,
+                    survey="wfd",
+                    radius_deg=0.5,
+                    min_visits=4,
+                    max_visits=10,
+                    duration_days=4.0,
+                )
             np.testing.assert_array_equal(first.time_days, second.time_days)
             np.testing.assert_array_equal(first.mjd, second.mjd)
             self.assertTrue(np.all(np.diff(first.time_days) >= 0.0))
             self.assertLessEqual(float(first.time_days[-1]), 4.0)
             self.assertNotIn("DD", first.band_names)
             self.assertEqual(first.metadata["survey"], "Rubin WFD")
+
+    def test_index_supports_sky_position_wfd_and_named_or_random_ddf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="microcaustics-opsim-") as temporary:
+            path = Path(temporary) / "opsim.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE observations ("
+                "fieldRA REAL, fieldDec REAL, observationStartMJD REAL, "
+                "band TEXT, fiveSigmaDepth REAL, seeingFwhmEff REAL, "
+                "science_program TEXT, target_name TEXT)"
+            )
+            rows = [
+                (10.0, 0.0, 60000.0, "u", 23.5, 0.9, "", "WFD"),
+                (359.8, -10.0, 60001.0, "g", 24.5, 0.8, "", "WFD"),
+                (0.2, -10.0, 60003.0, "r", 24.2, 0.7, "", "WFD"),
+                (150.0, 2.2, 60002.0, "g", 25.5, 0.6, "DD", "DD:COSMOS, lowdust"),
+                (150.1, 2.2, 60004.0, "i", 25.0, 0.6, "DD", "DD:COSMOS, lowdust"),
+                (150.0, 2.2, 60005.0, "r", 24.5, 0.7, "", "WFD"),
+                (53.0, -28.1, 60006.0, "z", 24.0, 0.8, "DD", "DD:ECDFS"),
+            ]
+            connection.executemany(
+                "INSERT INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows
+            )
+            connection.commit()
+            connection.close()
+
+            index = mc.RubinOpSimCadenceIndex.from_database(path, bin_size_deg=0.5)
+            self.assertIs(
+                index,
+                mc.RubinOpSimCadenceIndex.from_database(path, bin_size_deg=0.5),
+            )
+            self.assertEqual(set(index.ddf_fields), {"COSMOS", "ECDFS"})
+
+            wrapped = index.at_sky_position(
+                359.9,
+                -10.0,
+                survey="wfd",
+                radius_deg=0.5,
+                duration_days=None,
+            )
+            np.testing.assert_array_equal(wrapped.mjd, [60001.0, 60003.0])
+            np.testing.assert_array_equal(wrapped.time_days, [1.0, 3.0])
+
+            cosmos = index.sample(
+                seed=3,
+                survey="ddf",
+                field="cosmos",
+                radius_deg=0.5,
+                duration_days=None,
+            )
+            self.assertEqual(cosmos.metadata["ddf_field"], "COSMOS")
+            self.assertEqual(cosmos.band_names, ("g", "i"))
+            cosmos_all = index.sample(
+                seed=3,
+                survey="ddf",
+                field="COSMOS",
+                include_wfd=True,
+                radius_deg=0.5,
+                duration_days=None,
+            )
+            self.assertEqual(cosmos_all.band_names, ("g", "i", "r"))
+            random_ddf = index.sample(
+                seed=4,
+                survey="ddf",
+                radius_deg=0.5,
+                duration_days=None,
+            )
+            self.assertIn(random_ddf.metadata["ddf_field"], index.ddf_fields)
+            with self.assertRaisesRegex(ValueError, "only valid"):
+                index.sample(seed=0, survey="wfd", field="COSMOS")
 
     def test_rubin_uncertainty_matches_m5_definition(self) -> None:
         magnitude = torch.tensor([24.0, 24.0], dtype=torch.float64)
@@ -118,6 +194,41 @@ class ObservationTests(unittest.TestCase):
         torch.testing.assert_close(observed.magnitude, observed.noiseless_magnitude)
         self.assertEqual(observed.band_names, ("g", "r"))
         self.assertTrue(bool(torch.all(observed.magnitude_error > 0)))
+
+        single = mc.observe_light_curve(
+            curve_a,
+            cadence,
+            image_name="A",
+            zero_point_flux=10.0,
+            add_noise=False,
+            gamma_by_band={"g": 0.02, "r": 0.03},
+            systematic_floor_mag=0.01,
+        )
+        torch.testing.assert_close(single.magnitude, expected[:, 0])
+        torch.testing.assert_close(single.magnitude, single.noiseless_magnitude)
+        self.assertEqual(tuple(single.magnitude.shape), (cadence.visit_count,))
+        self.assertEqual(single.image_name, "A")
+        self.assertEqual(single.metadata["systematic_floor_mag"], 0.01)
+
+        noisy_first = mc.observe_multi_image_light_curves(
+            curves,
+            cadence,
+            zero_point_flux=10.0,
+            seed=17,
+            gamma_by_band={"g": 0.02, "r": 0.03},
+            systematic_floor_mag=0.01,
+        )
+        noisy_second = mc.observe_multi_image_light_curves(
+            curves,
+            cadence,
+            zero_point_flux=10.0,
+            seed=17,
+            gamma_by_band={"g": 0.02, "r": 0.03},
+            systematic_floor_mag=0.01,
+        )
+        torch.testing.assert_close(noisy_first.magnitude, noisy_second.magnitude)
+        self.assertEqual(tuple(noisy_first.magnitude.shape), (2, 2))
+        torch.testing.assert_close(noisy_first.time_days, noisy_second.time_days)
 
     def test_select_bands_preserves_registered_visit_metadata(self) -> None:
         cadence = mc.SurveyCadence(

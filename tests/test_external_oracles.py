@@ -73,7 +73,7 @@ class NumPyOracleTests(unittest.TestCase):
         macro = mc.MacroLens(
             convergence=0.43,
             shear=0.21,
-            shear_angle_rad=0.37,
+            shear_angle_deg=math.degrees(0.37),
             smooth_matter_fraction=0.35,
         )
         stars = mc.PointMassField._from_einstein_radii(
@@ -366,7 +366,7 @@ class LenstronomyOracleTests(unittest.TestCase):
             mc.MacroLens(
                 convergence,
                 shear,
-                shear_angle_rad=angle,
+                shear_angle_deg=math.degrees(angle),
                 smooth_matter_fraction=1.0,
             ),
             _empty_field(),
@@ -439,7 +439,7 @@ class LenstronomyOracleTests(unittest.TestCase):
             mc.MacroLens(
                 convergence,
                 shear,
-                shear_angle_rad=angle,
+                shear_angle_deg=math.degrees(angle),
                 smooth_matter_fraction=1.0,
             ),
             mc.PointMassField._from_einstein_radii(
