@@ -20,6 +20,7 @@ from .production import (
     dynamic_labeled_maps,
     multirate_labeled_light_curve,
     streaming_labeled_light_curve,
+    streaming_labeled_light_curves,
 )
 
 __all__ = [
@@ -37,6 +38,7 @@ __all__ = [
     "dynamic_labeled_maps",
     "multirate_labeled_light_curve",
     "streaming_labeled_light_curve",
+    "streaming_labeled_light_curves",
     "label_caustic_fields",
     "production_anchor_gauge_points",
 ]

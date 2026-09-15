@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -46,12 +46,16 @@ def _transferred_brightness_from_temperature4(
         dtype=dtype,
     )
     rest_wavelength_m = wavelengths * 1.0e-10 / (1.0 + redshift)
-    exponent = _H * _C / (
-        rest_wavelength_m
-        * local_transfer.gfactor[..., None]
-        * _K_B
-        * color
-        * temperature[..., None].clamp_min(1.0e-12)
+    exponent = (
+        _H
+        * _C
+        / (
+            rest_wavelength_m
+            * local_transfer.gfactor[..., None]
+            * _K_B
+            * color
+            * temperature[..., None].clamp_min(1.0e-12)
+        )
     )
     intensity_nu = (
         2.0
@@ -168,6 +172,13 @@ class TransferredThinDiskSource:
         width_m = self.geometry.shape[1] * self.geometry.pixel_scale_m[1]
         return 0.5 * min(float(height_m), float(width_m))
 
+    def with_bands(
+        self, bands_angstrom: Mapping[str, float]
+    ) -> TransferredThinDiskSource:
+        """Reuse the achromatic observer transfer at new observed wavelengths."""
+
+        return replace(self, geometry=self.geometry.with_bands(bands_angstrom))
+
     def brightness(
         self,
         times_days: torch.Tensor | Sequence[float] | float,
@@ -198,9 +209,7 @@ class TransferredThinDiskSource:
             "source_redshift": scalar(self.source_redshift),
             "color_correction": scalar(self.color_correction),
             "temperature_slope_beta": scalar(self.temperature_slope_beta),
-            "viscous_flux_profile": _prescription_name(
-                self.viscous_flux_profile
-            ),
+            "viscous_flux_profile": _prescription_name(self.viscous_flux_profile),
             "viscous_flux_profile_metadata": _prescription_metadata(
                 self.viscous_flux_profile
             ),

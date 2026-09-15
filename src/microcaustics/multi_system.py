@@ -625,6 +625,8 @@ class MultiImageSystem:
         source: PixelatedSource | PhysicalSourceModel | None = None,
         include_labels: bool = False,
         apply_driving_signal: bool | None = None,
+        include_microlensing_only: bool = False,
+        band_batch_size: int | None = None,
         keep_maps_at_days: Sequence[float]
         | Mapping[str, Sequence[float]]
         | None = None,
@@ -638,6 +640,8 @@ class MultiImageSystem:
         sets a separate photometry cadence. Arrival delays shift source emission,
         not stellar motion. ``apply_driving_signal=None`` uses an attached driver,
         ``False`` retains its mean heating, and ``True`` requires a driver.
+        ``include_microlensing_only=True`` attaches the shared-map mean-driver
+        comparison to every macroimage light curve.
 
         Plain ``rays``, ``temporal_batch_size``, ``scout_refresh_frames``, and
         ``label_batch_size`` override advanced method and schedule configurations.
@@ -650,6 +654,10 @@ class MultiImageSystem:
         ordered by ``map_times_days``. Missing retention epochs warn and are omitted.
         """
 
+        if include_microlensing_only and apply_driving_signal is False:
+            raise ValueError(
+                "include_microlensing_only=True requires the driven light curves"
+            )
         for value, label in (
             (times_days, "times_days"),
             (flux_times_days, "flux_times_days"),
@@ -693,6 +701,10 @@ class MultiImageSystem:
             include_labels=include_labels,
         )
         shared_source = system._shared_source(None, realizations)
+        microlensing_only_source = None
+        if include_microlensing_only:
+            _validate_source_driver(shared_source, True)
+            microlensing_only_source = realizations[0]._mean_source
         if apply_driving_signal is False:
             shared_source = realizations[0]._mean_source
         if use_multirate:
@@ -702,7 +714,9 @@ class MultiImageSystem:
                 shared_source,
                 self._shared_distances(),
                 include_labels=include_labels,
+                band_batch_size=band_batch_size,
                 map_observers=observers,
+                microlensing_only_source=microlensing_only_source,
             )
         else:
             result = simulation.light_curves(
@@ -710,7 +724,9 @@ class MultiImageSystem:
                 shared_source,
                 self._shared_distances(),
                 include_labels=include_labels,
+                band_batch_size=band_batch_size,
                 map_observers=observers,
+                microlensing_only_source=microlensing_only_source,
             )
         return replace(
             result,

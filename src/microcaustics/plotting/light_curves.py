@@ -101,11 +101,7 @@ def plot_light_curve(
         ax.set_ylabel(
             "Relative magnitude"
             if normalize
-            else (
-                "Brightness [AB mag]"
-                if zero_point_flux is None
-                else "Brightness [mag]"
-            )
+            else "brightness [mag]"
         )
         if invert_magnitude_axis:
             ax.invert_yaxis()
@@ -189,7 +185,7 @@ def plot_photometric_observations(
             color=colors[name], label=name,
         )
     ax.set_xlabel("Time [days]")
-    ax.set_ylabel("Brightness [mag]")
+    ax.set_ylabel("brightness [mag]")
     ax.invert_yaxis()
     ax.set_title(f"Observed image {observations.image_names[image_index]}")
     ax.legend(ncol=3)

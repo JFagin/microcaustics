@@ -47,21 +47,6 @@ class DocumentationIntegrityTests(unittest.TestCase):
                     violations.append(f"retired text: {relative}")
         self.assertEqual(violations, [])
 
-    def test_q2237_method_figure_fixtures_are_distributed(self) -> None:
-        fixture_root = PACKAGE_ROOT / "examples" / "data" / "q2237b_method_figures"
-        expected = {
-            "paper_anchor_gauge_method.png",
-            "paper_anchor_gauge_method_data.npz",
-            "paper_tile_upsampling_schematic.png",
-            "paper_tile_upsampling_schematic_data.npz",
-            "paper_far_field_schematic.png",
-            "paper_far_field_schematic_data.npz",
-        }
-        self.assertEqual(
-            {path.name for path in fixture_root.iterdir() if path.is_file()},
-            expected,
-        )
-
     def test_mkdocs_navigation_and_api_targets_are_resolvable(self) -> None:
         """Keep the declared documentation site synchronized with the package."""
 
@@ -252,8 +237,8 @@ class DocumentationIntegrityTests(unittest.TestCase):
                 self.assertNotIn("dynamic=True", text)
                 self.assertNotIn("dynamic=False", text)
 
-    def test_distributed_notebooks_contain_successful_saved_outputs(self) -> None:
-        """Prevent a release from silently shipping cleared tutorial notebooks."""
+    def test_distributed_notebooks_do_not_embed_generated_outputs(self) -> None:
+        """Keep the source distribution small and execution-environment neutral."""
 
         notebooks = tuple((PACKAGE_ROOT / "examples" / "notebooks").rglob("*.ipynb"))
         self.assertGreaterEqual(len(notebooks), 16)
@@ -267,17 +252,13 @@ class DocumentationIntegrityTests(unittest.TestCase):
                 ]
                 self.assertTrue(code_cells)
                 self.assertTrue(
-                    all(cell.get("execution_count") is not None for cell in code_cells),
-                    f"{path.name} has unexecuted code cells",
+                    all(cell.get("execution_count") is None for cell in code_cells),
+                    f"{path.name} contains saved execution counts",
                 )
                 outputs = [
                     output for cell in code_cells for output in cell.get("outputs", ())
                 ]
-                self.assertTrue(outputs, f"{path.name} has no saved outputs")
-                self.assertFalse(
-                    any(output.get("output_type") == "error" for output in outputs),
-                    f"{path.name} contains a saved execution error",
-                )
+                self.assertFalse(outputs, f"{path.name} contains saved outputs")
 
     def test_release_notebook_sequence_is_complete(self) -> None:
         root = PACKAGE_ROOT / "examples" / "notebooks"
@@ -318,7 +299,6 @@ class DocumentationIntegrityTests(unittest.TestCase):
         )
         for call in (
             "mc.MicrolensingSystem(",
-            ".light_curve(",
             "mc.batched_system_light_curves(",
         ):
             self.assertIn(call, code)

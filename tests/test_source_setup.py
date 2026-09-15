@@ -49,6 +49,12 @@ def test_angular_geometry_is_resolved_without_mutating_input(dtype):
     assert geometry.pixel_scale_m is None
     assert resolved.resolve(distances) is resolved
 
+    rebound = resolved.with_bands({"u": 3671.0, "y": 9712.0})
+    assert rebound.shape == resolved.shape
+    assert rebound.pixel_scale_m == resolved.pixel_scale_m
+    assert rebound.band_names == ("u", "y")
+    assert rebound.wavelengths_angstrom == (3671.0, 9712.0)
+
 
 @pytest.mark.parametrize(
     "kwargs",

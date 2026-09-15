@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import inspect
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 import torch
 
@@ -19,6 +19,7 @@ from ..relativity import (
     axis_lamppost_profile,
     trace_primary_equatorial,
 )
+from ..relativity.coordinates import add_observer_coordinates_batch
 from ..runtime import ResolvedRuntime, RuntimeConfig, resolve_runtime
 from .analytic import GaussianSource
 from .base import PixelatedSource, SourceGeometry
@@ -303,6 +304,16 @@ class ThinDiskModel:
             )
         return float(value)
 
+    def with_bands(self, bands_angstrom: Mapping[str, float]) -> ThinDiskModel:
+        """Return the same physical disk with different observed bands."""
+
+        return replace(
+            self,
+            wavelengths_angstrom=(),
+            band_names=(),
+            bands_angstrom=bands_angstrom,
+        )
+
     def support_radius_m(
         self,
         distances: LensingDistances,
@@ -417,8 +428,12 @@ class KerrDiskModel:
 
     ``grid`` controls source resolution and enclosed-flux support.
     ``lamppost_nalpha`` and ``lamppost_radial_bins`` affect only a variable
-    lamppost source. ``compile_solver`` controls the one-time Torch compilation
-    of the Kerr integrations and does not alter the physical model.
+    lamppost source. ``observer_coordinate_chunk_size`` controls the fixed,
+    padded observer-delay launch shape; the default suits typical modern GPUs
+    and is reduced automatically after an out-of-memory error. The emission
+    azimuth is omitted by default because an axisymmetric disk needs only the
+    delay. ``compile_solver`` controls one-time Torch compilation and does not
+    alter the physical model.
     """
 
     black_hole_mass_solar: float
@@ -444,6 +459,9 @@ class KerrDiskModel:
     compile_solver: bool = True
     warn_on_compile: bool = True
     primary_repair_max_passes: int = 8
+    observer_coordinate_chunk_size: int = 524_288
+    observer_coordinate_repair_device: str = "cpu"
+    compute_emission_azimuth: bool = False
     lamppost_nalpha: int = 1024
     lamppost_radial_bins: int = 512
     name: str = "kerr_thin_disk"
@@ -497,6 +515,12 @@ class KerrDiskModel:
             raise ValueError("corona_height_above_isco_rg must be non-negative")
         if self.primary_repair_max_passes < 0:
             raise ValueError("primary_repair_max_passes must be non-negative")
+        if self.observer_coordinate_chunk_size < 1:
+            raise ValueError("observer_coordinate_chunk_size must be positive")
+        if self.observer_coordinate_repair_device not in {"cpu", "same"}:
+            raise ValueError(
+                "observer_coordinate_repair_device must be 'cpu' or 'same'"
+            )
         if self.lamppost_nalpha < 16:
             raise ValueError("lamppost_nalpha must be at least 16")
         if self.lamppost_radial_bins < 16:
@@ -548,6 +572,16 @@ class KerrDiskModel:
 
         return replace(self, driving_signal=signal)
 
+    def with_bands(self, bands_angstrom: Mapping[str, float]) -> KerrDiskModel:
+        """Return the same physical disk with different observed bands."""
+
+        return replace(
+            self,
+            wavelengths_angstrom=(),
+            band_names=(),
+            bands_angstrom=bands_angstrom,
+        )
+
     def recommended_grid(
         self,
         distances: LensingDistances,
@@ -576,130 +610,322 @@ class KerrDiskModel:
         Resolved angular extent is retained in the transfer metadata for plots.
         """
 
-        distances = _resolve_source_distances(
+        plan = _prepare_kerr_pixelation(
+            self,
             distances,
             source_redshift=source_redshift,
-            model_redshift=self.source_redshift,
             H0=H0,
             Om0=Om0,
+            grid=grid,
+            policy=policy,
             runtime=runtime,
         )
+        return _finish_kerr_pixelation(plan)
 
-        resolved_grid = (
-            self.recommended_grid(distances, policy) if grid is None else grid
+
+@dataclass(frozen=True)
+class _KerrPixelationPlan:
+    model: KerrDiskModel
+    distances: LensingDistances
+    runtime: ResolvedRuntime
+    grid: PlaneGrid
+    redshift: float
+    half_width_rg: float
+    screen: ObserverScreen
+    primary: object
+    geometry: SourceGeometry
+
+
+def _prepare_kerr_pixelation(
+    model: KerrDiskModel,
+    distances: LensingDistances | None,
+    *,
+    source_redshift: float | None = None,
+    H0: float | None = None,
+    Om0: float | None = None,
+    grid: PlaneGrid | None = None,
+    policy: SourceGridConfig | None = None,
+    runtime: RuntimeConfig | ResolvedRuntime | None = None,
+) -> _KerrPixelationPlan:
+    """Resolve geometry and primary transfer before optional pooled delays."""
+
+    distances = _resolve_source_distances(
+        distances,
+        source_redshift=source_redshift,
+        model_redshift=model.source_redshift,
+        H0=H0,
+        Om0=Om0,
+        runtime=runtime,
+    )
+    resolved_grid = model.recommended_grid(distances, policy) if grid is None else grid
+    dy_uas, dx_uas = resolved_grid.pixel_scale_uas
+    if not math.isclose(dy_uas, dx_uas, rel_tol=1.0e-10, abs_tol=0.0):
+        raise ValueError("KerrDiskModel requires square angular pixels")
+    resolved_runtime = (
+        runtime if isinstance(runtime, ResolvedRuntime) else resolve_runtime(runtime)
+    )
+    redshift = model._redshift(distances)
+    gravitational_radius_m = (
+        _G * _M_SUN / _C**2 * float(model.black_hole_mass_solar)
+    )
+    fov_m = distances.uas_to_source_length(
+        resolved_grid.field_of_view_uas, dtype=torch.float64
+    )
+    half_width_rg = 0.5 * float(max(fov_m)) / gravitational_radius_m
+    screen = ObserverScreen.uniform(
+        resolved_grid.shape,
+        half_width_rg,
+        gravitational_radius_m=gravitational_radius_m,
+        observer_distance_m=distances.source_m,
+        device=resolved_runtime.device,
+        dtype=resolved_runtime.dtype,
+    ).rotated(model.position_angle_deg)
+    primary = trace_primary_equatorial(
+        screen,
+        spin=model.spin,
+        inclination_deg=model.inclination_deg,
+        disk_outer_rg=half_width_rg,
+        compile_solver=(model.compile_solver and resolved_runtime.device.type == "cuda"),
+        repair_max_passes=model.primary_repair_max_passes,
+        compile_mode=(resolved_runtime.torch_compile_mode or "reduce-overhead"),
+        warn_on_compile=(model.warn_on_compile and resolved_runtime.warn_on_compile),
+    )
+    primary = replace(
+        primary,
+        transfer=replace(
+            primary.transfer,
+            metadata={
+                **primary.transfer.metadata,
+                "source_field_of_view_uas": tuple(resolved_grid.field_of_view_uas),
+            },
+        ),
+    )
+    pixel_scale_m = distances.uas_to_source_length(
+        resolved_grid.pixel_scale_uas, dtype=torch.float64
+    )
+    geometry = SourceGeometry(
+        resolved_grid.shape,
+        (float(pixel_scale_m[0]), float(pixel_scale_m[1])),
+        tuple(float(value) for value in model.wavelengths_angstrom),
+        tuple(model.band_names),
+    )
+    return _KerrPixelationPlan(
+        model,
+        distances,
+        resolved_runtime,
+        resolved_grid,
+        redshift,
+        half_width_rg,
+        screen,
+        primary,
+        geometry,
+    )
+
+
+def _finish_kerr_pixelation(
+    plan: _KerrPixelationPlan,
+    coordinates=None,
+) -> TransferredThinDiskSource | ThermalReprocessingSource:
+    """Construct one source from its primary and optional prepared coordinates."""
+
+    model = plan.model
+    if model.driving_signal is None:
+        return TransferredThinDiskSource(
+            plan.geometry,
+            plan.primary.transfer,
+            black_hole_mass_solar=model.black_hole_mass_solar,
+            eddington_ratio=model.eddington_ratio,
+            spin=model.spin,
+            source_redshift=plan.redshift,
+            color_correction=model.color_correction,
+            temperature_slope_beta=model.temperature_slope_beta,
+            viscous_flux_profile=model.viscous_flux_profile,
+            radiative_efficiency=model.radiative_efficiency,
+            name=model.name,
         )
-        dy_uas, dx_uas = resolved_grid.pixel_scale_uas
-        if not math.isclose(dy_uas, dx_uas, rel_tol=1.0e-10, abs_tol=0.0):
-            raise ValueError("KerrDiskModel requires square angular pixels")
-        resolved_runtime = (
-            runtime
-            if isinstance(runtime, ResolvedRuntime)
-            else resolve_runtime(runtime)
-        )
-        redshift = self._redshift(distances)
-        gravitational_radius_m = _G * _M_SUN / _C**2 * float(self.black_hole_mass_solar)
-        fov_m = distances.uas_to_source_length(
-            resolved_grid.field_of_view_uas,
-            dtype=torch.float64,
-        )
-        half_width_rg = 0.5 * float(max(fov_m)) / gravitational_radius_m
-        screen = ObserverScreen.uniform(
-            resolved_grid.shape,
-            half_width_rg,
-            gravitational_radius_m=gravitational_radius_m,
-            observer_distance_m=distances.source_m,
-            device=resolved_runtime.device,
-            dtype=resolved_runtime.dtype,
-        ).rotated(self.position_angle_deg)
-        primary = trace_primary_equatorial(
-            screen,
-            spin=self.spin,
-            inclination_deg=self.inclination_deg,
-            disk_outer_rg=half_width_rg,
-            compile_solver=(
-                self.compile_solver and resolved_runtime.device.type == "cuda"
-            ),
-            repair_max_passes=self.primary_repair_max_passes,
-            warn_on_compile=(
-                self.warn_on_compile and resolved_runtime.warn_on_compile
-            ),
-        )
-        # Keep the resolved angular field with standalone GR products so
-        # plotting does not require rebuilding cosmological geometry.
-        primary = replace(
-            primary,
-            transfer=replace(
-                primary.transfer,
-                metadata={
-                    **primary.transfer.metadata,
-                    "source_field_of_view_uas": tuple(resolved_grid.field_of_view_uas),
-                },
-            ),
-        )
-        pixel_scale_m = distances.uas_to_source_length(
-            resolved_grid.pixel_scale_uas,
-            dtype=torch.float64,
-        )
-        geometry = SourceGeometry(
-            resolved_grid.shape,
-            (float(pixel_scale_m[0]), float(pixel_scale_m[1])),
-            tuple(float(value) for value in self.wavelengths_angstrom),
-            tuple(self.band_names),
-        )
-        if self.driving_signal is None:
-            return TransferredThinDiskSource(
-                geometry,
-                primary.transfer,
-                black_hole_mass_solar=self.black_hole_mass_solar,
-                eddington_ratio=self.eddington_ratio,
-                spin=self.spin,
-                source_redshift=redshift,
-                color_correction=self.color_correction,
-                temperature_slope_beta=self.temperature_slope_beta,
-                viscous_flux_profile=self.viscous_flux_profile,
-                radiative_efficiency=self.radiative_efficiency,
-                name=self.name,
-            )
+    if coordinates is None:
         coordinates = add_observer_coordinates(
-            primary,
-            screen,
-            black_hole_mass_solar=self.black_hole_mass_solar,
-            spin=self.spin,
-            inclination_deg=self.inclination_deg,
-            source_redshift=redshift,
-            coordinate_dtype=resolved_runtime.dtype,
+            plan.primary,
+            plan.screen,
+            black_hole_mass_solar=model.black_hole_mass_solar,
+            spin=model.spin,
+            inclination_deg=model.inclination_deg,
+            source_redshift=plan.redshift,
+            coordinate_dtype=plan.runtime.dtype,
+            compute_emission_azimuth=model.compute_emission_azimuth,
+            chunk_size=model.observer_coordinate_chunk_size,
+            compile_solver=(model.compile_solver and plan.runtime.device.type == "cuda"),
+            compile_mode=(plan.runtime.torch_compile_mode or "reduce-overhead"),
+            fallback_to_eager=not plan.runtime.strict_backend,
+            warn_on_compile=(model.warn_on_compile and plan.runtime.warn_on_compile),
+            repair_device=model.observer_coordinate_repair_device,
         )
-        profile = axis_lamppost_profile(
-            spin=self.spin,
-            height_above_isco_rg=self.corona_height_above_isco_rg,
-            disk_outer_rg=half_width_rg,
-            nalpha=self.lamppost_nalpha,
-            radial_bins=self.lamppost_radial_bins,
-            device=resolved_runtime.device,
-            dtype=resolved_runtime.dtype,
-            compile_solver=(
-                self.compile_solver and resolved_runtime.device.type == "cuda"
-            ),
-            warn_on_compile=(
-                self.warn_on_compile and resolved_runtime.warn_on_compile
-            ),
-        )
-        return ThermalReprocessingSource.from_axis_lamppost(
-            geometry,
-            coordinates.transfer,
-            self.driving_signal,
-            profile,
-            black_hole_mass_solar=self.black_hole_mass_solar,
-            eddington_ratio=self.eddington_ratio,
-            spin=self.spin,
-            source_redshift=redshift,
-            lamp_fraction=self.lamp_fraction,
-            color_correction=self.color_correction,
-            temperature_slope_beta=self.temperature_slope_beta,
-            viscous_flux_profile=self.viscous_flux_profile,
-            radiative_efficiency=self.radiative_efficiency,
-            name=self.name,
-        )
+    profile = axis_lamppost_profile(
+        spin=model.spin,
+        height_above_isco_rg=model.corona_height_above_isco_rg,
+        disk_outer_rg=plan.half_width_rg,
+        nalpha=model.lamppost_nalpha,
+        radial_bins=model.lamppost_radial_bins,
+        device=plan.runtime.device,
+        dtype=plan.runtime.dtype,
+        compile_solver=(model.compile_solver and plan.runtime.device.type == "cuda"),
+        compile_mode=(plan.runtime.torch_compile_mode or "reduce-overhead"),
+        warn_on_compile=(model.warn_on_compile and plan.runtime.warn_on_compile),
+    )
+    return ThermalReprocessingSource.from_axis_lamppost(
+        plan.geometry,
+        coordinates.transfer,
+        model.driving_signal,
+        profile,
+        black_hole_mass_solar=model.black_hole_mass_solar,
+        eddington_ratio=model.eddington_ratio,
+        spin=model.spin,
+        source_redshift=plan.redshift,
+        lamp_fraction=model.lamp_fraction,
+        color_correction=model.color_correction,
+        temperature_slope_beta=model.temperature_slope_beta,
+        viscous_flux_profile=model.viscous_flux_profile,
+        radiative_efficiency=model.radiative_efficiency,
+        name=model.name,
+    )
+
+
+def batched_pixelate_sources(
+    models: Sequence[PhysicalSourceModel | PixelatedSource],
+    distances: LensingDistances | Sequence[LensingDistances],
+    *,
+    batch_size: int = 3,
+    grids: Sequence[PlaneGrid | None] | None = None,
+    runtime: RuntimeConfig | ResolvedRuntime | None = None,
+    oom_backoff: bool = True,
+) -> tuple[PixelatedSource, ...]:
+    """Materialize physical sources while pooling compatible Kerr delay rays.
+
+    Non-Kerr, static, azimuth-dependent, and numerically incompatible models
+    retain their ordinary serial implementations. The result order always
+    matches ``models``. CUDA OOM reduces only the source-setup batch size.
+    """
+
+    models = tuple(models)
+    if not models:
+        return ()
+    requested = int(batch_size)
+    if requested < 1:
+        raise ValueError("batch_size must be positive")
+    distance_values = (
+        (distances,) * len(models)
+        if isinstance(distances, LensingDistances)
+        else tuple(distances)
+    )
+    if len(distance_values) != len(models):
+        raise ValueError("distances must be shared or match models")
+    grid_values = (None,) * len(models) if grids is None else tuple(grids)
+    if len(grid_values) != len(models):
+        raise ValueError("grids must match models")
+    outputs: list[PixelatedSource | None] = [None] * len(models)
+    current = requested
+    start = 0
+    while start < len(models):
+        stop = min(start + current, len(models))
+        selected = models[start:stop]
+        try:
+            plans = tuple(
+                _prepare_kerr_pixelation(
+                    model,
+                    distance,
+                    grid=grid,
+                    runtime=runtime,
+                )
+                if isinstance(model, KerrDiskModel)
+                else None
+                for model, distance, grid in zip(
+                    selected,
+                    distance_values[start:stop],
+                    grid_values[start:stop],
+                    strict=True,
+                )
+            )
+            buckets: dict[tuple[object, ...], list[int]] = {}
+            for local, plan in enumerate(plans):
+                if plan is None:
+                    continue
+                model = plan.model
+                signature = (
+                    model.driving_signal is not None,
+                    not model.compute_emission_azimuth,
+                    plan.grid.shape,
+                    plan.runtime.device,
+                    plan.runtime.dtype,
+                    model.observer_coordinate_chunk_size,
+                    model.observer_coordinate_repair_device,
+                    plan.runtime.torch_compile_mode,
+                    model.compile_solver,
+                )
+                buckets.setdefault(signature, []).append(local)
+            for members in buckets.values():
+                member_plans = tuple(plans[index] for index in members)
+                assert all(plan is not None for plan in member_plans)
+                driven = member_plans[0].model.driving_signal is not None
+                can_pool = (
+                    driven
+                    and not member_plans[0].model.compute_emission_azimuth
+                    and len(member_plans) > 1
+                )
+                coordinates = (None,) * len(member_plans)
+                if can_pool:
+                    first = member_plans[0]
+                    coordinates = add_observer_coordinates_batch(
+                        tuple(plan.primary for plan in member_plans),
+                        tuple(plan.screen for plan in member_plans),
+                        black_hole_masses_solar=tuple(
+                            plan.model.black_hole_mass_solar for plan in member_plans
+                        ),
+                        spins=tuple(plan.model.spin for plan in member_plans),
+                        inclinations_deg=tuple(
+                            plan.model.inclination_deg for plan in member_plans
+                        ),
+                        source_redshifts=tuple(plan.redshift for plan in member_plans),
+                        chunk_size=first.model.observer_coordinate_chunk_size,
+                        compile_solver=(
+                            first.model.compile_solver
+                            and first.runtime.device.type == "cuda"
+                        ),
+                        compile_mode=(
+                            first.runtime.torch_compile_mode or "reduce-overhead"
+                        ),
+                        fallback_to_eager=not first.runtime.strict_backend,
+                        warn_on_compile=(
+                            first.model.warn_on_compile
+                            and first.runtime.warn_on_compile
+                        ),
+                        repair_device=first.model.observer_coordinate_repair_device,
+                    )
+                for member, plan, coordinate in zip(
+                    members, member_plans, coordinates, strict=True
+                ):
+                    outputs[start + member] = _finish_kerr_pixelation(plan, coordinate)
+            for local, (model, distance, grid, plan) in enumerate(
+                zip(
+                    selected,
+                    distance_values[start:stop],
+                    grid_values[start:stop],
+                    plans,
+                    strict=True,
+                )
+            ):
+                if plan is None:
+                    outputs[start + local] = _pixelate_source(
+                        model, distance, grid=grid, runtime=runtime
+                    )
+            start = stop
+        except torch.OutOfMemoryError:
+            if not oom_backoff or current == 1:
+                raise
+            current = max(1, current // 2)
+            torch.cuda.empty_cache()
+    if any(output is None for output in outputs):
+        raise RuntimeError("batched source setup did not produce every requested source")
+    return cast(tuple[PixelatedSource, ...], tuple(outputs))
 
 
 @dataclass(frozen=True)

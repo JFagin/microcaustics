@@ -8,6 +8,7 @@ from .physical import (
     PhysicalSourceModel,
     SourceGridConfig,
     ThinDiskModel,
+    batched_pixelate_sources,
 )
 from .reprocessing import (
     ThermalReprocessingSource,
@@ -65,6 +66,7 @@ __all__ = [
     "ThermalReprocessingSource",
     "TimeShiftedSource",
     "broken_power_law_driving_signal",
+    "batched_pixelate_sources",
     "driving_signal_from_psd",
     "lognormal_damped_random_walk",
     "lamppost_irradiation_efficiency",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import unittest
 import warnings
 from unittest import mock
@@ -179,9 +180,7 @@ class FoundationTests(unittest.TestCase):
     def test_source_geometry_from_angular_requires_named_wavelengths(self) -> None:
         """Reject empty wavelength mappings with the public argument name."""
         with self.assertRaisesRegex(ValueError, "bands_angstrom"):
-            SourceGeometry(
-                shape=4, field_of_view_uas=2.0, bands_angstrom={}
-            )
+            SourceGeometry(shape=4, field_of_view_uas=2.0, bands_angstrom={})
 
     def test_backend_falls_back_without_triton(self) -> None:
         capabilities = RuntimeCapabilities(
@@ -513,6 +512,102 @@ class FoundationTests(unittest.TestCase):
         self.assertIn("cache=hit", second.transfer.metadata["execution"])
         clear_compiled_primary_cache()
 
+    def test_observer_coordinate_compile_cache_reuses_physical_parameters(
+        self,
+    ) -> None:
+        from microcaustics.relativity.coordinates import (
+            _coordinate_solver,
+            clear_compiled_coordinate_cache,
+        )
+
+        def kernel(values, *, observer_radius_rg):
+            return values + observer_radius_rg
+
+        clear_compiled_coordinate_cache()
+        with (
+            mock.patch(
+                "microcaustics.relativity.coordinates._torch_compile_supported",
+                return_value=True,
+            ),
+            mock.patch.object(
+                torch, "compile", side_effect=lambda function, **_: function
+            ) as compile_mock,
+        ):
+            first, first_execution = _coordinate_solver(
+                kernel,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                chunk_size=524_288,
+                observer_radius_rg=3000.0,
+                compile_solver=True,
+                compile_mode="reduce-overhead",
+                fallback_to_eager=False,
+                warn_on_compile=False,
+            )
+            second, second_execution = _coordinate_solver(
+                kernel,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                chunk_size=524_288,
+                observer_radius_rg=3000.0,
+                compile_solver=True,
+                compile_mode="reduce-overhead",
+                fallback_to_eager=False,
+                warn_on_compile=False,
+            )
+        self.assertIs(first, second)
+        self.assertEqual(compile_mock.call_count, 1)
+        self.assertIn("cache=miss", first_execution)
+        self.assertIn("cache=hit", second_execution)
+        clear_compiled_coordinate_cache()
+
+    def test_analytic_delay_only_kernel_matches_full_observer_kernel(self) -> None:
+        from microcaustics.relativity.coordinates import (
+            _coordinate_azimuth_analytic,
+            _coordinate_delay_analytic,
+        )
+        from microcaustics.relativity.primary import trace_primary_equatorial
+
+        inclination_deg = 30.0
+        screen = ObserverScreen.uniform(
+            (12, 14),
+            (24.0, 28.0),
+            gravitational_radius_m=1.0,
+            observer_distance_m=1.0e6,
+            dtype=torch.float64,
+        )
+        primary = trace_primary_equatorial(
+            screen,
+            spin=0.7,
+            inclination_deg=inclination_deg,
+            disk_outer_rg=30.0,
+        )
+        selected = primary.transfer.hit & (primary.radial_root_count == 4)
+        spin = torch.full_like(primary.carter_eta[selected], 0.7)
+        inclination = torch.tensor(
+            math.radians(inclination_deg), dtype=torch.float64
+        )
+        arguments = (
+            spin,
+            inclination,
+            primary.carter_eta[selected],
+            primary.photon_lambda[selected],
+            -screen.y_rg[selected],
+            primary.mino_time[selected],
+            primary.radial_root_real[selected],
+        )
+        delay = _coordinate_delay_analytic(
+            *arguments, observer_radius_rg=3000.0
+        )
+        full = _coordinate_azimuth_analytic(
+            *arguments, observer_radius_rg=3000.0
+        )
+        self.assertTrue(torch.all(delay[3]))
+        self.assertTrue(torch.all(full[4]))
+        torch.testing.assert_close(delay[0], full[1], rtol=1.0e-13, atol=1.0e-13)
+        torch.testing.assert_close(delay[1], full[2], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(delay[2], full[3], rtol=1.0e-13, atol=1.0e-13)
+
     def test_primary_kerr_iterative_pinhole_repair_is_monotone(self) -> None:
         from microcaustics.relativity.primary import trace_primary_equatorial
 
@@ -568,6 +663,7 @@ class FoundationTests(unittest.TestCase):
             inclination_deg=53.0,
             quadrature_order=24,
             coordinate_dtype=torch.float64,
+            compute_emission_azimuth=True,
         )
         hit = coordinates.transfer.hit
         self.assertEqual(coordinates.failed_pixels, 0)
@@ -603,6 +699,7 @@ class FoundationTests(unittest.TestCase):
             source_redshift=1.0,
             quadrature_order=24,
             coordinate_dtype=torch.float64,
+            compute_emission_azimuth=True,
         )
         self.assertTrue(
             torch.allclose(
@@ -611,6 +708,41 @@ class FoundationTests(unittest.TestCase):
                 rtol=2.0e-15,
                 atol=2.0e-15,
             )
+        )
+
+    def test_float32_primary_preserves_requested_parameters_for_coordinates(self) -> None:
+        from microcaustics.relativity import add_observer_coordinates
+        from microcaustics.relativity.primary import trace_primary_equatorial
+
+        inclination = 49.52234964316163
+        spin = 0.73123456789
+        screen = ObserverScreen.uniform(
+            (8, 8),
+            (20.0, 20.0),
+            gravitational_radius_m=1.0,
+            observer_distance_m=1.0e6,
+            dtype=torch.float32,
+        )
+        primary = trace_primary_equatorial(
+            screen,
+            spin=spin,
+            inclination_deg=inclination,
+            disk_outer_rg=30.0,
+        )
+
+        self.assertEqual(primary.transfer.metadata["spin"], spin)
+        self.assertEqual(primary.transfer.metadata["inclination_deg"], inclination)
+        coordinates = add_observer_coordinates(
+            primary,
+            screen,
+            black_hole_mass_solar=1.0e9,
+            spin=spin,
+            inclination_deg=inclination,
+        )
+        self.assertEqual(coordinates.transfer.shape, screen.shape)
+        self.assertIsNone(coordinates.transfer.emission_azimuth_rad)
+        self.assertEqual(
+            coordinates.transfer.metadata["repair_quadrature_order"], 32
         )
 
     def test_observer_coordinates_repair_rare_float32_rays(self) -> None:
@@ -724,6 +856,15 @@ class FoundationTests(unittest.TestCase):
 
         epsilon = 1.0e-4
         source = make_source(1.0)
+        mean_source = source.at_driver_mean()
+        rebound_source = source.with_bands({"u": 3671.0, "y": 9712.0})
+        self.assertTrue(mean_source.is_time_static)
+        torch.testing.assert_close(
+            mean_source.brightness([0.0, 1.0], dtype=torch.float64),
+            source.brightness([0.0, 1.0], dtype=torch.float64),
+        )
+        self.assertEqual(rebound_source.geometry.band_names, ("u", "y"))
+        self.assertEqual(tuple(rebound_source.brightness(0.0).shape), (1, 12, 14, 2))
         perturbed = make_source(1.0 + epsilon)
         numerical = (
             perturbed.brightness(0.0, dtype=torch.float64)[0]
@@ -1163,7 +1304,9 @@ class FoundationTests(unittest.TestCase):
         rechunked = simulation.magnification_map(
             region,
             grid,
-            method=IRSConfig(rays=4097, sampling="random", seed=12, ray_chunk_size=1024),
+            method=IRSConfig(
+                rays=4097, sampling="random", seed=12, ray_chunk_size=1024
+            ),
         )
         different = simulation.magnification_map(
             region,
@@ -2138,16 +2281,9 @@ class FoundationTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                frame.caustics.metadata[
-                    "critical_discovery_downsample_ratio"
-                ]
-                == 16
-                and frame.caustics.metadata[
-                    "critical_discovery_source_active_after"
-                ]
-                <= frame.caustics.metadata[
-                    "critical_discovery_source_active_before"
-                ]
+                frame.caustics.metadata["critical_discovery_downsample_ratio"] == 16
+                and frame.caustics.metadata["critical_discovery_source_active_after"]
+                <= frame.caustics.metadata["critical_discovery_source_active_before"]
                 for frame in result.caustics
             )
         )
@@ -2192,10 +2328,7 @@ class FoundationTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                frame.caustics.metadata[
-                    "critical_discovery_downsample_ratio"
-                ]
-                == 8
+                frame.caustics.metadata["critical_discovery_downsample_ratio"] == 8
                 for frame in multirate.caustics
             )
         )
@@ -2231,9 +2364,10 @@ class FoundationTests(unittest.TestCase):
         for dtype in (torch.float32, torch.float64):
             with self.subTest(dtype=dtype):
                 generator = torch.Generator().manual_seed(1729)
-                segments = 4.0 * torch.rand(
-                    (257, 2, 2), generator=generator, dtype=dtype
-                ) - 2.0
+                segments = (
+                    4.0 * torch.rand((257, 2, 2), generator=generator, dtype=dtype)
+                    - 2.0
+                )
                 grid = PlaneGrid((31, 29), (4.5, 4.25), (0.13, -0.17))
                 field = CausticField(segments, segments, grid)
                 x, y = grid.mesh(dtype=dtype)
@@ -2680,6 +2814,26 @@ class FoundationTests(unittest.TestCase):
         torch.testing.assert_close(result.flux, result.unlensed_flux)
         expected = image.sum(dim=(0, 1)) * 2.0e20
         torch.testing.assert_close(result.flux[0], expected)
+        batched = light_curve_from_maps(
+            maps,
+            source,
+            [0.0, 2.0],
+            LensingDistances(1.0e25, 2.0e25, 1.0e25),
+            trajectory=LinearTrajectory(velocity_uas_per_day=(0.1, 0.0)),
+            batch_size=1,
+        )
+        torch.testing.assert_close(batched.flux, result.flux)
+        torch.testing.assert_close(batched.unlensed_flux, result.unlensed_flux)
+        self.assertEqual(batched.metadata["source_batch_size"], 1)
+
+        with self.assertRaisesRegex(ValueError, "batch_size"):
+            light_curve_from_maps(
+                maps,
+                source,
+                [0.0, 2.0],
+                LensingDistances(1.0e25, 2.0e25, 1.0e25),
+                batch_size=0,
+            )
 
     def test_streaming_light_curve_matches_precomputed_maps(self) -> None:
         simulation = MicrolensingSimulation.create(

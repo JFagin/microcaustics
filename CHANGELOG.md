@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add shared-map microlensing-only comparison fluxes to single-system,
+  multi-image, labeled, multirate, and independently batched light curves.
 - Add a reusable in-memory Rubin OpSim cadence index with fast random WFD and
   DDF sampling, named DDF selection, and coordinate-based visit queries.
 - Add a single-light-curve observation API while preserving one shared cadence
@@ -14,6 +16,8 @@
   runtime, so first-call Torch and Triton specialization costs are explicit.
 - Add `batched_system_light_curves` for mixed single-, double-, and quad-image
   datasets, with bounded-memory direct NPZ or combined-archive output.
+- Add independent cross-disk Kerr source setup batching, with one source per
+  lensed system, fixed-shape observer-delay launches, and lossless OOM backoff.
 - Fuse compatible independent systems through shared scout preparation,
   ragged IPM and caustic queues, indexed far-field evaluation, and cached
   compact-node plans.

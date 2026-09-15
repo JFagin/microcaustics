@@ -118,6 +118,14 @@ class IndependentLightCurveBatchTests(unittest.TestCase):
             all(curve.flux.shape == (3, 1) for curve in result.light_curves)
         )
 
+    def test_source_setup_batch_size_must_be_positive(self) -> None:
+        with self.assertRaisesRegex(ValueError, "source_setup_batch_size"):
+            mc.batched_system_light_curves(
+                (_FakeRealization(1.0),),
+                (0.0,),
+                source_setup_batch_size=0,
+            )
+
     def test_cuda_oom_backoff_retries_smaller_groups(self) -> None:
         systems = tuple(_FakeRealization(value) for value in (1.0, 2.0, 3.0))
 

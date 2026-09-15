@@ -279,6 +279,7 @@ class GeneralRelativityLimitTests(unittest.TestCase):
             spin=0.7,
             inclination_deg=53.0,
             coordinate_dtype=dtype,
+            compute_emission_azimuth=True,
         ).transfer
 
     def test_float32_gr_transfer_matches_float64_on_same_screen(self) -> None:

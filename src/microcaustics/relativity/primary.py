@@ -256,6 +256,14 @@ def trace_primary_equatorial(
             inner,
             outer,
         )
+    if execution.startswith("torch.compile"):
+        # These tensors outlive the primary CUDA graph and are consumed by the
+        # separately compiled observer-coordinate graph. Give them independent
+        # storage before Inductor reuses its graph output buffers.
+        outputs = tuple(
+            value.clone() if isinstance(value, torch.Tensor) else value
+            for value in outputs
+        )
     (
         hit,
         radius,
@@ -319,8 +327,11 @@ def trace_primary_equatorial(
         metadata={
             "backend": "analytic_separated_kerr",
             "image_order": "primary",
-            "spin": float(spin_tensor.detach().cpu()),
-            "inclination_deg": float(inclination.detach().cpu()),
+            # Preserve the requested Python values in metadata.  The solver
+            # tensors may be float32, which is not precise enough for later
+            # consistency checks on arbitrary user-supplied parameters.
+            "spin": float(spin),
+            "inclination_deg": float(inclination_deg),
             "disk_inner_rg": float(inner.detach().cpu()),
             "disk_outer_rg": float(outer.detach().cpu()),
             "observer_coordinates": False,

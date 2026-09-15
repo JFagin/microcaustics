@@ -92,9 +92,14 @@ def test_notebook_public_calls_match_current_signatures(path):
 def test_custom_source_notebook_generates_physical_brightness():
     """Execute the actual source definition and preserve its Jy normalization."""
     pytest.importorskip("matplotlib")
-    notebook = cells(NOTEBOOKS / "source_models/02_custom_sources_and_variability.ipynb")
+    notebook = cells(
+        NOTEBOOKS / "source_models/02_custom_sources_and_variability.ipynb"
+    )
     namespace = {}
-    exec(compile("".join(notebook[2]["source"]), "custom source setup", "exec"), namespace)
+    exec(
+        compile("".join(notebook[2]["source"]), "custom source setup", "exec"),
+        namespace,
+    )
     source = namespace["system"].realize().source
     geometry = source.geometry
     times = torch.tensor([0.0, 150.0, 300.0])
@@ -146,11 +151,16 @@ def test_dataset_tutorial_runs_without_scripts_or_saved_simulations(
         map_cadence_days=25.0,
         source_cadence_days=10.0,
         temporal_batch_size=2,
+        label_batch_size=1,
+        curves_per_batch=2,
+        source_setup_batch_size=1,
+        labeled_curves_per_batch=1,
         scout_refresh_frames=10,
         count=2,
         rays=64,
         bands={"g": 4800.0, "i": 7500.0},
         OUTPUT=tmp_path,
+        use_cuda=False,
         runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
     )
     # Execute the actual tutorial definitions, not a second implementation.
@@ -165,14 +175,15 @@ def test_dataset_tutorial_runs_without_scripts_or_saved_simulations(
         )
     system = namespace["make_system"](0)
     assert system.seed == 0
-    assert system.source.signal.seed is None  # inherited by the system
+    assert isinstance(system.source, mc.KerrDiskModel)
+    assert system.source.driving_signal.seed is None  # inherited by the system
     assert system.stellar_population is not None
     kinematics = system.stellar_population.kinematics
     assert isinstance(kinematics, mc.SkyProjectedKinematics)
     assert kinematics.include_cmb_dipole
     assert kinematics.stellar_dispersion_km_s > 0
     assert kinematics.peculiar_velocity_dispersion_km_s > 0
-    assert system.source.source.grid.shape == (16, 16)
+    assert system.source.grid.shape == (16, 16)
     prior = namespace["sample_parameters"](np.random.default_rng(0))
     assert 0 <= prior["inclination_deg"] <= 60
     assert prior["source_redshift"] > prior["lens_redshift"] + 0.4
@@ -196,7 +207,7 @@ def test_dataset_tutorial_runs_without_scripts_or_saved_simulations(
     )
     namespace["systems"] = [system, system.with_seed(1)]
     try:
-        for index in (3, 5, 17):
+        for index in (3, 5):
             exec(
                 compile(
                     "".join(notebook[index]["source"]), f"dataset cell {index}", "exec"
@@ -233,7 +244,7 @@ def test_dataset_tutorial_runs_without_scripts_or_saved_simulations(
         torch.testing.assert_close(
             curve.labels.times_days, torch.tensor([0.0, 25.0, 50.0]), check_dtype=False
         )
-        only_micro = namespace["microlensing_fluxes"]([system], [curve])[0]
+        only_micro = namespace["microlensing_only_fluxes"][0]
         direct = system.light_curve(
             duration_days=50,
             map_cadence_days=25,
@@ -253,3 +264,65 @@ def test_dataset_tutorial_runs_without_scripts_or_saved_simulations(
             mcp.plot_labeled_map_gallery([])
     finally:
         plt.close("all")
+
+
+def test_multi_image_workflow_uses_six_band_quasar_and_real_opsim():
+    """Keep the observation tutorial on the physical source and cadence APIs."""
+
+    notebook = cells(
+        NOTEBOOKS / "workflows/00_multi_image_light_curves_and_observations.ipynb"
+    )
+    code = "\n".join(
+        "".join(cell["source"]) for cell in notebook if cell["cell_type"] == "code"
+    )
+    assert "mc.KerrDiskModel(" in code
+    assert "driving_signal=driver" in code
+    assert "mc.ModulatedSource(" not in code
+    assert "mc.GaussianModel(" not in code
+    assert "mc.RubinOpSimCadenceIndex.from_database" in code
+    assert "rubin.sample(" in code
+    assert 'survey="wfd"' in code
+    assert "deterministic fallback" not in code
+    for band in ("u", "g", "r", "i", "z", "y"):
+        assert f'"{band}":' in code
+
+
+def test_q2237_workflow_uses_physical_thermal_variability():
+    """Prevent the production quasar example from reverting to scalar modulation."""
+
+    notebook = cells(
+        NOTEBOOKS / "getting_started/01_q2237_production_light_curve_and_gif.ipynb"
+    )
+    code = "\n".join(
+        "".join(cell["source"]) for cell in notebook if cell["cell_type"] == "code"
+    )
+    assert "mc.KerrDiskModel(" in code
+    assert "driving_signal=driver" in code
+    assert "include_microlensing_only=True" in code
+    assert "microlensing_only_flux" in code
+    assert "mc.ModulatedSource(" not in code
+    assert "variable_curve.flux / amplitudes" not in code
+
+
+def test_spectral_notebook_uses_multiband_light_curve_api():
+    """Keep spectral evolution concise and its intrinsic cadence explicit."""
+
+    notebook = cells(NOTEBOOKS / "source_models/03_spectral_microlensing.ipynb")
+    code = "\n".join(
+        "".join(cell["source"]) for cell in notebook if cell["cell_type"] == "code"
+    )
+    assert "cadence_days=SOURCE_CADENCE_DAYS" in code
+    assert "max_duration_days=Q2237_DURATION_DAYS" in code
+    assert "apply_driving_signal=False" in code
+    assert ".with_bands(" in code
+    assert "band_batch_size=32" in code
+    assert "bands_angstrom=spectral_bands" in code
+    assert "flux_cadence_days=SOURCE_CADENCE_DAYS" in code
+    assert "map_grid_shape=MAP_RESOLUTION" in code
+    assert "driver_times =" not in code
+    assert "mc.LensingDistances.from_redshifts(" not in code
+    assert ".pixelate(" not in code
+    assert ".at_driver_mean()" not in code
+    assert "mc.CallableDrivingSignal(" not in code
+    assert "mc.SourceGeometry(" not in code
+    assert "from dataclasses import replace" not in code

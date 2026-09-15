@@ -70,6 +70,14 @@ class TimeShiftedSource:
         shifted = times - float(self.delay_days)
         return self.source.brightness(shifted, dtype=dtype, device=device)
 
+    def with_bands(self, bands_angstrom: Mapping[str, float]) -> TimeShiftedSource:
+        """Reuse the delayed source with a different wavelength selection."""
+
+        with_bands = getattr(self.source, "with_bands", None)
+        if with_bands is None:
+            raise TypeError("the wrapped source does not support wavelength selection")
+        return replace(self, source=with_bands(bands_angstrom))
+
     def metadata(self) -> Mapping[str, object]:
         """Return the delay convention and wrapped source provenance."""
 
@@ -939,6 +947,14 @@ class ModulatedSource:
         method = getattr(self.source, "support_radius_m", None)
         value = None if method is None else method(distances)
         return None if value is None else float(value)
+
+    def with_bands(self, bands_angstrom: Mapping[str, float]) -> ModulatedSource:
+        """Return the same modulation around a wavelength-adjusted source."""
+
+        method = getattr(self.source, "with_bands", None)
+        if method is None:
+            raise TypeError("the wrapped source does not support with_bands")
+        return replace(self, source=method(bands_angstrom))
 
     def brightness(
         self,

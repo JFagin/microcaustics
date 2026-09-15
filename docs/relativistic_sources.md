@@ -56,6 +56,7 @@ disk = mc.KerrDiskModel(
     driving_signal=driver,
     source_grid_shape=1024,
     source_margin=1.05,
+    observer_coordinate_chunk_size=524_288,
 )
 source = disk.pixelate(source_redshift=1.695, H0=70.0, Om0=0.3)
 ```
@@ -205,6 +206,7 @@ coordinates = mc.add_observer_coordinates(
     inclination_deg=30.0,
     source_redshift=source_redshift,
     coordinate_dtype=torch.float64,
+    compute_emission_azimuth=True,
 )
 
 pixel_scale_m = 160.0 * gravitational_radius_m / 1024
@@ -300,17 +302,17 @@ models.
 External illumination models can supply the same two arrays directly. This is
 also the extension point for a future finite or non-axisymmetric corona.
 
-`axis_lamppost_profile` supports eager Torch on CPU, CUDA, and Apple devices.
-Set `compile_solver=True` to cache one static-shape `torch.compile` callable per
-device, dtype, launch resolution, quadrature order, and compile mode. The ray
-result records `compile_warmup_s` separately from steady execution time, and a
-failed compiler toolchain falls back to the numerically identical eager path
-unless `fallback_to_eager=False` is requested.
+The primary, observer-coordinate, and axial-lamppost solvers support eager
+Torch on CPU, CUDA, and Apple devices. On CUDA, `KerrDiskModel` enables their
+cached `torch.compile` paths by default. Cache keys contain numerical launch
+shapes rather than physical disk parameters, so compatible disks reuse the
+same compiled callables. A failed compiler toolchain falls back to eager Torch
+unless strict runtime behavior or `fallback_to_eager=False` is requested.
 
 Compilation warnings are enabled by default. Set `warn_on_compile=False` on
-`KerrDiskModel`, `trace_primary_equatorial`, or `axis_lamppost_profile` to
-suppress them; a runtime with `RuntimeConfig(warn_on_compile=False)` also
-suppresses compilation warnings during high-level Kerr source construction.
+`KerrDiskModel` or the low-level solvers to suppress them; a runtime with
+`RuntimeConfig(warn_on_compile=False)` also suppresses compilation warnings
+during high-level Kerr source construction.
 
 `ObserverScreen` uses pixel-center sampling and calculates each pixel's true
 solid angle from its impact-parameter extent, physical gravitational radius,
@@ -327,15 +329,26 @@ three stored 1024-square SIM5 validation screens, the migrated tracer retains
 identical hit masks. The paper comparison had unit hit-mask intersection over
 union and integrated flux ratios within `4e-7` of unity.
 
-Observer azimuth and finite-observer travel time use analytic polar integrals
-and logarithmically sampled radial Gauss--Legendre integration. Calculations
-are chunked over hit rays only. Float32 uses a compact float64 repair queue for
-rare two-real-root and poorly conditioned polar rays. Callers may instead
-promote the entire coordinate stage to float64 independently of the primary
-image. Returned delays are converted from `GM/c^3` to
-observer-frame days using the supplied black-hole mass. The implementation
-matches the validated paper coordinates to floating-point rounding on the
-frozen regression fixture.
+On CUDA float32, finite-observer travel time uses the paper's compiled analytic
+radial and polar endpoint solver. Hit rays are evaluated in fixed, padded
+chunks so different disk parameters and a short final chunk reuse the same
+compiled shape. `observer_coordinate_chunk_size=524_288` is the default; it is
+user configurable and automatically halved and remembered if a CUDA
+out-of-memory error occurs. A compact float64 CPU queue repairs the small
+non-four-real-root or ill-conditioned complement without rerunning the dense
+GPU calculation. Passing `coordinate_dtype=torch.float64` to the low-level
+function selects the eager quadrature reference instead.
+
+CPU and Apple execution cap the effective quadrature chunk at 65,536 rays to
+avoid materializing an unnecessarily large integration-node workspace; the
+requested and effective sizes are both recorded in transfer metadata.
+
+An axisymmetric disk does not consume emission azimuth, so `KerrDiskModel`
+omits that calculation by default. Set `compute_emission_azimuth=True` when a
+non-axisymmetric model or a diagnostic needs it. Returned delays are converted
+from `GM/c^3` to observer-frame days using the supplied black-hole mass. The
+analytic delay-only path matches the full paper observer solver to float32
+rounding on the three stored production systems.
 
 Low-level differentiable functions are available from
 `microcaustics.relativity`, including `kerr_isco_radius`,

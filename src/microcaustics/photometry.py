@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import math
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from time import perf_counter
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as functional
@@ -15,6 +17,9 @@ from .lens import LensingDistances
 from .results import LightCurve, MagnificationMap, TimingBreakdown
 from .sources import ModulatedSource, PixelatedSource
 from .trajectories import LinearTrajectory, SourceTrajectory
+
+if TYPE_CHECKING:
+    from .sources import PhysicalSourceModel
 
 AB_ZERO_POINT_JY = 3631.0
 
@@ -62,11 +67,30 @@ class LightCurveRequest:
     simulation calls must supply distances because they contain no cosmology.
     """
 
-    source: PixelatedSource
+    source: PixelatedSource | PhysicalSourceModel | None = None
     distances: LensingDistances | None = None
     trajectory: SourceTrajectory | None = None
     strict_coverage: bool = True
     name: str | None = None
+    bands_angstrom: Mapping[str, float] | None = None
+    apply_driving_signal: bool | None = None
+    flux_cadence_days: float | None = None
+    flux_times_days: Sequence[float] | torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.flux_cadence_days is not None and self.flux_times_days is not None:
+            raise ValueError(
+                "supply flux_cadence_days or flux_times_days per request, not both"
+            )
+        if self.flux_cadence_days is not None and (
+            not math.isfinite(float(self.flux_cadence_days))
+            or self.flux_cadence_days <= 0.0
+        ):
+            raise ValueError("flux_cadence_days must be finite and positive")
+        if self.apply_driving_signal is not None and not isinstance(
+            self.apply_driving_signal, bool
+        ):
+            raise TypeError("apply_driving_signal must be True, False, or None")
 
 
 def _source_offsets_uas(
@@ -216,6 +240,8 @@ def light_curve_from_maps(
     *,
     trajectory: SourceTrajectory | None = None,
     strict_coverage: bool = True,
+    batch_size: int | None = None,
+    band_batch_size: int | None = None,
 ) -> LightCurve:
     """Convolve time-aligned maps with an arbitrary pixelated source.
 
@@ -240,6 +266,13 @@ def light_curve_from_maps(
     strict_coverage:
         Raise when any source pixel lies beyond its corresponding map. If
         false, out-of-map samples contribute zero magnification.
+    batch_size:
+        Number of source epochs to evaluate together. The default evaluates
+        every epoch at once; use a smaller value to bound memory for sources
+        with many wavelength channels.
+    band_batch_size:
+        Number of wavelength channels evaluated together. The final batch is
+        padded internally to this size and trimmed from the result.
     """
 
     times = torch.as_tensor(times_days).reshape(-1)
@@ -249,13 +282,26 @@ def light_curve_from_maps(
         raise ValueError("maps and times_days must have the same length")
     if not maps:
         raise ValueError("at least one magnification map is required")
+    if batch_size is None:
+        batch_size = len(maps)
+    if (
+        not isinstance(batch_size, int)
+        or isinstance(batch_size, bool)
+        or batch_size < 1
+    ):
+        raise ValueError("batch_size must be a positive integer or None")
+    if band_batch_size is not None and (
+        not isinstance(band_batch_size, int)
+        or isinstance(band_batch_size, bool)
+        or band_batch_size < 1
+    ):
+        raise ValueError("band_batch_size must be a positive integer or None")
     device = maps[0].values.device
     dtype = maps[0].values.dtype
     if any(item.values.device != device or item.values.dtype != dtype for item in maps):
         raise ValueError("all magnification maps must share a device and dtype")
     trajectory = LinearTrajectory() if trajectory is None else trajectory
     started = perf_counter()
-    brightness = source.brightness(times, device=device, dtype=dtype)
     centers = trajectory.position_uas(times, device=device, dtype=dtype)
     if centers.shape != (times.numel(), 2):
         raise ValueError("trajectory positions must have shape [time, 2]")
@@ -265,20 +311,41 @@ def light_curve_from_maps(
         device=device,
         dtype=dtype,
     )
-    flux_rows = []
-    for index, magnification_map in enumerate(maps):
-        sample = _sample_map(
-            magnification_map,
-            offset_x + centers[index, 0],
-            offset_y + centers[index, 1],
-            strict_coverage=strict_coverage,
-        )
-        flux_rows.append((brightness[index] * sample[..., None]).sum(dim=(0, 1)))
     pixel_area_m2 = float(
         source.geometry.pixel_scale_m[0] * source.geometry.pixel_scale_m[1]
     )
-    lensed_flux = torch.stack(flux_rows) * pixel_area_m2
-    unlensed_flux = brightness.sum(dim=(1, 2)) * pixel_area_m2
+    lensed_chunks = []
+    unlensed_chunks = []
+    source_chunks = _source_band_chunks(source, band_batch_size)
+    for start in range(0, len(maps), batch_size):
+        stop = min(start + batch_size, len(maps))
+        samples = [
+            _sample_map(
+                magnification_map,
+                offset_x + centers[index, 0],
+                offset_y + centers[index, 1],
+                strict_coverage=strict_coverage,
+            )
+            for index, magnification_map in enumerate(
+                maps[start:stop], start=start
+            )
+        ]
+        lensed_parts = []
+        unlensed_parts = []
+        for chunk_source, valid_count in source_chunks:
+            brightness = chunk_source.brightness(
+                times[start:stop], device=device, dtype=dtype
+            )
+            rows = [
+                (brightness[index] * sample[..., None]).sum(dim=(0, 1))
+                for index, sample in enumerate(samples)
+            ]
+            lensed_parts.append(torch.stack(rows)[:, :valid_count])
+            unlensed_parts.append(brightness.sum(dim=(1, 2))[:, :valid_count])
+        lensed_chunks.append(torch.cat(lensed_parts, dim=1) * pixel_area_m2)
+        unlensed_chunks.append(torch.cat(unlensed_parts, dim=1) * pixel_area_m2)
+    lensed_flux = torch.cat(lensed_chunks, dim=0)
+    unlensed_flux = torch.cat(unlensed_chunks, dim=0)
     elapsed = perf_counter() - started
     return LightCurve(
         times_days=times.to(device=device, dtype=dtype),
@@ -289,6 +356,8 @@ def light_curve_from_maps(
             "method": "finite_source_map_sampling",
             "map_methods": sorted({item.method for item in maps}),
             "strict_coverage": bool(strict_coverage),
+            "source_batch_size": batch_size,
+            "band_batch_size": band_batch_size,
             "source": dict(source.metadata()),
         },
         timing=TimingBreakdown(
@@ -305,6 +374,7 @@ def source_light_curve(
     times_days: torch.Tensor | Sequence[float],
     *,
     batch_size: int = 16,
+    band_batch_size: int | None = None,
     device: str | torch.device | None = None,
     dtype: torch.dtype | None = None,
 ) -> LightCurve:
@@ -314,12 +384,19 @@ def source_light_curve(
     curve. The returned flux density is in Jy when the source brightness uses
     the package's standard physical surface-brightness convention.
 
-    ``batch_size`` only controls memory. It does not alter the result.
+    ``batch_size`` and ``band_batch_size`` only control memory. They do not
+    alter the result. The last wavelength batch is padded and trimmed.
     ``device`` and ``dtype`` optionally override the time tensor's placement.
     """
 
     if int(batch_size) < 1:
         raise ValueError("batch_size must be positive")
+    if band_batch_size is not None and (
+        not isinstance(band_batch_size, int)
+        or isinstance(band_batch_size, bool)
+        or band_batch_size < 1
+    ):
+        raise ValueError("band_batch_size must be a positive integer or None")
     times = torch.as_tensor(times_days)
     if times.ndim != 1 or times.numel() < 1:
         raise ValueError("times_days must be a non-empty one-dimensional sequence")
@@ -334,11 +411,15 @@ def source_light_curve(
         source.geometry.pixel_scale_m[0] * source.geometry.pixel_scale_m[1]
     )
     rows = []
+    source_chunks = _source_band_chunks(source, band_batch_size)
     for chunk in times.split(int(batch_size)):
-        brightness = source.brightness(
-            chunk, device=resolved_device, dtype=resolved_dtype
-        )
-        rows.append(brightness.sum(dim=(1, 2)) * pixel_area_m2)
+        parts = []
+        for chunk_source, valid_count in source_chunks:
+            brightness = chunk_source.brightness(
+                chunk, device=resolved_device, dtype=resolved_dtype
+            )
+            parts.append(brightness.sum(dim=(1, 2))[:, :valid_count])
+        rows.append(torch.cat(parts, dim=1) * pixel_area_m2)
     flux = torch.cat(rows, dim=0)
     return LightCurve(
         times_days=times,
@@ -347,6 +428,7 @@ def source_light_curve(
         unlensed_flux=flux,
         metadata={
             "method": "integrated_source_brightness",
+            "band_batch_size": band_batch_size,
             "source": dict(source.metadata()),
         },
         timing=TimingBreakdown(),
@@ -449,8 +531,10 @@ def multirate_streaming_light_curve(
     must lie inside the map-time interval.
     """
 
-    map_times = _increasing_times(map_times_days, name="map_times_days")
-    flux_times = _increasing_times(flux_times_days, name="flux_times_days")
+    # Plan interpolation brackets on the CPU once. This avoids synchronizing
+    # CUDA for every map interval merely to recover Python output indices.
+    map_times = _increasing_times(map_times_days, name="map_times_days").cpu()
+    flux_times = _increasing_times(flux_times_days, name="flux_times_days").cpu()
     if map_times.numel() > 1 and (
         float(flux_times[0]) < float(map_times[0])
         or float(flux_times[-1]) > float(map_times[-1])
@@ -460,7 +544,6 @@ def multirate_streaming_light_curve(
     resolved_schedule = DynamicConfig() if schedule is None else schedule
     runtime = simulation.runtime
     device, dtype = runtime.device, runtime.dtype
-    map_times_device = map_times.to(device=device, dtype=dtype)
     flux_times_device = flux_times.to(device=device, dtype=dtype)
     trajectory = LinearTrajectory() if trajectory is None else trajectory
     centers = trajectory.position_uas(
@@ -481,22 +564,22 @@ def multirate_streaming_light_curve(
         interval_indices = torch.zeros(
             flux_times.numel(),
             dtype=torch.long,
-            device=device,
         )
-        fractions = torch.zeros_like(flux_times_device)
+        fractions = torch.zeros_like(flux_times)
     else:
         interval_indices = (
             torch.searchsorted(
-                map_times_device,
-                flux_times_device,
+                map_times,
+                flux_times,
                 right=True,
             )
             .sub(1)
             .clamp(0, map_times.numel() - 2)
         )
-        left_times = map_times_device[interval_indices]
-        right_times = map_times_device[interval_indices + 1]
-        fractions = (flux_times_device - left_times) / (right_times - left_times)
+        left_times = map_times[interval_indices]
+        right_times = map_times[interval_indices + 1]
+        fractions = (flux_times - left_times) / (right_times - left_times)
+    fractions_device = fractions.to(device=device, dtype=dtype)
 
     map_iterator = iter(
         simulation.dynamic_maps(
@@ -566,8 +649,9 @@ def multirate_streaming_light_curve(
     interval_count = max(1, int(map_times.numel()) - 1)
     for interval in range(interval_count):
         right_map = left_map if map_times.numel() == 1 else next_map(interval + 1)
-        selected = torch.nonzero(interval_indices == interval).reshape(-1)
-        if selected.numel() > 0:
+        selected_host = torch.nonzero(interval_indices == interval).reshape(-1)
+        if selected_host.numel() > 0:
+            selected = selected_host.to(device=device)
             runtime.synchronize()
             source_started = perf_counter()
             selected_times = flux_times_device[selected]
@@ -599,7 +683,7 @@ def multirate_streaming_light_curve(
                     y_uas,
                     strict_coverage=strict_coverage,
                 )
-                weight = fractions[selected, None, None]
+                weight = fractions_device[selected, None, None]
                 sampled = left_values + weight * (right_values - left_values)
             selected_flux = (brightness * sampled[..., None]).sum(dim=(1, 2))
             selected_unlensed = brightness.sum(dim=(1, 2))
@@ -612,7 +696,7 @@ def multirate_streaming_light_curve(
             )
             selected_flux = selected_flux * pixel_area_m2
             selected_unlensed = selected_unlensed * pixel_area_m2
-            for local_index, output_index in enumerate(selected.tolist()):
+            for local_index, output_index in enumerate(selected_host.tolist()):
                 flux_rows[output_index] = selected_flux[local_index]
                 unlensed_rows[output_index] = selected_unlensed[local_index]
             runtime.synchronize()
@@ -663,6 +747,250 @@ def multirate_streaming_light_curve(
     )
 
 
+def _source_band_chunks(source, band_batch_size):
+    """Split a wavelength-aware source without duplicating its spatial state."""
+
+    band_count = len(source.geometry.band_names)
+    if band_batch_size is None or band_batch_size >= band_count:
+        return ((source, band_count),)
+    with_bands = getattr(source, "with_bands", None)
+    if with_bands is None:
+        raise TypeError("band_batch_size requires a source that supports with_bands")
+    names = source.geometry.band_names
+    wavelengths = source.geometry.wavelengths_angstrom
+    chunks = []
+    for start in range(0, band_count, band_batch_size):
+        stop = min(start + band_batch_size, band_count)
+        chunk_names = list(names[start:stop])
+        chunk_wavelengths = list(wavelengths[start:stop])
+        valid_count = len(chunk_names)
+        if valid_count < band_batch_size:
+            chunk_names.extend(
+                f"__padding_band_{index:04d}"
+                for index in range(valid_count, band_batch_size)
+            )
+            chunk_wavelengths.extend(
+                [chunk_wavelengths[-1]] * (band_batch_size - valid_count)
+            )
+        chunks.append(
+            (
+                with_bands(dict(zip(chunk_names, chunk_wavelengths, strict=True))),
+                valid_count,
+            )
+        )
+    return tuple(chunks)
+
+
+@torch.no_grad()
+def _flexible_streaming_light_curves(
+    simulation,
+    lens_region,
+    source_grid,
+    map_times,
+    requests,
+    request_times,
+    *,
+    method,
+    schedule,
+    map_observer,
+    band_batch_size,
+    map_iterator,
+):
+    """Share dynamic maps across request-specific time and wavelength batches."""
+
+    runtime = simulation.runtime
+    device, dtype = runtime.device, runtime.dtype
+    map_times = _increasing_times(map_times, name="times_days").cpu()
+    request_times = tuple(
+        _increasing_times(values, name="request flux_times_days").cpu()
+        for values in request_times
+    )
+    if len(request_times) != len(requests):
+        raise ValueError("request_flux_times_days must match the request count")
+    if map_times.numel() > 1 and any(
+        times[0] < map_times[0] or times[-1] > map_times[-1] for times in request_times
+    ):
+        raise ValueError("request flux times must lie within the dynamic map cadence")
+    if band_batch_size is not None and (
+        not isinstance(band_batch_size, int)
+        or isinstance(band_batch_size, bool)
+        or band_batch_size < 1
+    ):
+        raise ValueError("band_batch_size must be a positive integer or None")
+
+    resolved_schedule = DynamicConfig() if schedule is None else schedule
+    temporal_batch = resolved_schedule.temporal_batch_size
+    if temporal_batch is None:
+        temporal_batch = 49 if device.type == "cuda" else 1
+    temporal_batch = max(1, int(temporal_batch))
+    times_device = tuple(
+        times.to(device=device, dtype=dtype) for times in request_times
+    )
+    centers = []
+    offsets = []
+    chunks = []
+    right_indices = []
+    fractions = []
+    for request, times, local_times in zip(
+        requests, request_times, times_device, strict=True
+    ):
+        trajectory = (
+            LinearTrajectory() if request.trajectory is None else request.trajectory
+        )
+        position = trajectory.position_uas(local_times, device=device, dtype=dtype)
+        if position.shape != (times.numel(), 2):
+            raise ValueError("trajectory positions must have shape [time, 2]")
+        centers.append(position)
+        offsets.append(
+            _source_offsets_uas(
+                request.source,
+                request.distances,
+                device=device,
+                dtype=dtype,
+            )
+        )
+        chunks.append(_source_band_chunks(request.source, band_batch_size))
+        if map_times.numel() == 1:
+            right_indices.append(torch.zeros(times.numel(), dtype=torch.long))
+            fractions.append(torch.zeros(times.numel(), dtype=dtype, device=device))
+        else:
+            right = torch.searchsorted(map_times, times).clamp(1, map_times.numel() - 1)
+            right_indices.append(right)
+            fraction = (times - map_times[right - 1]) / (
+                map_times[right] - map_times[right - 1]
+            )
+            fractions.append(fraction.to(device=device, dtype=dtype))
+
+    iterator = iter(
+        simulation.dynamic_maps(
+            lens_region,
+            source_grid,
+            map_times.tolist(),
+            method=method,
+            schedule=resolved_schedule,
+        )
+        if map_iterator is None
+        else map_iterator
+    )
+    runtime.synchronize(detailed=False)
+    started = perf_counter()
+    outputs = [[None] * int(times.numel()) for times in request_times]
+    unlensed_outputs = [[None] * int(times.numel()) for times in request_times]
+    map_methods = set()
+    dynamic_metadata = {}
+
+    def take_map(index):
+        nonlocal dynamic_metadata
+        frame = next(iterator)
+        map_methods.add(frame.method)
+        dynamic_metadata = {
+            key: value
+            for key, value in frame.metadata.items()
+            if key == "rasterizer"
+            or key.startswith(("dynamic_", "dual_scout_", "cross_system_"))
+        }
+        if map_observer is not None:
+            map_observer(index, frame)
+        return frame
+
+    left_map = take_map(0)
+    interval_values = (0,) if map_times.numel() == 1 else range(1, map_times.numel())
+    for right_index in interval_values:
+        right_map = left_map if right_index == 0 else take_map(right_index)
+        for request_index, request in enumerate(requests):
+            selected = torch.nonzero(
+                right_indices[request_index] == right_index
+            ).reshape(-1)
+            for start in range(0, selected.numel(), temporal_batch):
+                local = selected[start : start + temporal_batch]
+                if local.numel() == 0:
+                    continue
+                x_offset, y_offset = offsets[request_index]
+                x = x_offset[None] + centers[request_index][local, 0, None, None]
+                y = y_offset[None] + centers[request_index][local, 1, None, None]
+                left_values = _sample_map_batch(
+                    left_map, x, y, strict_coverage=request.strict_coverage
+                )
+                if right_map is left_map:
+                    sampled = left_values
+                else:
+                    right_values = _sample_map_batch(
+                        right_map, x, y, strict_coverage=request.strict_coverage
+                    )
+                    weight = fractions[request_index][local, None, None]
+                    sampled = left_values + weight * (right_values - left_values)
+                lensed_parts = []
+                unlensed_parts = []
+                for chunk_source, valid_count in chunks[request_index]:
+                    brightness = chunk_source.brightness(
+                        times_device[request_index][local],
+                        device=device,
+                        dtype=dtype,
+                    )
+                    lensed_parts.append(
+                        (brightness * sampled[..., None]).sum(dim=(1, 2))[
+                            :, :valid_count
+                        ]
+                    )
+                    unlensed_parts.append(brightness.sum(dim=(1, 2))[:, :valid_count])
+                lensed = torch.cat(lensed_parts, dim=1)
+                unlensed = torch.cat(unlensed_parts, dim=1)
+                for row, output_index in enumerate(local.tolist()):
+                    outputs[request_index][output_index] = lensed[row]
+                    unlensed_outputs[request_index][output_index] = unlensed[row]
+        left_map = right_map
+
+    try:
+        next(iterator)
+    except StopIteration:
+        pass
+    else:
+        raise RuntimeError("dynamic scheduler returned more maps than requested")
+    runtime.synchronize(detailed=False)
+    elapsed = perf_counter() - started
+    results = []
+    for index, request in enumerate(requests):
+        if any(value is None for value in outputs[index]):
+            raise RuntimeError("not every request flux epoch was evaluated")
+        pixel_area = float(
+            request.source.geometry.pixel_scale_m[0]
+            * request.source.geometry.pixel_scale_m[1]
+        )
+        results.append(
+            LightCurve(
+                times_days=times_device[index],
+                flux=torch.stack(outputs[index]) * pixel_area,
+                band_names=request.source.geometry.band_names,
+                unlensed_flux=torch.stack(unlensed_outputs[index]) * pixel_area,
+                metadata={
+                    "method": "streaming_finite_source_map_sampling",
+                    "request_name": request.name,
+                    "map_methods": sorted(map_methods),
+                    "strict_coverage": bool(request.strict_coverage),
+                    "source": dict(request.source.metadata()),
+                    "maps_retained": False,
+                    "source_batch_size": temporal_batch,
+                    "band_batch_size": band_batch_size,
+                    "shared_map_request_count": len(requests),
+                    "map_epochs": int(map_times.numel()),
+                    "flux_epochs": int(request_times[index].numel()),
+                    "map_interpolation": (
+                        "linear"
+                        if not torch.equal(request_times[index], map_times)
+                        else "none"
+                    ),
+                    "dynamic_map_metadata": dynamic_metadata,
+                    **dynamic_metadata,
+                },
+                timing=TimingBreakdown(
+                    collected=runtime.profiling_enabled,
+                    steady_seconds=elapsed,
+                ),
+            )
+        )
+    return tuple(results)
+
+
 @torch.no_grad()
 def streaming_light_curves(
     simulation,
@@ -675,6 +1003,8 @@ def streaming_light_curves(
     schedule: DynamicConfig | None = None,
     map_observer: Callable[[int, MagnificationMap], None] | None = None,
     flux_times_days: torch.Tensor | Sequence[float] | None = None,
+    request_flux_times_days=None,
+    band_batch_size: int | None = None,
     _map_iterator=None,
 ) -> tuple[LightCurve, ...]:
     """Generate several light curves from one streamed map sequence.
@@ -699,6 +1029,41 @@ def streaming_light_curves(
     if any(item.distances is None for item in requests):
         raise ValueError(
             "low-level requests require distances; use system.light_curves to inherit them"
+        )
+    if any(item.source is None for item in requests):
+        raise ValueError("low-level requests require resolved sources")
+    if request_flux_times_days is not None:
+        if flux_times_days is not None:
+            raise ValueError(
+                "supply shared flux_times_days or request_flux_times_days, not both"
+            )
+        return _flexible_streaming_light_curves(
+            simulation,
+            lens_region,
+            source_grid,
+            times_days,
+            requests,
+            request_flux_times_days,
+            method=method,
+            schedule=schedule,
+            map_observer=map_observer,
+            band_batch_size=band_batch_size,
+            map_iterator=_map_iterator,
+        )
+    if band_batch_size is not None:
+        shared_times = times_days if flux_times_days is None else flux_times_days
+        return _flexible_streaming_light_curves(
+            simulation,
+            lens_region,
+            source_grid,
+            times_days,
+            requests,
+            (shared_times,) * len(requests),
+            method=method,
+            schedule=schedule,
+            map_observer=map_observer,
+            band_batch_size=band_batch_size,
+            map_iterator=_map_iterator,
         )
     resolved_schedule = DynamicConfig() if schedule is None else schedule
     map_times = _increasing_times(times_days, name="times_days").cpu()
@@ -816,8 +1181,7 @@ def streaming_light_curves(
                 times_device[:1], device=device, dtype=dtype
             )[0]
     factorized_unlensed = [
-        None if base is None else base.sum(dim=(0, 1))
-        for base in factorized_bases
+        None if base is None else base.sum(dim=(0, 1)) for base in factorized_bases
     ]
     runtime.synchronize()
     source_seconds += perf_counter() - factorized_started
@@ -835,7 +1199,8 @@ def streaming_light_curves(
         dynamic_metadata = {
             key: value
             for key, value in right_map.metadata.items()
-            if key.startswith(("dynamic_", "dual_scout_", "cross_system_"))
+            if key == "rasterizer"
+            or key.startswith(("dynamic_", "dual_scout_", "cross_system_"))
         }
         if map_observer is not None:
             map_observer(map_index, right_map)
@@ -846,16 +1211,10 @@ def streaming_light_curves(
         if any(offsets[index] is None for index in active):
             raise RuntimeError("mixed aligned and sampled sources cannot share a group")
         x_batch = torch.stack(
-            [
-                offsets[index][0] + centers[index][frame_index, 0]
-                for index in active
-            ]
+            [offsets[index][0] + centers[index][frame_index, 0] for index in active]
         )
         y_batch = torch.stack(
-            [
-                offsets[index][1] + centers[index][frame_index, 1]
-                for index in active
-            ]
+            [offsets[index][1] + centers[index][frame_index, 1] for index in active]
         )
         return _sample_map_batch(
             frame, x_batch, y_batch, strict_coverage=requests[active[0]].strict_coverage
@@ -921,7 +1280,9 @@ def streaming_light_curves(
                         if len(unlensed_items) == 1
                         else torch.stack(unlensed_items)
                     )
-                    if any(factorized_amplitudes[index] is not None for index in active):
+                    if any(
+                        factorized_amplitudes[index] is not None for index in active
+                    ):
                         modulation = torch.stack(
                             [
                                 (
@@ -993,6 +1354,7 @@ def streaming_light_curves(
                     else "none",
                     "coherent_source_factorized": (factorized_bases[index] is not None),
                     "map_aligned_source_fast_path": map_aligned[index],
+                    "dynamic_map_metadata": dynamic_metadata,
                     **dynamic_metadata,
                 },
                 timing=timing,

@@ -44,6 +44,11 @@ def _light_curve_payload(light_curve: LightCurve) -> dict[str, np.ndarray]:
         if light_curve.unlensed_flux is None
         else light_curve.unlensed_flux.detach().cpu().numpy()
     )
+    microlensing_only = (
+        np.asarray([], dtype=np.float32)
+        if light_curve.microlensing_only_flux is None
+        else light_curve.microlensing_only_flux.detach().cpu().numpy()
+    )
     payload = {
         "schema_version": np.asarray(_LIGHT_CURVE_SCHEMA_VERSION),
         "has_labels": np.asarray(light_curve.labels is not None),
@@ -51,6 +56,10 @@ def _light_curve_payload(light_curve: LightCurve) -> dict[str, np.ndarray]:
         "flux": light_curve.flux.detach().cpu().numpy(),
         "unlensed_flux": unlensed,
         "has_unlensed": np.asarray(light_curve.unlensed_flux is not None),
+        "microlensing_only_flux": microlensing_only,
+        "has_microlensing_only": np.asarray(
+            light_curve.microlensing_only_flux is not None
+        ),
         "band_names": np.asarray(light_curve.band_names),
         "metadata_json": np.asarray(_json_text(light_curve.metadata)),
     }
@@ -90,6 +99,11 @@ def _light_curve_from_payload(
     unlensed = None
     if bool(payload["has_unlensed"]):
         unlensed = torch.from_numpy(payload["unlensed_flux"].copy()).to(device)
+    microlensing_only = None
+    if bool(payload.get("has_microlensing_only", False)):
+        microlensing_only = torch.from_numpy(
+            payload["microlensing_only_flux"].copy()
+        ).to(device)
     return LightCurve(
         times_days=torch.from_numpy(payload["times_days"].copy()).to(device),
         flux=torch.from_numpy(payload["flux"].copy()).to(device),
@@ -97,6 +111,7 @@ def _light_curve_from_payload(
         unlensed_flux=unlensed,
         metadata=json.loads(str(payload["metadata_json"])),
         labels=labels,
+        microlensing_only_flux=microlensing_only,
     )
 
 

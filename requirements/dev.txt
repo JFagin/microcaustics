@@ -1,3 +1,0 @@
--r test.txt
-build>=1.2
-ruff>=0.6

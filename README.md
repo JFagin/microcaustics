@@ -396,9 +396,11 @@ source = mc.KerrDiskModel(
     lamp_fraction=0.1,
     corona_height_above_isco_rg=20.0,
     driving_signal=driver,          # optional, inherits the system's variability seed
-    source_grid_shape=1024,          # disk/map pixels per axis, e.g. 512 or 1024
+    source_grid_shape=1024,          # disk-brightness pixels per axis
     enclosed_flux_fraction=0.999,
     source_margin=1.05,
+    observer_coordinate_chunk_size=524_288,  # fixed padded delay-solver chunk
+    compute_emission_azimuth=False,  # enable only for non-axisymmetric use
 )
 
 kinematics = mc.SkyProjectedKinematics(
@@ -421,6 +423,7 @@ system = mc.MicrolensingSystem(
     Om0=0.3,                         # present-day matter density
     macro=macro,
     source=source,
+    map_grid_shape=1024,              # optional independent map resolution
     stellar_population=population,
     integration_domain="scout",     # "scout", "full", or "rectangle"
     light_loss=0.01,                 # stellar-aperture truncation tolerance
@@ -458,8 +461,10 @@ and resource scale with `system.summary(duration_days=3650)`. The returned
 dictionary can also be validated programmatically, and the call performs no
 simulation.
 
-`source_grid_shape` is the number of source pixels per axis, not a physical source
-size. Quasar models derive their angular field from the black-hole, accretion,
+`source_grid_shape` is the number of source-brightness pixels per axis, not a
+physical source size. `map_grid_shape` optionally selects a different
+magnification-map resolution over the same angular field. Quasar models derive
+their angular field from the black-hole, accretion,
 wavelength, inclination, redshift, and enclosed-flux settings.
 Expanding-supernova models derive it from the largest photospheric radius over
 the requested evolution.
@@ -486,11 +491,11 @@ figure, ax = mcp.plot_magnification_map(
 )
 ```
 
-For a static map, the two main numerical controls are `rays` and `source_grid_shape`.
+For a static map, the two main numerical controls are `rays` and the map grid shape.
 `rays` sets the lens-plane sampling budget, for example
-`system.magnification_map(rays=5_000_000)`. `source_grid_shape` in the source
-definition sets the disk and magnification-map resolution. Change it to
-`512` for a smaller pixel grid or keep `1024` for the examples shown here.
+`system.magnification_map(rays=5_000_000)`. By default the source's
+`source_grid_shape` also sets the map resolution. Set `map_grid_shape` on the
+system when the disk-brightness and map resolutions should differ.
 Neither requires choosing the physical source size manually.
 
 More output pixels resolve finer structure but do not replace adequate ray
@@ -565,8 +570,10 @@ combined = system.light_curve(
     scout_refresh_frames=10,
     include_labels=True,
     apply_driving_signal=True,
+    include_microlensing_only=True,
 )
 print(combined.magnitude.shape)                # [3651, 6], daily AB magnitudes
+print(combined.microlensing_only_magnitude.shape)  # [3651, 6], same maps
 print(combined.labels.crossing_labels.shape)   # [147], labels stay at the map cadence
 print(combined.labels.times_days.shape)        # [147], separate label epochs
 ```
@@ -580,6 +587,33 @@ delay. Out-of-range queries raise an error rather than hold an endpoint.
 Changing the generation grid can change the entire realization even with the
 same seed. A driver-specific `seed` overrides the inherited system seed.
 
+Dense continuum spectra use the same light-curve API: wavelength channels are
+simply bands in the returned `[time, band]` arrays. Use `band_batch_size` to
+bound source memory. A final partial batch is padded to the requested size to
+reuse the compiled shape, then trimmed before the result is returned.
+Configure the system source to include the reddest wavelength you will request
+so its automatically chosen spatial support encloses that emission.
+
+```python
+spectral_bands = {
+    f"lambda_{w:05d}": float(w) for w in range(3000, 11001, 20)
+}
+daily_lsst, spectra = system.light_curves(
+    duration_days=3650,
+    map_cadence_days=25,
+    requests=(
+        mc.LightCurveRequest(
+            bands_angstrom={"u": 3671, "g": 4827, "r": 6223,
+                             "i": 7546, "z": 8691, "y": 9712},
+            flux_cadence_days=1,
+        ),
+        mc.LightCurveRequest(bands_angstrom=spectral_bands),
+    ),
+    band_batch_size=32,
+)
+print(daily_lsst.flux.shape, spectra.flux.shape)  # [3651, 6], [147, 401]
+```
+
 Omitting `apply_driving_signal` uses the supplied driver automatically. Setting
 it to false holds the driver at its mean without removing lamp heating or
 freezing other source evolution, such as supernova expansion. Custom signals
@@ -592,6 +626,11 @@ error. Supernovae evolve through their own source model and need no driver.
 For a custom source, use `ModulatedSource` only when you intend additional
 multiplicative brightness modulation. Replacing a source replaces its driver
 too, without inheriting the previous source's driver.
+
+Set `include_microlensing_only=True` to return the driven curve and its
+constant-mean-driver comparison together. The comparison is available as
+`microlensing_only_flux` and `microlensing_only_magnitude`. Both use the same
+magnification maps and labels; the static source brightness is evaluated once.
 
 Only requested maps are retained. A request that is not an evaluated map epoch
 produces a warning and is omitted, without interpolation or extra ray tracing.
@@ -724,10 +763,12 @@ batch = mc.batched_system_light_curves(
     temporal_batch_size=30,
     scout_refresh_frames=10,
     curves_per_batch=3,  # individual macroimage curves, not systems
+    source_setup_batch_size=3,  # compatible Kerr disks prepared together
     include_labels=True,
+    include_microlensing_only=True,
 )
 curves = batch.light_curves
-print(curves[0].magnitude.shape, batch.executed_batch_sizes)
+print(curves[0].magnitude.shape, curves[0].microlensing_only_magnitude.shape)
 ```
 
 Large datasets can be streamed through a bounded background writer. A directory
@@ -794,7 +835,8 @@ The main accuracy and throughput controls in the example are listed below.
 | Control | Meaning |
 |---|---|
 | `rays` | Requested base lens-plane cell budget, $N$ |
-| `source_grid_shape` | Disk and magnification-map pixels per axis, set on the source model |
+| `source_grid_shape` | Source-brightness pixels per axis, set on the source model |
+| `map_grid_shape` | Optional independent magnification-map pixels per axis |
 | `map_pixels` | Magnification-map pixels per axis when no source model is supplied |
 | `integration_domain` | `"scout"`, `"full"`, or `"rectangle"` integration region |
 | `scout_ratio` | Scout coarsening factor, $k$, used only by the scout domain |
@@ -804,7 +846,9 @@ The main accuracy and throughput controls in the example are listed below.
 | `scout_refresh_frames` | Number of dynamic epochs sharing an endpoint-union scout selection |
 | `temporal_batch_size` | Number of consecutive maps processed by one fused temporal batch |
 | `light_curve_batch_size` | Number of sources or trajectories sampled from one shared map sequence |
+| `band_batch_size` | Wavelength channels evaluated together; the final batch is padded and trimmed |
 | `curves_per_batch` | Number of independent macroimage light curves run concurrently on one GPU |
+| `source_setup_batch_size` | Number of compatible Kerr disks sharing fixed-shape observer-delay launches |
 | `cell_chunk_size` | Maximum spatial work chunk before automatic memory backoff |
 | `caustic_grid_shape` | Resolution of determinant, critical-curve, and source-center-label products |
 | `discovery_downsample_ratio` | Coarsening of the critical-curve discovery grid before sparse full-resolution determinant evaluation |

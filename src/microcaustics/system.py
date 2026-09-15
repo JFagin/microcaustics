@@ -57,6 +57,7 @@ from .lens.stellar import (
     _warn_incomplete_dynamic_kinematics,
     circular_stellar_aperture,
 )
+from .photometry import LightCurveRequest
 from .random import derive_seed
 from .runtime import ResolvedRuntime, resolve_runtime
 from .simulation import MicrolensingSimulation
@@ -265,6 +266,8 @@ class MicrolensingRealization:
         caustics=None,
         diagnostic_grid=None,
         include_distance_map=False,
+        include_microlensing_only=False,
+        band_batch_size=None,
     ):
         """Resolve geometry and observers once for all four photometry schedulers."""
 
@@ -274,6 +277,10 @@ class MicrolensingRealization:
         source = _pixelate_source(
             source, self.system.distances, runtime=self.simulation.runtime
         )
+        microlensing_only_source = None
+        if include_microlensing_only:
+            _validate_source_driver(source, True)
+            microlensing_only_source = _source_at_driver_mean(source)
         method = self._method_for_domain(
             production_ipm_config() if method is None else method
         )
@@ -295,6 +302,8 @@ class MicrolensingRealization:
             trajectory=self._trajectory_in_local_frame(trajectory),
             strict_coverage=strict_coverage,
             map_observer=observer,
+            microlensing_only_source=microlensing_only_source,
+            band_batch_size=band_batch_size,
         )
         if include_labels:
             kwargs.update(
@@ -333,8 +342,39 @@ class MicrolensingRealization:
         strict_coverage: bool = True,
         map_observer=None,
         keep_maps_at_days: Sequence[float] | None = None,
+        bands_angstrom: Mapping[str, float] | None = None,
+        band_batch_size: int | None = None,
+        include_microlensing_only: bool = False,
     ) -> LightCurve:
         """Generate a finite-source light curve for this realization."""
+
+        if band_batch_size is not None or bands_angstrom is not None:
+            request = LightCurveRequest(
+                source=self.source if source is None else source,
+                distances=self.system.distances,
+                trajectory=trajectory,
+                strict_coverage=strict_coverage,
+                bands_angstrom=bands_angstrom,
+            )
+            curves = self.light_curves(
+                times_days,
+                (
+                    request,
+                    *(
+                        (replace(request, source=_source_at_driver_mean(request.source)),)
+                        if include_microlensing_only
+                        else ()
+                    ),
+                ),
+                method=method,
+                schedule=schedule,
+                map_observer=map_observer,
+                keep_maps_at_days=keep_maps_at_days,
+                band_batch_size=band_batch_size,
+            )
+            if not include_microlensing_only:
+                return curves[0]
+            return curves[0].with_microlensing_only(curves[1])
 
         return self._photometry(
             times_days,
@@ -347,6 +387,42 @@ class MicrolensingRealization:
             strict_coverage=strict_coverage,
             map_observer=map_observer,
             keep_maps_at_days=keep_maps_at_days,
+            include_microlensing_only=include_microlensing_only,
+            band_batch_size=band_batch_size,
+        )
+
+    def source_light_curve(
+        self,
+        times_days,
+        *,
+        bands_angstrom: Mapping[str, float] | None = None,
+        apply_driving_signal: bool | None = None,
+        batch_size: int = 16,
+        band_batch_size: int | None = None,
+    ) -> LightCurve:
+        """Integrate the source without generating magnification maps."""
+
+        from .photometry import source_light_curve
+
+        source = self.source
+        if source is None:
+            raise ValueError("source_light_curve requires a system source")
+        if bands_angstrom is not None:
+            with_bands = getattr(source, "with_bands", None)
+            if with_bands is None:
+                raise TypeError("bands_angstrom requires a source with with_bands")
+            source = with_bands(bands_angstrom)
+        _validate_source_driver(source, apply_driving_signal)
+        if apply_driving_signal is False:
+            source = _source_at_driver_mean(source)
+        runtime = self.simulation.runtime
+        return source_light_curve(
+            source,
+            times_days,
+            batch_size=batch_size,
+            band_batch_size=band_batch_size,
+            device=runtime.device,
+            dtype=runtime.dtype,
         )
 
     def light_curves(
@@ -359,6 +435,8 @@ class MicrolensingRealization:
         map_observer=None,
         keep_maps_at_days: Sequence[float] | None = None,
         flux_times_days=None,
+        request_flux_times_days=None,
+        band_batch_size: int | None = None,
     ) -> tuple[LightCurve, ...]:
         """Batch multiple sources or trajectories through one map sequence.
 
@@ -367,18 +445,33 @@ class MicrolensingRealization:
         not repeat map generation.
         """
 
-        requests = tuple(
-            replace(
-                request,
-                distances=request.distances or self.system.distances,
-                source=_pixelate_source(
-                    request.source,
-                    request.distances or self.system.distances,
-                    runtime=self.simulation.runtime,
-                ),
+        resolved_requests = []
+        for request in requests:
+            distances = request.distances or self.system.distances
+            source = self.source if request.source is None else request.source
+            if source is None:
+                raise ValueError(
+                    "a request without a source requires a system source to inherit"
+                )
+            source = _pixelate_source(
+                source,
+                distances,
+                runtime=self.simulation.runtime,
             )
-            for request in requests
-        )
+            if request.bands_angstrom is not None:
+                with_bands = getattr(source, "with_bands", None)
+                if with_bands is None:
+                    raise TypeError(
+                        "bands_angstrom requires a source that supports with_bands"
+                    )
+                source = with_bands(request.bands_angstrom)
+            _validate_source_driver(source, request.apply_driving_signal)
+            if request.apply_driving_signal is False:
+                source = _source_at_driver_mean(source)
+            resolved_requests.append(
+                replace(request, source=source, distances=distances)
+            )
+        requests = tuple(resolved_requests)
 
         resolved_method = self._method_for_domain(
             production_ipm_config() if method is None else method
@@ -398,6 +491,8 @@ class MicrolensingRealization:
             schedule=resolved_schedule,
             map_observer=observer,
             flux_times_days=flux_times_days,
+            request_flux_times_days=request_flux_times_days,
+            band_batch_size=band_batch_size,
         )
         return tuple(replace(curve, maps=retained) for curve in curves)
 
@@ -413,8 +508,38 @@ class MicrolensingRealization:
         strict_coverage: bool = True,
         map_observer=None,
         keep_maps_at_days: Sequence[float] | None = None,
+        band_batch_size: int | None = None,
+        include_microlensing_only: bool = False,
     ) -> LightCurve:
         """Use sparse dynamic maps with independently sampled source evolution."""
+
+        if band_batch_size is not None:
+            request = LightCurveRequest(
+                source=self.source if source is None else source,
+                distances=self.system.distances,
+                trajectory=trajectory,
+                strict_coverage=strict_coverage,
+            )
+            curves = self.light_curves(
+                map_times_days,
+                (
+                    request,
+                    *(
+                        (replace(request, source=_source_at_driver_mean(request.source)),)
+                        if include_microlensing_only
+                        else ()
+                    ),
+                ),
+                method=method,
+                schedule=schedule,
+                map_observer=map_observer,
+                keep_maps_at_days=keep_maps_at_days,
+                flux_times_days=flux_times_days,
+                band_batch_size=band_batch_size,
+            )
+            if not include_microlensing_only:
+                return curves[0]
+            return curves[0].with_microlensing_only(curves[1])
 
         return self._photometry(
             map_times_days,
@@ -427,6 +552,8 @@ class MicrolensingRealization:
             strict_coverage=strict_coverage,
             map_observer=map_observer,
             keep_maps_at_days=keep_maps_at_days,
+            include_microlensing_only=include_microlensing_only,
+            band_batch_size=band_batch_size,
         )
 
     def multirate_light_curve_with_labels(
@@ -444,6 +571,8 @@ class MicrolensingRealization:
         include_distance_map: bool = False,
         map_observer=None,
         keep_maps_at_days: Sequence[float] | None = None,
+        include_microlensing_only: bool = False,
+        band_batch_size: int | None = None,
     ):
         """Return fine-cadence flux and labels at the sparse map epochs."""
 
@@ -461,6 +590,8 @@ class MicrolensingRealization:
             caustics=caustics,
             diagnostic_grid=diagnostic_grid,
             include_distance_map=include_distance_map,
+            include_microlensing_only=include_microlensing_only,
+            band_batch_size=band_batch_size,
         )
 
     def light_curve_with_labels(
@@ -477,6 +608,8 @@ class MicrolensingRealization:
         include_distance_map: bool = False,
         map_observer=None,
         keep_maps_at_days: Sequence[float] | None = None,
+        include_microlensing_only: bool = False,
+        band_batch_size: int | None = None,
     ):
         """Generate a light curve with aligned source-center caustic labels."""
 
@@ -494,6 +627,8 @@ class MicrolensingRealization:
             caustics=caustics,
             diagnostic_grid=diagnostic_grid,
             include_distance_map=include_distance_map,
+            include_microlensing_only=include_microlensing_only,
+            band_batch_size=band_batch_size,
         )
 
     def caustics(
@@ -666,6 +801,7 @@ class MicrolensingSystem:
     distance_device: torch.device | str | None = "auto"
     source: PixelatedSource | PhysicalSourceModel | None = None
     source_grid: PlaneGrid | None = None
+    map_grid_shape: int | tuple[int, int] | None = None
     stellar_population: StellarPopulation | None = None
     stars: PointMassField | None = None
     integration_domain: IntegrationDomain | str = IntegrationDomain.SCOUT
@@ -732,6 +868,25 @@ class MicrolensingSystem:
         explicit_lens_plane = _lens_plane_region(self.lens_plane_uas)
         if explicit_lens_plane is not None and self.lens_region is not None:
             raise ValueError("supply lens_plane_uas or lens_region, not both")
+        if self.map_grid_shape is not None:
+            if self.source_grid is not None:
+                raise ValueError("supply map_grid_shape or source_grid, not both")
+            raw_shape = (
+                (self.map_grid_shape, self.map_grid_shape)
+                if isinstance(self.map_grid_shape, int)
+                and not isinstance(self.map_grid_shape, bool)
+                else tuple(self.map_grid_shape)
+                if not isinstance(self.map_grid_shape, (int, bool))
+                else ()
+            )
+            if (
+                len(raw_shape) != 2
+                or any(not isinstance(value, int) or isinstance(value, bool) for value in raw_shape)
+                or any(value < 1 for value in raw_shape)
+            ):
+                raise ValueError("map_grid_shape must contain positive integers")
+            shape = tuple(raw_shape)
+            object.__setattr__(self, "map_grid_shape", shape)
         if (
             self.source is not None
             and self.source_grid is not None
@@ -981,6 +1136,12 @@ class MicrolensingSystem:
                 numerical_trajectory,
                 (0.0, self.duration_days),
                 margin=self.trajectory_grid_margin,
+            )
+        if self.map_grid_shape is not None:
+            source_grid = PlaneGrid(
+                self.map_grid_shape,
+                source_grid.field_of_view_uas,
+                source_grid.center_uas,
             )
         if source_support_radius_uas is not None and self.source_grid is not None:
             available_radius = 0.5 * min(native_source_grid.field_of_view_uas)
@@ -1593,6 +1754,9 @@ class MicrolensingSystem:
         flux_times_days: Sequence[float] | None = None,
         include_labels: bool = False,
         apply_driving_signal: bool | None = None,
+        include_microlensing_only: bool = False,
+        bands_angstrom: Mapping[str, float] | None = None,
+        band_batch_size: int | None = None,
         start_day: float = 0.0,
         **kwargs,
     ) -> LightCurve:
@@ -1613,6 +1777,8 @@ class MicrolensingSystem:
         present. ``False`` keeps its mean heating while disabling fluctuations,
         and ``True`` requires a configured source driver. A ``source`` override
         uses its own geometry and driver, never the previous source's driver.
+        ``include_microlensing_only=True`` also returns the mean-driver flux
+        through the same map stream; its static source brightness is reused.
 
         Plain numerical controls override ``method``, ``schedule`` and ``caustics``.
         Unrecognized controls raise before realization. ``keep_maps_at_days``
@@ -1620,6 +1786,11 @@ class MicrolensingSystem:
         Photometry arrays have shape [time, band]. Label epochs are separate in
         ``labels.times_days`` and retained map epochs in ``map_times_days``.
         """
+
+        if include_microlensing_only and apply_driving_signal is False:
+            raise ValueError(
+                "include_microlensing_only=True requires the driven light curve"
+            )
 
         map_times, flux_times = _light_curve_times(
             times_days,
@@ -1629,6 +1800,34 @@ class MicrolensingSystem:
             flux_times_days=flux_times_days,
             start_day=start_day,
         )
+        if band_batch_size is not None or bands_angstrom is not None:
+            if include_labels:
+                raise ValueError(
+                    "wavelength selection and batching are not supported with labels"
+                )
+            source_override = kwargs.pop("source", None)
+            trajectory = kwargs.pop("trajectory", None)
+            strict_coverage = kwargs.pop("strict_coverage", True)
+            request = LightCurveRequest(
+                source=source_override,
+                trajectory=trajectory,
+                strict_coverage=strict_coverage,
+                bands_angstrom=bands_angstrom,
+                apply_driving_signal=apply_driving_signal,
+            )
+            requests = [request]
+            if include_microlensing_only:
+                requests.append(replace(request, apply_driving_signal=False))
+            curves = self.light_curves(
+                map_times,
+                requests=tuple(requests),
+                flux_times_days=map_times if flux_times is None else flux_times,
+                band_batch_size=band_batch_size,
+                **kwargs,
+            )
+            if not include_microlensing_only:
+                return curves[0]
+            return curves[0].with_microlensing_only(curves[1])
         call_kwargs = _light_curve_options(
             kwargs,
             include_labels=include_labels,
@@ -1652,9 +1851,15 @@ class MicrolensingSystem:
             map_times,
             flux_times,
             include_labels=include_labels,
+            include_microlensing_only=include_microlensing_only,
             **call_kwargs,
         )
         return replace(result, maps=retained)
+
+    def source_light_curve(self, times_days, **kwargs) -> LightCurve:
+        """Integrate the physical source without generating lensing maps."""
+
+        return self.realize().source_light_curve(times_days, **kwargs)
 
     def light_curves(
         self,
@@ -1665,6 +1870,7 @@ class MicrolensingSystem:
         map_cadence_days: float | None = None,
         source_cadence_days: float | None = None,
         flux_times_days=None,
+        band_batch_size: int | None = None,
         start_day: float = 0.0,
         **kwargs,
     ):
@@ -1681,6 +1887,11 @@ class MicrolensingSystem:
             raise ValueError(
                 "supply requests containing the sources or trajectories to sample"
             )
+        requests = tuple(requests)
+        if not requests:
+            raise ValueError("at least one light-curve request is required")
+        if not all(isinstance(request, LightCurveRequest) for request in requests):
+            raise TypeError("requests must contain LightCurveRequest instances")
         map_times, flux_times = _light_curve_times(
             times_days,
             duration_days=duration_days,
@@ -1694,10 +1905,34 @@ class MicrolensingSystem:
             include_labels=False,
             allowed_options={"keep_maps_at_days", "map_observer"},
         )
+        default_flux_times = map_times if flux_times is None else flux_times
+        request_times = []
+        for request in requests:
+            if request.flux_times_days is not None:
+                _, selected = _light_curve_times(
+                    map_times,
+                    flux_times_days=request.flux_times_days,
+                )
+            elif request.flux_cadence_days is not None:
+                _, selected = _light_curve_times(
+                    map_times,
+                    source_cadence_days=request.flux_cadence_days,
+                )
+            else:
+                selected = default_flux_times
+            request_times.append(map_times if selected is None else selected)
+        shared_times = request_times[0]
+        request_times_argument = (
+            None
+            if all(torch.equal(shared_times, item) for item in request_times[1:])
+            else tuple(request_times)
+        )
         return self._realize_for_times(map_times).light_curves(
             map_times,
             requests,
-            flux_times_days=flux_times,
+            flux_times_days=(shared_times if request_times_argument is None else None),
+            request_flux_times_days=request_times_argument,
+            band_batch_size=band_batch_size,
             **options,
         )
 

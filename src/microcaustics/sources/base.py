@@ -114,6 +114,20 @@ class SourceGeometry:
             self.band_names,
         )
 
+    def with_bands(self, bands_angstrom: Mapping[str, float]) -> SourceGeometry:
+        """Return the same spatial grid with different observed-wavelength bands."""
+
+        spatial = (
+            {"pixel_scale_m": self.pixel_scale_m}
+            if self.pixel_scale_m is not None
+            else {"field_of_view_uas": self.field_of_view_uas}
+        )
+        return SourceGeometry(
+            self.shape,
+            bands_angstrom=bands_angstrom,
+            **spatial,
+        )
+
     @property
     def pixel_area_m2(self) -> float:
         """Physical pixel area, available after the source geometry is resolved."""

@@ -33,6 +33,9 @@ driver heating, or use `apply_driving_signal=True` for intrinsic variability.
 Omitting the switch uses the source's driver when one is configured. Disabling the driver does not
 disable other evolution such as photospheric expansion. Custom multiplicative
 drivers use unit baseline unless their metadata supplies `mean_amplitude`.
+To obtain both products in one map calculation, set
+`include_microlensing_only=True`; the comparison is returned as
+`curve.microlensing_only_flux` and `curve.microlensing_only_magnitude`.
 
 A source without a driver needs no special handling. Omitting the switch or
 setting it to `False` evaluates that source normally. Setting it to `True`
@@ -165,6 +168,24 @@ system = mc.MicrolensingSystem(
 
 The source parameters determine its native angular support. The system then
 enlarges the map field, when necessary, to cover the complete trajectory.
+
+Several standalone physical sources can also be resolved together:
+
+```python
+sources = mc.batched_pixelate_sources(
+    disk_models,
+    distances,
+    batch_size=3,
+    runtime=runtime,
+)
+```
+
+On CUDA, compatible driven Kerr disks share fixed-size observer-delay launches;
+other source types and incompatible settings retain their ordinary serial
+calculation. This changes scheduling only. The requested model order and each
+source's independent physical parameters are preserved, CUDA memory exhaustion
+reduces the active source batch without changing numerical settings, and later
+calls reuse the same compiled kernel specialization.
 
 ## Expanding supernovae
 
@@ -325,6 +346,30 @@ weights = reprocessed.linear_response_weights()
 psi = reprocessed.transfer_function(delay_edges_days, magnification=mu)
 ```
 
+The observer transfer and heating maps are achromatic, so the same pixelated
+disk can be evaluated at any set of observed wavelengths without rebuilding
+them. The mean-driver source retains the mean lamppost heating while disabling
+only its stochastic fluctuations:
+
+```python
+spectrum_source = reprocessed.with_bands({
+    f"lambda_{wavelength:05d}": float(wavelength)
+    for wavelength in range(3000, 11001, 20)
+})
+mean_spectrum_source = spectrum_source.at_driver_mean()
+
+spectrum = mc.light_curve_from_maps(
+    maps,
+    spectrum_source,
+    map_times_days,
+    distances,
+    batch_size=1,
+)
+```
+
+Here the result is an ordinary multiband `LightCurve`; `batch_size` bounds the
+temporary wavelength-by-pixel cube without changing the calculation.
+
 When only the first moment is needed, use the direct mean-delay operations:
 
 ```python
@@ -398,6 +443,31 @@ Source evolution and dynamic magnification-map cadence are deliberately
 separate. A source can be evaluated daily while maps are generated less often,
 or vice versa, as long as the caller chooses and validates the interpolation
 appropriate to the application.
+
+For many wavelength channels, keep the physical model on the system and select
+the requested bands at light-curve time. Include the reddest requested
+wavelength in the configured model so its automatic support is large enough:
+
+```python
+spectral_bands = {
+    f"lambda_{w:05d}": float(w) for w in range(3000, 11001, 20)
+}
+spectrum = system.light_curve(
+    duration_days=3650,
+    map_cadence_days=25,
+    source_cadence_days=1,
+    bands_angstrom=spectral_bands,
+    band_batch_size=32,
+    include_microlensing_only=True,
+)
+```
+
+For several products from one map sequence, prefer
+`LightCurveRequest(bands_angstrom=...)` with `system.light_curves`. Requests can
+independently set `flux_cadence_days` and `apply_driving_signal=False`; no
+manual distance calculation, pixelation, or constant-driver source is needed.
+The final partial wavelength batch is padded internally and trimmed from the
+returned `[time, band]` arrays.
 
 ## Automatic physical source grids
 

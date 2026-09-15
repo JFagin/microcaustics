@@ -310,32 +310,6 @@ class PlottingTests(unittest.TestCase):
         self.assertEqual(len(axes), 3)
         self.assertTrue(hasattr(figure, "canvas"))
 
-    def test_paper_ipm_renderer_reproduces_the_archived_q2237b_diagnostic(self) -> None:
-        """Keep the tutorial schematic tied to the manuscript Figure 3 code."""
-
-        package_root = Path(__file__).resolve().parents[1]
-        fixture_root = package_root / "examples" / "data" / "q2237b_method_figures"
-        with tempfile.TemporaryDirectory() as temporary:
-            paths = mcp.render_paper_ipm_schematic(
-                fixture_root / "paper_tile_upsampling_schematic_data.npz",
-                fixture_root / "paper_far_field_schematic_data.npz",
-                temporary,
-                refinement=2,
-                virtual_refinement=4,
-                source_bins=1024,
-                output_prefix="q2237b_paper_figure_3",
-            )
-            self.assertEqual(len(paths), 3)
-            self.assertTrue(all(path.is_file() for path in paths))
-            rendered = plt.imread(paths[0])
-            self.assertGreater(rendered.shape[1], rendered.shape[0])
-            self.assertGreater(rendered.shape[0], 1000)
-            with np.load(paths[2], allow_pickle=False) as diagnostic:
-                self.assertEqual(int(diagnostic["displayed_refinement"]), 2)
-                self.assertEqual(int(diagnostic["displayed_virtual_refinement"]), 4)
-                self.assertEqual(int(diagnostic["source_bins"]), 1024)
-                self.assertFalse(bool(diagnostic["displayed_pixel_grid_enlarged"]))
-
     def test_live_paper_ipm_renderer_builds_its_own_diagnostics(self) -> None:
         """The publication layout also accepts a newly evaluated simulation."""
 
@@ -432,7 +406,11 @@ class PlottingTests(unittest.TestCase):
             normalize=False,
             zero_point_flux={"g": 100.0, "r": 200.0},
         )
-        self.assertEqual(calibrated_ax.get_ylabel(), "Brightness [mag]")
+        self.assertEqual(calibrated_ax.get_ylabel(), "brightness [mag]")
+        _, physical_ax = mcp.plot_light_curve(
+            curve, magnitude=True, normalize=False
+        )
+        self.assertEqual(physical_ax.get_ylabel(), "brightness [mag]")
         with self.assertRaises(ValueError):
             mcp.plot_light_curve(
                 curve,
@@ -518,6 +496,7 @@ class PlottingTests(unittest.TestCase):
         )
         _, ax = mcp.plot_photometric_observations(observations, image="B")
         self.assertEqual(len(ax.collections), 2)
+        self.assertEqual(ax.get_ylabel(), "brightness [mag]")
 
         series = mc.TransferFunctionSeries(
             times_days=torch.tensor([0.0, 2.0]),

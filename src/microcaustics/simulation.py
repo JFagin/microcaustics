@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .config import (
     DynamicConfig,
@@ -308,27 +308,43 @@ class MicrolensingSimulation:
         diagnostic_grid: PlaneGrid | None = None,
         include_distance_map: bool = False,
         map_observer=None,
+        microlensing_only_source: PixelatedSource | None = None,
+        band_batch_size: int | None = None,
     ):
         """Stream a finite-source LC with aligned center-crossing labels."""
 
-        from .caustics import streaming_labeled_light_curve
+        from .caustics import streaming_labeled_light_curves
+        from .photometry import LightCurveRequest
 
-        return streaming_labeled_light_curve(
+        requests = [LightCurveRequest(source, distances, trajectory, strict_coverage)]
+        if microlensing_only_source is not None:
+            requests.append(
+                LightCurveRequest(
+                    microlensing_only_source, distances, trajectory, strict_coverage
+                )
+            )
+        results = streaming_labeled_light_curves(
             self,
             lens_region,
             source_grid,
             lens_grid,
             times_days,
-            source,
-            distances,
+            tuple(requests),
             method=method,
-            trajectory=trajectory,
             map_schedule=map_schedule,
             caustic_config=caustic_config,
-            strict_coverage=strict_coverage,
             diagnostic_grid=diagnostic_grid,
             include_distance_map=include_distance_map,
             map_observer=map_observer,
+            band_batch_size=band_batch_size,
+        )
+        if microlensing_only_source is None:
+            return results[0]
+        return replace(
+            results[0],
+            light_curve=results[0].light_curve.with_microlensing_only(
+                results[1].light_curve
+            ),
         )
 
     def dynamic_maps(
@@ -369,6 +385,8 @@ class MicrolensingSimulation:
         *,
         trajectory: SourceTrajectory | None = None,
         strict_coverage: bool = True,
+        batch_size: int | None = None,
+        band_batch_size: int | None = None,
     ) -> LightCurve:
         """Convolve existing maps with an arbitrary finite source.
 
@@ -386,6 +404,8 @@ class MicrolensingSimulation:
             distances,
             trajectory=trajectory,
             strict_coverage=strict_coverage,
+            batch_size=batch_size,
+            band_batch_size=band_batch_size,
         )
 
     def light_curve(
@@ -401,6 +421,8 @@ class MicrolensingSimulation:
         schedule: DynamicConfig | None = None,
         strict_coverage: bool = True,
         map_observer=None,
+        band_batch_size: int | None = None,
+        microlensing_only_source: PixelatedSource | None = None,
     ) -> LightCurve:
         """Stream dynamic maps directly into an arbitrary source light curve.
 
@@ -408,6 +430,36 @@ class MicrolensingSimulation:
         frame. This is the ordinary production interface when a complete map
         sequence is not itself a required output.
         """
+
+        if band_batch_size is not None or microlensing_only_source is not None:
+            from .photometry import LightCurveRequest, streaming_light_curves
+
+            requests = [
+                LightCurveRequest(source, distances, trajectory, strict_coverage)
+            ]
+            if microlensing_only_source is not None:
+                requests.append(
+                    LightCurveRequest(
+                        microlensing_only_source,
+                        distances,
+                        trajectory,
+                        strict_coverage,
+                    )
+                )
+            curves = streaming_light_curves(
+                self,
+                lens_region,
+                source_grid,
+                times_days,
+                tuple(requests),
+                method=method,
+                schedule=schedule,
+                map_observer=map_observer,
+                band_batch_size=band_batch_size,
+            )
+            if microlensing_only_source is None:
+                return curves[0]
+            return curves[0].with_microlensing_only(curves[1])
 
         from .photometry import streaming_light_curve
 
@@ -436,6 +488,8 @@ class MicrolensingSimulation:
         schedule: DynamicConfig | None = None,
         map_observer=None,
         flux_times_days=None,
+        request_flux_times_days=None,
+        band_batch_size: int | None = None,
     ) -> tuple[LightCurve, ...]:
         """Stream one map sequence into multiple finite-source light curves.
 
@@ -458,6 +512,8 @@ class MicrolensingSimulation:
             schedule=schedule,
             map_observer=map_observer,
             flux_times_days=flux_times_days,
+            request_flux_times_days=request_flux_times_days,
+            band_batch_size=band_batch_size,
         )
 
     def multirate_light_curve(
@@ -474,6 +530,8 @@ class MicrolensingSimulation:
         schedule: DynamicConfig | None = None,
         strict_coverage: bool = True,
         map_observer=None,
+        band_batch_size: int | None = None,
+        microlensing_only_source: PixelatedSource | None = None,
     ) -> LightCurve:
         """Combine sparse dynamic maps with a finer source/light-curve cadence.
 
@@ -483,6 +541,37 @@ class MicrolensingSimulation:
         This source-independent interface accepts any ``PixelatedSource``;
         fine cadence is not restricted to quasar variability.
         """
+
+        if band_batch_size is not None or microlensing_only_source is not None:
+            from .photometry import LightCurveRequest, streaming_light_curves
+
+            requests = [
+                LightCurveRequest(source, distances, trajectory, strict_coverage)
+            ]
+            if microlensing_only_source is not None:
+                requests.append(
+                    LightCurveRequest(
+                        microlensing_only_source,
+                        distances,
+                        trajectory,
+                        strict_coverage,
+                    )
+                )
+            curves = streaming_light_curves(
+                self,
+                lens_region,
+                source_grid,
+                map_times_days,
+                tuple(requests),
+                method=method,
+                schedule=schedule,
+                map_observer=map_observer,
+                flux_times_days=flux_times_days,
+                band_batch_size=band_batch_size,
+            )
+            if microlensing_only_source is None:
+                return curves[0]
+            return curves[0].with_microlensing_only(curves[1])
 
         from .photometry import multirate_streaming_light_curve
 
@@ -519,6 +608,8 @@ class MicrolensingSimulation:
         diagnostic_grid: PlaneGrid | None = None,
         include_distance_map: bool = False,
         map_observer=None,
+        microlensing_only_source: PixelatedSource | None = None,
+        band_batch_size: int | None = None,
     ):
         """Return fine-cadence flux with labels at the dynamic-map epochs.
 
@@ -527,25 +618,39 @@ class MicrolensingSimulation:
         evaluated at a much finer cadence than the dynamic lens map.
         """
 
-        from .caustics import multirate_labeled_light_curve
+        from .caustics import streaming_labeled_light_curves
+        from .photometry import LightCurveRequest
 
-        return multirate_labeled_light_curve(
+        requests = [LightCurveRequest(source, distances, trajectory, strict_coverage)]
+        if microlensing_only_source is not None:
+            requests.append(
+                LightCurveRequest(
+                    microlensing_only_source, distances, trajectory, strict_coverage
+                )
+            )
+        results = streaming_labeled_light_curves(
             self,
             lens_region,
             source_grid,
             lens_grid,
             map_times_days,
-            flux_times_days,
-            source,
-            distances,
+            tuple(requests),
             method=method,
-            trajectory=trajectory,
             map_schedule=map_schedule,
             caustic_config=caustic_config,
-            strict_coverage=strict_coverage,
             diagnostic_grid=diagnostic_grid,
             include_distance_map=include_distance_map,
             map_observer=map_observer,
+            flux_times_days=flux_times_days,
+            band_batch_size=band_batch_size,
+        )
+        if microlensing_only_source is None:
+            return results[0]
+        return replace(
+            results[0],
+            light_curve=results[0].light_curve.with_microlensing_only(
+                results[1].light_curve
+            ),
         )
 
     def transfer_functions(

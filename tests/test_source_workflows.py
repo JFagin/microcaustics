@@ -1,6 +1,7 @@
 """High-level source geometry and batching agree with explicit calculations."""
 
 from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -149,6 +150,66 @@ def test_standalone_reverberation_transfer_requires_no_lens():
     result = mc.steady_transfer_function(source, edges)
     torch.testing.assert_close(result.values, source.transfer_function(edges))
     assert torch.isfinite(result.values).all()
+
+
+def test_batched_kerr_source_setup_matches_serial_sources():
+    runtime = mc.RuntimeConfig(device="cpu", backend="torch-eager", dtype=torch.float32)
+    distances = mc.LensingDistances.from_redshifts(
+        0.3, 1.5, device="cpu", dtype=torch.float32
+    )
+    driver = mc.TabulatedDrivingSignal([-100.0, 100.0], [1.0, 1.0])
+    base = mc.KerrDiskModel(
+        black_hole_mass_solar=1e8,
+        eddington_ratio=0.1,
+        bands_angstrom={"g": 4800},
+        source_grid_shape=8,
+        compile_solver=False,
+        lamppost_nalpha=32,
+        lamppost_radial_bins=32,
+        driving_signal=driver,
+    )
+    models = (base, replace(base, spin=0.4, inclination_deg=30.0))
+    expected = tuple(model.pixelate(distances, runtime=runtime) for model in models)
+    actual = mc.batched_pixelate_sources(
+        models, distances, batch_size=2, runtime=runtime
+    )
+    assert len(actual) == len(expected)
+    for source, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(source.transfer.hit, reference.transfer.hit)
+        torch.testing.assert_close(
+            source.delay_days, reference.delay_days, equal_nan=True
+        )
+        torch.testing.assert_close(source.brightness([0]), reference.brightness([0]))
+    with pytest.raises(ValueError, match="batch_size"):
+        mc.batched_pixelate_sources(models, distances, batch_size=0, runtime=runtime)
+
+
+def test_system_source_setup_batch_counts_one_shared_multi_image_disk():
+    from microcaustics.batching import _batch_pixelate_system_sources
+
+    model = mc.KerrDiskModel(
+        black_hole_mass_solar=1e8,
+        eddington_ratio=0.1,
+        bands_angstrom={"g": 4800},
+        source_grid_shape=8,
+        compile_solver=False,
+    )
+    first = system(model)
+    multi = mc.MultiImageSystem(
+        images={"A": first, "B": first.with_seed(1)}, source=model
+    )
+    geometry = mc.SourceGeometry((4, 4), (1.0, 1.0), (4800.0,), ("g",))
+    resolved = mc.StaticSource(torch.ones((4, 4, 1)), geometry)
+    with patch(
+        "microcaustics.sources.batched_pixelate_sources",
+        return_value=(resolved, resolved),
+    ) as pixelate:
+        updated = _batch_pixelate_system_sources((first, multi), 3)
+    models = pixelate.call_args.args[0]
+    assert len(models) == 2
+    assert updated[0].source is resolved
+    assert updated[1].source is resolved
+    assert all(image.source is resolved for image in updated[1].images.values())
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

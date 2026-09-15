@@ -206,7 +206,9 @@ class MultiImageSimulation:
         distances: LensingDistances,
         *,
         include_labels: bool = False,
+        band_batch_size: int | None = None,
         map_observers: Mapping[str, Callable] | None = None,
+        microlensing_only_source: PixelatedSource | None = None,
     ) -> MultiImageLightCurves:
         """Generate resolved multiband light curves for every macroimage.
 
@@ -232,6 +234,13 @@ class MultiImageSimulation:
             delayed_source = TimeShiftedSource(
                 source,
                 image.arrival_time_delay_days,
+            )
+            delayed_mean_source = (
+                None
+                if microlensing_only_source is None
+                else TimeShiftedSource(
+                    microlensing_only_source, image.arrival_time_delay_days
+                )
             )
             observer = observers.get(image.name)
             if include_labels:
@@ -259,6 +268,8 @@ class MultiImageSimulation:
                     diagnostic_grid=image.diagnostic_grid,
                     include_distance_map=image.include_distance_map,
                     map_observer=observer,
+                    microlensing_only_source=delayed_mean_source,
+                    band_batch_size=band_batch_size,
                 )
                 curve = labeled.light_curve
                 caustics = labeled.caustics
@@ -273,7 +284,9 @@ class MultiImageSimulation:
                     trajectory=image.trajectory,
                     schedule=image.schedule,
                     strict_coverage=image.strict_coverage,
+                    band_batch_size=band_batch_size,
                     map_observer=observer,
+                    microlensing_only_source=delayed_mean_source,
                 )
                 caustics = None
             curve = replace(
@@ -310,6 +323,7 @@ class MultiImageSimulation:
                 "execution_order": "image_major",
                 "maps_retained": False,
                 "labels_included": bool(include_labels),
+                "microlensing_only_included": microlensing_only_source is not None,
             },
             timing=TimingBreakdown(
                 collected=all(item.light_curve.timing.collected for item in outputs),
@@ -326,7 +340,9 @@ class MultiImageSimulation:
         distances: LensingDistances,
         *,
         include_labels: bool = False,
+        band_batch_size: int | None = None,
         map_observers: Mapping[str, Callable] | None = None,
+        microlensing_only_source: PixelatedSource | None = None,
     ) -> MultiImageLightCurves:
         """Generate fine-cadence resolved curves from sparse dynamic maps.
 
@@ -356,6 +372,13 @@ class MultiImageSimulation:
                 source,
                 image.arrival_time_delay_days,
             )
+            delayed_mean_source = (
+                None
+                if microlensing_only_source is None
+                else TimeShiftedSource(
+                    microlensing_only_source, image.arrival_time_delay_days
+                )
+            )
             if include_labels:
                 if image.lens_grid is None:
                     raise ValueError(
@@ -382,6 +405,8 @@ class MultiImageSimulation:
                     diagnostic_grid=image.diagnostic_grid,
                     include_distance_map=image.include_distance_map,
                     map_observer=observers.get(image.name),
+                    microlensing_only_source=delayed_mean_source,
+                    band_batch_size=band_batch_size,
                 )
                 curve = labeled.light_curve
                 caustics = labeled.caustics
@@ -397,7 +422,9 @@ class MultiImageSimulation:
                     trajectory=image.trajectory,
                     schedule=image.schedule,
                     strict_coverage=image.strict_coverage,
+                    band_batch_size=band_batch_size,
                     map_observer=observers.get(image.name),
+                    microlensing_only_source=delayed_mean_source,
                 )
                 caustics = None
             curve = replace(
@@ -435,6 +462,7 @@ class MultiImageSimulation:
                 "maps_retained": False,
                 "labels_included": bool(include_labels),
                 "arrival_delays": "explicit_per_image",
+                "microlensing_only_included": microlensing_only_source is not None,
             },
             timing=TimingBreakdown(
                 collected=all(item.light_curve.timing.collected for item in outputs),

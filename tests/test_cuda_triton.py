@@ -120,6 +120,51 @@ def _small_caustic_config():
 class TritonTaylorTests(unittest.TestCase):
     """Compare fused float32 kernels with the readable eager implementation."""
 
+    def test_cross_disk_kerr_setup_matches_serial(self):
+        runtime = mc.RuntimeConfig(
+            device="cuda",
+            backend="triton",
+            strict_backend=True,
+            warn_on_compile=False,
+        )
+        distances = mc.LensingDistances.from_redshifts(0.0395, 1.695)
+        driver = mc.TabulatedDrivingSignal([-100.0, 100.0], [1.0, 1.0])
+        base = mc.KerrDiskModel(
+            black_hole_mass_solar=10.0**9.08,
+            eddington_ratio=0.34,
+            bands_angstrom={"g": 4827},
+            source_redshift=1.695,
+            source_grid_shape=64,
+            observer_coordinate_chunk_size=4096,
+            lamppost_nalpha=32,
+            lamppost_radial_bins=32,
+            driving_signal=driver,
+            compile_solver=False,
+            warn_on_compile=False,
+        )
+        models = (
+            replace(base, spin=0.74, inclination_deg=10.0),
+            replace(base, spin=0.31, inclination_deg=41.0),
+        )
+        pooled = mc.batched_pixelate_sources(
+            models, distances, batch_size=2, runtime=runtime
+        )
+        serial = tuple(model.pixelate(distances, runtime=runtime) for model in models)
+        self.assertTrue(
+            all(
+                source.transfer.metadata["coordinate_cross_disk_pooled"]
+                for source in pooled
+            )
+        )
+        for actual, expected in zip(pooled, serial, strict=True):
+            torch.testing.assert_close(
+                actual.delay_days,
+                expected.delay_days,
+                equal_nan=True,
+                rtol=2.0e-5,
+                atol=2.0e-3,
+            )
+
     def test_dense_temporal_marching_matches_scalar(self):
         from microcaustics.caustics.triton_caustics import (
             batched_dense_marching_squares_zero_triton,

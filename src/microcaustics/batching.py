@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import warnings
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -398,6 +399,104 @@ def _system_device(system) -> torch.device:
     return realization.simulation.runtime.device
 
 
+def _source_setup_candidate(item):
+    """Return one deferred Kerr source contract eligible for setup pooling."""
+
+    from .multi_system import MultiImageSystem
+    from .runtime import resolve_runtime
+    from .sources import KerrDiskModel
+    from .system import IntegrationDomain, MicrolensingSystem
+
+    if isinstance(item, MultiImageSystem):
+        source = item.source
+        images = tuple(item.images.values())
+        if source is None:
+            source = images[0].source
+            if any(image.source is not source for image in images[1:]):
+                return None
+        if not isinstance(source, KerrDiskModel):
+            return None
+        if any(
+            image.integration_domain is IntegrationDomain.RECTANGLE
+            and not math.isclose(
+                math.remainder(float(image.macro.shear_angle_deg), 180.0),
+                0.0,
+                abs_tol=1.0e-12,
+            )
+            for image in images
+        ):
+            return None
+        runtimes = tuple(resolve_runtime(image.runtime) for image in images)
+        if any(runtime != runtimes[0] for runtime in runtimes[1:]):
+            return None
+        signal = item._shared_driving_signal
+        if signal is not None:
+            source = source.with_driving_signal(signal)
+        grids = tuple(image.source_grid for image in images)
+        grid = item.source_grid
+        if grid is None:
+            grid = grids[0]
+            if any(value != grid for value in grids[1:]):
+                return None
+        return source, item._shared_distances(), grid, runtimes[0]
+    if not isinstance(item, MicrolensingSystem) or not isinstance(
+        item.source, KerrDiskModel
+    ):
+        return None
+    if item.integration_domain is IntegrationDomain.RECTANGLE and not math.isclose(
+        math.remainder(float(item.macro.shear_angle_deg), 180.0),
+        0.0,
+        abs_tol=1.0e-12,
+    ):
+        return None
+    source = item.source
+    if item._bound_driving_signal is not None:
+        source = source.with_driving_signal(item._bound_driving_signal)
+    return source, item.distances, item.source_grid, resolve_runtime(item.runtime)
+
+
+def _batch_pixelate_system_sources(systems, batch_size: int):
+    """Attach pooled Kerr sources before stellar realization begins."""
+
+    from .sources import batched_pixelate_sources
+
+    systems = list(systems)
+    candidates = []
+    for index, item in enumerate(systems):
+        candidate = _source_setup_candidate(item)
+        if candidate is not None:
+            candidates.append((index, item, candidate))
+    buckets: dict[tuple[object, ...], list[tuple[object, ...]]] = {}
+    for candidate in candidates:
+        runtime = candidate[2][3]
+        key = (
+            runtime.device,
+            runtime.dtype,
+            runtime.backend,
+            runtime.torch_compile_mode,
+            runtime.strict_backend,
+            runtime.warn_on_compile,
+        )
+        buckets.setdefault(key, []).append(candidate)
+    for bucket in buckets.values():
+        for start in range(0, len(bucket), batch_size):
+            group = bucket[start : start + batch_size]
+            models = tuple(entry[2][0] for entry in group)
+            distances = tuple(entry[2][1] for entry in group)
+            grids = tuple(entry[2][2] for entry in group)
+            runtime = group[0][2][3]
+            sources = batched_pixelate_sources(
+                models,
+                distances,
+                batch_size=batch_size,
+                grids=grids,
+                runtime=runtime,
+            )
+            for (index, item, _), source in zip(group, sources, strict=True):
+                systems[index] = item.with_source(source)
+    return tuple(systems)
+
+
 @dataclass(frozen=True)
 class _CurveJob:
     """One independently executable macroimage plus its parent-system identity."""
@@ -410,6 +509,7 @@ class _CurveJob:
     map_times_days: Sequence[float]
     flux_times_days: Sequence[float] | None
     include_labels: bool
+    band_batch_size: int | None
     method: object
     schedule: object
     caustics: object
@@ -419,6 +519,7 @@ class _CurveJob:
     diagnostic_grid: object | None = None
     include_distance_map: bool = False
     multi_image: bool = False
+    include_microlensing_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -438,7 +539,10 @@ def _run_independent_curve(job: _CurveJob, stream: torch.cuda.Stream | None) -> 
         "method": job.method,
         "schedule": job.schedule,
         "map_observer": job.map_observer,
+        "include_microlensing_only": job.include_microlensing_only,
     }
+    if job.band_batch_size is not None:
+        kwargs["band_batch_size"] = job.band_batch_size
     if job.include_labels:
         kwargs["caustics"] = job.caustics
         if job.multi_image:
@@ -534,6 +638,8 @@ def _cross_system_signature(job: _CurveJob):
         realization.simulation.runtime.dtype,
         realization.simulation.runtime.backend,
         bool(job.include_labels),
+        bool(job.include_microlensing_only),
+        job.band_batch_size,
     )
 
 
@@ -611,24 +717,38 @@ def _run_cross_system_ipm_group(jobs: Sequence[_CurveJob]) -> tuple[object, ...]
                     _observer(index, LabeledMapFrame(frame, labeled))
                 yield frame
 
-        curve = streaming_light_curves(
+        requests = [
+            LightCurveRequest(
+                realization.source,
+                realization.system.distances,
+                realization._trajectory_in_local_frame(job.trajectory),
+                True if job.strict_coverage is None else job.strict_coverage,
+            )
+        ]
+        if job.include_microlensing_only:
+            requests.append(
+                LightCurveRequest(
+                    realization._mean_source,
+                    realization.system.distances,
+                    realization._trajectory_in_local_frame(job.trajectory),
+                    True if job.strict_coverage is None else job.strict_coverage,
+                )
+            )
+        curves = streaming_light_curves(
             realization.simulation,
             realization.lens_region,
             realization.source_grid,
             job.map_times_days,
-            (
-                LightCurveRequest(
-                    realization.source,
-                    realization.system.distances,
-                    realization._trajectory_in_local_frame(job.trajectory),
-                    True if job.strict_coverage is None else job.strict_coverage,
-                ),
-            ),
+            tuple(requests),
             method=setting[0],
             schedule=setting[1],
             flux_times_days=job.flux_times_days,
+            band_batch_size=job.band_batch_size,
             _map_iterator=observed_maps(),
-        )[0]
+        )
+        curve = curves[0]
+        if job.include_microlensing_only:
+            curve = curve.with_microlensing_only(curves[1])
         if labels is not None:
             from .results import LabeledLightCurve, MultirateLabeledLightCurve
 
@@ -763,6 +883,8 @@ def _jobs_for_system(
     *,
     include_labels: bool,
     apply_driving_signal: bool | None,
+    include_microlensing_only: bool,
+    band_batch_size: int | None,
     single_options: dict[str, object],
     raw_options: dict[str, object],
     observer,
@@ -787,6 +909,8 @@ def _jobs_for_system(
         )
         shared_source = item._shared_source(None, realizations)
         _validate_source_driver(shared_source, apply_driving_signal)
+        if include_microlensing_only:
+            _validate_source_driver(shared_source, True)
         if apply_driving_signal is False:
             shared_source = realizations[0]._mean_source
         jobs = []
@@ -812,6 +936,7 @@ def _jobs_for_system(
                     map_times_days,
                     flux_times_days,
                     include_labels,
+                    band_batch_size,
                     config.method,
                     config.schedule,
                     config.caustic_config,
@@ -821,6 +946,7 @@ def _jobs_for_system(
                     config.diagnostic_grid,
                     config.include_distance_map,
                     True,
+                    include_microlensing_only,
                 )
             )
         metadata = {
@@ -849,6 +975,8 @@ def _jobs_for_system(
         )
 
     _validate_source_driver(item.source, apply_driving_signal)
+    if include_microlensing_only:
+        _validate_source_driver(item.source, True)
     realization = (
         item if hasattr(item, "simulation") else item._realize_for_times(map_times_days)
     )
@@ -863,10 +991,12 @@ def _jobs_for_system(
         map_times_days,
         flux_times_days,
         include_labels,
+        band_batch_size,
         single_options.get("method"),
         single_options["schedule"],
         single_options.get("caustics"),
         observer,
+        include_microlensing_only=include_microlensing_only,
     )
     return _ParentInfo(("image",), (0.0,), {}, False), (job,)
 
@@ -902,12 +1032,15 @@ def batched_system_light_curves(
     flux_times_days: Sequence[float] | None = None,
     *,
     curves_per_batch: int = 1,
+    source_setup_batch_size: int = 1,
     duration_days: float | None = None,
     map_cadence_days: float | None = None,
     source_cadence_days: float | None = None,
     start_day: float = 0.0,
     include_labels: bool = False,
     apply_driving_signal: bool | None = None,
+    include_microlensing_only: bool = False,
+    band_batch_size: int | None = None,
     method: IPMConfig | IRSConfig | None = None,
     schedule: DynamicConfig | None = None,
     caustics: CausticConfig | None = None,
@@ -930,6 +1063,14 @@ def batched_system_light_curves(
     reconstructed in the original system and image order. A CUDA out-of-memory
     error halves concurrency without changing numerical settings.
 
+    ``include_microlensing_only=True`` attaches a mean-driver comparison to
+    every curve while sharing maps, labels, and static source brightness.
+
+    ``source_setup_batch_size`` separately pools compatible driven Kerr disks
+    before stellar realization. A multi-image system contributes one shared
+    disk rather than one disk per macroimage. The default of one preserves the
+    minimum-memory serial setup.
+
     With ``output_path=None`` results remain in memory. A directory writes flat
     per-image NPZ files plus ``manifest.json``; a path ending in ``.npz`` writes
     one combined archive. Disk writes use a bounded background queue and the
@@ -942,6 +1083,10 @@ def batched_system_light_curves(
 
     from ._batch_storage import BatchOutputWriter
 
+    if include_microlensing_only and apply_driving_signal is False:
+        raise ValueError(
+            "include_microlensing_only=True requires the driven light curves"
+        )
     map_times_days, flux_times_days = _light_curve_times(
         map_times_days,
         duration_days=duration_days,
@@ -967,6 +1112,9 @@ def batched_system_light_curves(
     requested = int(curves_per_batch)
     if requested < 1:
         raise ValueError("curves_per_batch must be positive")
+    source_setup_batch_size = int(source_setup_batch_size)
+    if source_setup_batch_size < 1:
+        raise ValueError("source_setup_batch_size must be positive")
     if int(writer_queue_size) < 1:
         raise ValueError("writer_queue_size must be positive")
     if output_path is not None and keep_maps_at_days is not None:
@@ -993,8 +1141,14 @@ def batched_system_light_curves(
             )
             for source in sources:
                 _validate_source_driver(source, apply_driving_signal)
+                if include_microlensing_only:
+                    _validate_source_driver(source, True)
         else:
             _validate_source_driver(item.source, apply_driving_signal)
+            if include_microlensing_only:
+                _validate_source_driver(item.source, True)
+    if source_setup_batch_size > 1:
+        systems = _batch_pixelate_system_sources(systems, source_setup_batch_size)
     if keep_maps_at_days is not None:
         for observer in observers:
             callbacks = (
@@ -1109,6 +1263,8 @@ def batched_system_light_curves(
                 flux_times_days,
                 include_labels=include_labels,
                 apply_driving_signal=apply_driving_signal,
+                include_microlensing_only=include_microlensing_only,
+                band_batch_size=band_batch_size,
                 single_options=options,
                 raw_options=raw_options,
                 observer=observer,
@@ -1218,6 +1374,7 @@ def tune_system_light_curve_batch(
     source_cadence_days: float | None = None,
     start_day: float = 0.0,
     apply_driving_signal: bool | None = None,
+    band_batch_size: int | None = None,
     **solver_options,
 ) -> IndependentBatchTuningResult:
     """Benchmark macroimage-curve concurrency on representative systems.
@@ -1250,6 +1407,7 @@ def tune_system_light_curve_batch(
         oom_backoff=False,
         profile=True,
         apply_driving_signal=apply_driving_signal,
+        band_batch_size=band_batch_size,
         **solver_options,
     )
     # Pay first-call compilation before collecting the sequential reference.

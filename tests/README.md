@@ -118,9 +118,10 @@ $env:MICROCAUSTICS_RUN_BUILD_SMOKE = "1"
 python -m unittest tests.test_packaging.WheelInstallationTests -v
 ```
 
-This uses `pip wheel --no-build-isolation --no-deps`, installs the resulting
-wheel away from the repository, imports the installed package, and runs
-`microcaustics doctor`. It does not download dependencies.
+This uses `python -m build --wheel --no-isolation`, extracts the resulting
+wheel away from the repository, imports that wheel with the current test
+environment's dependencies, and runs `microcaustics doctor`. It does not
+download dependencies.
 
 ## SIM5 comparison
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -709,6 +709,11 @@ class ThinDiskSource:
         dtype = torch.get_default_dtype() if dtype is None else dtype
         frame = self._frame(device=device, dtype=dtype)
         return frame.unsqueeze(0).expand(times.numel(), -1, -1, -1)
+
+    def with_bands(self, bands_angstrom: Mapping[str, float]) -> ThinDiskSource:
+        """Reuse the physical disk grid at different observed wavelengths."""
+
+        return replace(self, geometry=self.geometry.with_bands(bands_angstrom))
 
     def metadata(self) -> Mapping[str, object]:
         """Return physical disk parameters and approximation provenance."""

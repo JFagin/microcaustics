@@ -11,10 +11,12 @@ curve = system.light_curve(
     temporal_batch_size=30,
     scout_refresh_frames=10,
     include_labels=True,
+    include_microlensing_only=True,
     keep_maps_at_days=(0.0,),
 )
 
 magnitudes = curve.magnitude       # [photometry epoch, band], apparent AB mag
+micro_only = curve.microlensing_only_magnitude  # same maps, mean driver
 labels = curve.labels             # source-center labels at map epochs
 first_map = curve.maps[0]          # first retained map
 ```
@@ -24,6 +26,11 @@ that driver when present, or set it to `False` to retain its baseline without
 fluctuations. Setting it to `True` requires a source with a configured driver.
 Supernova expansion and other independent source evolution are unaffected by
 this switch.
+
+For a variable source, `include_microlensing_only=True` adds the corresponding
+constant-mean-driver flux and magnitude to the same result. Map generation,
+caustic labels, and source geometry are shared. Because the comparison source
+is static, its brightness is calculated once and reused at every epoch.
 
 The lower-level examples below use `MicrolensingSimulation`, named
 `simulation`, when direct control of the grids and scheduler is useful.
@@ -123,6 +130,37 @@ Source models are pixelated once before sampling. Fine-cadence evolution uses
 the same two-map interpolation as individual light curves. Each dynamic map
 is generated once for the whole request list.
 
+Requests may also select wavelengths and cadences without constructing new
+sources manually. This makes an evolving spectrum an ordinary multiband light
+curve. The system source should include the reddest requested wavelength when
+its spatial support is selected automatically:
+
+```python
+spectral_bands = {
+    f"lambda_{w:05d}": float(w) for w in range(3000, 11001, 20)
+}
+daily, spectra, mean_spectra = system.light_curves(
+    duration_days=3650,
+    map_cadence_days=25,
+    requests=(
+        mc.LightCurveRequest(
+            bands_angstrom=lsst_bands,
+            flux_cadence_days=1,
+        ),
+        mc.LightCurveRequest(bands_angstrom=spectral_bands),
+        mc.LightCurveRequest(
+            bands_angstrom=spectral_bands,
+            apply_driving_signal=False,
+        ),
+    ),
+    band_batch_size=32,
+)
+```
+
+`band_batch_size` controls only memory and execution shape. The final partial
+wavelength group is padded to the same size so it does not trigger another
+compiled kernel, and those filler channels are removed from the result.
+
 Use `batched_system_light_curves` for unrelated stellar realizations. It and
 `tune_system_light_curve_batch` accept the same duration, cadence, rays, and
 temporal-batch keywords. Static batches use
@@ -179,6 +217,17 @@ For mixed doubles or quads, matching macroimage contracts are grouped across
 systems while incompatible images use the established private-stream path.
 Lossless OOM backoff halves CUDA concurrency and retries; CPU and Apple MPS use
 the same interface and execute curves sequentially.
+The same `include_microlensing_only=True` option applies to every single or
+multi-image result and is preserved by both disk-backed output modes.
+
+For collections of relativistic variable sources, set
+`source_setup_batch_size` independently of `curves_per_batch`. Compatible Kerr
+disks then pool their directly traced rays through the same fixed-size compiled
+observer-delay kernel before the stellar realizations are built. A double or
+quad contributes one shared source, not one source per macroimage. Repeated
+batches reuse the compiled specialization even when the disk parameters or
+batch occupancy change; only source resolution, dtype, compile mode, or the
+explicit observer-coordinate chunk size can require another specialization.
 
 Set `output_path` to a directory for flat per-image NPZ files and a manifest,
 or to a `.npz` file for one combined NumPy archive. A bounded single-writer

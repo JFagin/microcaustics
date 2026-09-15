@@ -13,6 +13,7 @@ import pytest
 import torch
 
 import microcaustics as mc
+from microcaustics.photometry import _source_band_chunks
 from microcaustics.sources.variability import _source_at_driver_mean
 from microcaustics.system import _light_curve_options, _light_curve_times
 
@@ -218,6 +219,61 @@ def test_source_driver_switch_preserves_geometry_and_does_not_sample_when_off():
         small_system().light_curve((0,), apply_driving_signal=True)
 
 
+def test_light_curve_can_include_shared_map_microlensing_only_comparison():
+    driver = mc.broken_power_law_driving_signal(max_duration_days=10, history_days=2)
+    system = small_system(signal=driver)
+    observed = []
+    paired = system.light_curve(
+        duration_days=2,
+        map_cadence_days=1,
+        source_cadence_days=0.5,
+        include_microlensing_only=True,
+        map_observer=lambda index, frame: observed.append((index, frame.time_days)),
+        **small_options(),
+    )
+    expected = system.light_curve(
+        duration_days=2,
+        map_cadence_days=1,
+        source_cadence_days=0.5,
+        apply_driving_signal=False,
+        **small_options(),
+    )
+    assert len(observed) == 3
+    assert paired.microlensing_only_flux is not None
+    torch.testing.assert_close(paired.microlensing_only_flux, expected.flux)
+    torch.testing.assert_close(
+        paired.microlensing_only_magnitude, expected.magnitude
+    )
+    assert paired.metadata["microlensing_only_included"]
+    assert "dynamic_map_metadata" in paired.metadata
+    with pytest.raises(ValueError, match="requires the driven"):
+        system.light_curve(
+            (0, 1),
+            include_microlensing_only=True,
+            apply_driving_signal=False,
+            **small_options(),
+        )
+
+    labeled = system.light_curve(
+        duration_days=2,
+        map_cadence_days=1,
+        source_cadence_days=0.5,
+        include_labels=True,
+        include_microlensing_only=True,
+        caustics=mc.CausticConfig(
+            far_field_approx=mc.FarFieldApproxConfig(enabled=False),
+            minimum_determinant_sign_pixels=1,
+            anchor_count=3,
+            gauge_count=3,
+            minimum_alignment_gauges=1,
+        ),
+        **small_options(),
+    )
+    assert labeled.labels.times_days.numel() == 3
+    assert labeled.times_days.numel() == 5
+    assert labeled.microlensing_only_flux.shape == labeled.flux.shape
+
+
 def test_disabling_thermal_variability_preserves_mean_lamp_heating():
     shape = (4, 4)
     radius = torch.full(shape, 20.0)
@@ -250,6 +306,119 @@ def test_disabling_thermal_variability_preserves_mean_lamp_heating():
     assert mean.response_temperature4 is source.response_temperature4
     assert mean.transfer is source.transfer
     assert mean.is_time_static and signal._sampled is None
+
+
+def test_request_specific_cadence_driver_state_and_padded_band_batches():
+    distances = mc.LensingDistances.from_redshifts(0.5, 1.5)
+    bands = {f"b{index}": 4000.0 + 500.0 * index for index in range(5)}
+    geometry = mc.SourceGeometry(
+        4, field_of_view_uas=2.0, bands_angstrom=bands
+    ).resolve(distances)
+    transfer = mc.ObserverTransfer(
+        torch.full((4, 4), 20.0),
+        torch.ones((4, 4)),
+        torch.ones((4, 4)),
+        torch.ones((4, 4), dtype=torch.bool),
+    )
+    driver = mc.broken_power_law_driving_signal(
+        cadence_days=0.5,
+        max_duration_days=2.0,
+        history_days=2.0,
+        standard_deviation=0.1,
+        seed=7,
+    )
+    source = mc.ThermalReprocessingSource(
+        geometry,
+        transfer,
+        driver,
+        torch.full((4, 4), 1.0e20),
+        torch.zeros((4, 4)),
+        black_hole_mass_solar=1.0e8,
+        eddington_ratio=0.1,
+        spin=0.0,
+        source_redshift=1.5,
+    )
+    system = small_system(source=source, duration_days=2.0)
+    variable, mean = system.light_curves(
+        duration_days=2.0,
+        map_cadence_days=1.0,
+        requests=(
+            mc.LightCurveRequest(name="variable", flux_cadence_days=0.5),
+            mc.LightCurveRequest(
+                name="mean",
+                apply_driving_signal=False,
+                flux_cadence_days=1.0,
+            ),
+        ),
+        band_batch_size=2,
+        **small_options(),
+    )
+    assert variable.flux.shape == (5, 5)
+    assert mean.flux.shape == (3, 5)
+    assert variable.times_days.tolist() == [0.0, 0.5, 1.0, 1.5, 2.0]
+    assert mean.times_days.tolist() == [0.0, 1.0, 2.0]
+    assert variable.band_names == tuple(bands)
+    assert variable.metadata["band_batch_size"] == 2
+    assert not torch.equal(variable.flux[[0, 2, 4]], mean.flux)
+    chunks = _source_band_chunks(system.realize().source, 2)
+    assert [len(chunk.geometry.band_names) for chunk, _ in chunks] == [2, 2, 2]
+    assert [valid_count for _, valid_count in chunks] == [2, 2, 1]
+
+    unbatched = system.light_curve(
+        duration_days=2.0,
+        map_cadence_days=1.0,
+        source_cadence_days=0.5,
+        **small_options(),
+    )
+    torch.testing.assert_close(variable.flux, unbatched.flux)
+    torch.testing.assert_close(variable.unlensed_flux, unbatched.unlensed_flux)
+
+    selected_bands = {name: bands[name] for name in ("b0", "b2", "b4")}
+    selected = system.light_curve(
+        duration_days=2.0,
+        map_cadence_days=1.0,
+        source_cadence_days=0.5,
+        bands_angstrom=selected_bands,
+        band_batch_size=2,
+        **small_options(),
+    )
+    assert selected.band_names == tuple(selected_bands)
+    torch.testing.assert_close(selected.flux, unbatched.flux[:, (0, 2, 4)])
+
+    direct = system.light_curve(
+        duration_days=2.0,
+        map_cadence_days=1.0,
+        apply_driving_signal=False,
+        band_batch_size=2,
+        **small_options(),
+    )
+    torch.testing.assert_close(direct.flux, mean.flux)
+
+
+def test_map_grid_shape_is_independent_of_physical_source_pixels():
+    model = mc.ThinDiskModel(
+        black_hole_mass_solar=1.0e8,
+        eddington_ratio=0.1,
+        bands_angstrom={"g": 4800.0},
+        source_grid_shape=8,
+    )
+    system = mc.MicrolensingSystem(
+        macro=mc.MacroLens(0.0, 0.0),
+        lens_redshift=0.5,
+        source_redshift=1.5,
+        stars=mc.PointMassField([0.0], [0.0], [0.001]),
+        source=model,
+        map_grid_shape=12,
+        lens_plane_uas=4.0,
+        runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+    )
+    realization = system.realize()
+    assert realization.source.geometry.shape == (8, 8)
+    assert realization.source_grid.shape == (12, 12)
+    assert (
+        realization.source_grid.field_of_view_uas
+        == model.recommended_grid(system.distances).field_of_view_uas
+    )
 
 
 def test_disabled_custom_modulation_does_not_freeze_source_evolution():
@@ -311,6 +480,11 @@ def test_independent_batch_matches_single_calls_with_driver_and_retained_maps():
         torch.testing.assert_close(
             actual.flux, system.light_curve(apply_driving_signal=False, **options).flux
         )
+    paired = mc.batched_system_light_curves(
+        systems, include_microlensing_only=True, **options
+    )
+    for actual, expected in zip(paired.light_curves, off.light_curves, strict=True):
+        torch.testing.assert_close(actual.microlensing_only_flux, expected.flux)
 
 
 def test_multi_image_driver_is_shared_and_delayed_with_consistent_results():
@@ -337,10 +511,14 @@ def test_multi_image_driver_is_shared_and_delayed_with_consistent_results():
     off = multi.light_curves(apply_driving_signal=False, **controls)
     assert multi._shared_driving_signal._sampled is None
     on = multi.light_curves(apply_driving_signal=True, **controls)
+    paired = multi.light_curves(include_microlensing_only=True, **controls)
     assert (
         multi.image("A")._bound_driving_signal is multi.image("B")._bound_driving_signal
     )
     for name, delay in (("A", 0), ("B", 1)):
+        torch.testing.assert_close(
+            paired[name].microlensing_only_flux, off[name].flux
+        )
         assert on[name].magnitude.shape == (5, 1)
         assert on[name].map_times_days.tolist() == [0]
         assert on[name].labels is None

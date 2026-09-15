@@ -3,4 +3,3 @@ include README.md
 include CHANGELOG.md
 recursive-include docs *.md *.gif
 recursive-include examples *.py *.ipynb *.md
-recursive-include examples/data *.npz *.png

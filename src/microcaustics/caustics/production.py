@@ -1552,49 +1552,65 @@ def dynamic_labeled_maps(
         nonlocal previous_distances
         nonlocal previous_center
         nonlocal previous_center_distance
-        fields = caustic_fields_from_far_fields(
-            simulation,
-            lens_grid,
-            [times[index] for index in indices],
-            config,
-            far_fields=far_fields,
-            selected_cell_indices=selected_cell_indices,
-            selected_cell_indices_by_frame=selected_cell_indices_by_frame,
-            selected_cell_shape=selected_cell_shape,
-            source_region=source_grid.region,
+        indices = tuple(indices)
+        far_fields = tuple(far_fields)
+        per_frame_cells = (
+            None
+            if selected_cell_indices_by_frame is None
+            else tuple(selected_cell_indices_by_frame)
         )
-        (
-            labeled,
-            previous_gauges,
-            previous_distances,
-            previous_center,
-            previous_center_distance,
-        ) = label_caustic_fields(
-            fields,
-            source_grid.region,
-            config,
-            previous_aligned_gauges=previous_gauges,
-            previous_gauge_distances_uas=previous_distances,
-            previous_center_label=previous_center,
-            previous_center_distance_uas=previous_center_distance,
-            diagnostic_grid=diagnostic_grid,
-            include_distance_map=include_distance_map,
+        label_batch_size = min(
+            len(indices),
+            int(config.temporal_batch_size or len(indices)),
         )
-        if caustic_tuning_result is not None:
-            labeled = tuple(
-                replace(
-                    frame,
-                    caustics=replace(
-                        frame.caustics,
-                        metadata={
-                            **frame.caustics.metadata,
-                            **caustic_tuning_result.metadata(),
-                        },
-                    ),
-                )
-                for frame in labeled
+        for start in range(0, len(indices), label_batch_size):
+            stop = min(len(indices), start + label_batch_size)
+            batch_indices = indices[start:stop]
+            fields = caustic_fields_from_far_fields(
+                simulation,
+                lens_grid,
+                [times[index] for index in batch_indices],
+                config,
+                far_fields=far_fields[start:stop],
+                selected_cell_indices=selected_cell_indices,
+                selected_cell_indices_by_frame=(
+                    None if per_frame_cells is None else per_frame_cells[start:stop]
+                ),
+                selected_cell_shape=selected_cell_shape,
+                source_region=source_grid.region,
             )
-        labels_by_index.update(zip(indices, labeled, strict=True))
+            (
+                labeled,
+                previous_gauges,
+                previous_distances,
+                previous_center,
+                previous_center_distance,
+            ) = label_caustic_fields(
+                fields,
+                source_grid.region,
+                config,
+                previous_aligned_gauges=previous_gauges,
+                previous_gauge_distances_uas=previous_distances,
+                previous_center_label=previous_center,
+                previous_center_distance_uas=previous_center_distance,
+                diagnostic_grid=diagnostic_grid,
+                include_distance_map=include_distance_map,
+            )
+            if caustic_tuning_result is not None:
+                labeled = tuple(
+                    replace(
+                        frame,
+                        caustics=replace(
+                            frame.caustics,
+                            metadata={
+                                **frame.caustics.metadata,
+                                **caustic_tuning_result.metadata(),
+                            },
+                        ),
+                    )
+                    for frame in labeled
+                )
+            labels_by_index.update(zip(batch_indices, labeled, strict=True))
 
     if not shared:
         labels = dynamic_labeled_caustics(
@@ -1641,27 +1657,27 @@ def dynamic_labeled_maps(
 
 
 @torch.no_grad()
-def streaming_labeled_light_curve(
+def streaming_labeled_light_curves(
     simulation: MicrolensingSimulation,
     lens_region: PlaneRegion,
     source_grid: PlaneGrid,
     lens_grid: PlaneGrid,
     times_days,
-    source,
-    distances,
+    requests,
     *,
     method,
-    trajectory=None,
     map_schedule=None,
     caustic_config: CausticConfig | None = None,
-    strict_coverage: bool = True,
     diagnostic_grid: PlaneGrid | None = None,
     include_distance_map: bool = False,
     map_observer=None,
-) -> LabeledLightCurve:
-    """Generate a production LC and labels without retaining map tensors."""
+    flux_times_days=None,
+    band_batch_size: int | None = None,
+):
+    """Generate several light curves and one shared sequence of labels."""
 
-    from ..photometry import LightCurveRequest, streaming_light_curves
+    from ..photometry import streaming_light_curves
+    from ..results import MultirateLabeledLightCurve
 
     labeled_frames: list[LabeledCausticFrame] = []
 
@@ -1685,23 +1701,66 @@ def streaming_labeled_light_curve(
                 map_observer(index, frame)
             yield frame.magnification_map
 
+    light_curves = streaming_light_curves(
+        simulation,
+        lens_region,
+        source_grid,
+        times_days,
+        requests,
+        method=method,
+        schedule=map_schedule,
+        flux_times_days=flux_times_days,
+        band_batch_size=band_batch_size,
+        _map_iterator=map_iterator(),
+    )
+    wrapper = LabeledLightCurve if flux_times_days is None else MultirateLabeledLightCurve
+    frames = tuple(labeled_frames)
+    return tuple(wrapper(light_curve, frames) for light_curve in light_curves)
+
+
+@torch.no_grad()
+def streaming_labeled_light_curve(
+    simulation: MicrolensingSimulation,
+    lens_region: PlaneRegion,
+    source_grid: PlaneGrid,
+    lens_grid: PlaneGrid,
+    times_days,
+    source,
+    distances,
+    *,
+    method,
+    trajectory=None,
+    map_schedule=None,
+    caustic_config: CausticConfig | None = None,
+    strict_coverage: bool = True,
+    diagnostic_grid: PlaneGrid | None = None,
+    include_distance_map: bool = False,
+    map_observer=None,
+) -> LabeledLightCurve:
+    """Generate a production LC and labels without retaining map tensors."""
+
+    from ..photometry import LightCurveRequest
+
     request = LightCurveRequest(
         source=source,
         distances=distances,
         trajectory=trajectory,
         strict_coverage=strict_coverage,
     )
-    light_curve = streaming_light_curves(
+    return streaming_labeled_light_curves(
         simulation,
         lens_region,
         source_grid,
+        lens_grid,
         times_days,
         (request,),
         method=method,
-        schedule=map_schedule,
-        _map_iterator=map_iterator(),
+        map_schedule=map_schedule,
+        caustic_config=caustic_config,
+        diagnostic_grid=diagnostic_grid,
+        include_distance_map=include_distance_map,
+        map_observer=map_observer,
     )[0]
-    return LabeledLightCurve(light_curve, tuple(labeled_frames))
 
 
 @torch.no_grad()
@@ -1733,43 +1792,26 @@ def multirate_labeled_light_curve(
     and selective exports possible without retaining a full-resolution cube.
     """
 
-    from ..photometry import multirate_streaming_light_curve
-    from ..results import MultirateLabeledLightCurve
+    from ..photometry import LightCurveRequest
 
-    labeled_frames: list[LabeledCausticFrame] = []
-
-    def map_iterator():
-        for index, frame in enumerate(
-            dynamic_labeled_maps(
-                simulation,
-                lens_region,
-                source_grid,
-                lens_grid,
-                map_times_days,
-                method=method,
-                map_schedule=map_schedule,
-                caustic_config=caustic_config,
-                diagnostic_grid=diagnostic_grid,
-                include_distance_map=include_distance_map,
-            )
-        ):
-            labeled_frames.append(frame.caustics)
-            if map_observer is not None:
-                map_observer(index, frame)
-            yield frame.magnification_map
-
-    light_curve = multirate_streaming_light_curve(
+    request = LightCurveRequest(
+        source=source,
+        distances=distances,
+        trajectory=trajectory,
+        strict_coverage=strict_coverage,
+    )
+    return streaming_labeled_light_curves(
         simulation,
         lens_region,
         source_grid,
+        lens_grid,
         map_times_days,
-        flux_times_days,
-        source,
-        distances,
+        (request,),
         method=method,
-        trajectory=trajectory,
-        schedule=map_schedule,
-        strict_coverage=strict_coverage,
-        _map_iterator=map_iterator(),
-    )
-    return MultirateLabeledLightCurve(light_curve, tuple(labeled_frames))
+        map_schedule=map_schedule,
+        caustic_config=caustic_config,
+        diagnostic_grid=diagnostic_grid,
+        include_distance_map=include_distance_map,
+        map_observer=map_observer,
+        flux_times_days=flux_times_days,
+    )[0]

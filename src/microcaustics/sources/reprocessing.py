@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -109,9 +109,7 @@ class ThermalReprocessingSource:
         response = torch.as_tensor(self.response_temperature4)
         delay = torch.as_tensor(self.delay_days, device=response.device)
         if response.shape != self.geometry.shape or not response.is_floating_point():
-            raise ValueError(
-                "response_temperature4 must be one floating [y, x] map"
-            )
+            raise ValueError("response_temperature4 must be one floating [y, x] map")
         if delay.shape != self.geometry.shape or not delay.is_floating_point():
             raise ValueError("delay_days must be one floating [y, x] map")
         hit = self.transfer.hit.to(response.device)
@@ -191,9 +189,7 @@ class ThermalReprocessingSource:
         if transfer.relative_delay_days is None:
             raise ValueError("observer transfer must contain a relative delay map")
         if irradiation_efficiency is not None and lamp_fraction is not None:
-            raise ValueError(
-                "supply irradiation_efficiency or lamp_fraction, not both"
-            )
+            raise ValueError("supply irradiation_efficiency or lamp_fraction, not both")
         if lamp_fraction is not None:
             efficiency = lamppost_irradiation_efficiency(
                 lamp_fraction,
@@ -203,21 +199,23 @@ class ThermalReprocessingSource:
                 radiative_efficiency=radiative_efficiency,
             )
         else:
-            efficiency = 1.0 if irradiation_efficiency is None else irradiation_efficiency
+            efficiency = (
+                1.0 if irradiation_efficiency is None else irradiation_efficiency
+            )
         efficiency_tensor = torch.as_tensor(
             efficiency,
             device=transfer.radius_rg.device,
             dtype=transfer.radius_rg.dtype,
         )
-        if efficiency_tensor.numel() != 1 or not bool(
-            torch.isfinite(efficiency_tensor)
-        ) or bool(efficiency_tensor < 0):
-            raise ValueError(
-                "irradiation_efficiency must be finite and non-negative"
-            )
+        if (
+            efficiency_tensor.numel() != 1
+            or not bool(torch.isfinite(efficiency_tensor))
+            or bool(efficiency_tensor < 0)
+        ):
+            raise ValueError("irradiation_efficiency must be finite and non-negative")
         if not math.isclose(
             float(profile.rays.spin),
-            float(torch.as_tensor(spin).detach().cpu()),
+            float(spin),
             rel_tol=0.0,
             abs_tol=1.0e-7,
         ):
@@ -225,13 +223,11 @@ class ThermalReprocessingSource:
         transfer_redshift = transfer.metadata.get("source_redshift")
         if transfer_redshift is not None and not math.isclose(
             float(transfer_redshift),
-            float(torch.as_tensor(source_redshift).detach().cpu()),
+            float(source_redshift),
             rel_tol=0.0,
             abs_tol=1.0e-7,
         ):
-            raise ValueError(
-                "observer-coordinate and disk source redshifts must match"
-            )
+            raise ValueError("observer-coordinate and disk source redshifts must match")
         radius = transfer.radius_rg
         lamp_delay_rg, illumination, _ = profile.interpolate(radius)
         coefficient, isco = _thin_disk_temperature4_coefficient(
@@ -243,9 +239,7 @@ class ThermalReprocessingSource:
             device=radius.device,
             dtype=radius.dtype,
         )
-        response_temperature4 = (
-            efficiency_tensor * coefficient * illumination
-        )
+        response_temperature4 = efficiency_tensor * coefficient * illumination
         mass = torch.as_tensor(
             black_hole_mass_solar,
             device=radius.device,
@@ -257,11 +251,7 @@ class ThermalReprocessingSource:
             dtype=radius.dtype,
         )
         lamp_delay_days = (
-            lamp_delay_rg
-            * (_G * _M_SUN / _C**3)
-            * mass
-            / 86_400.0
-            * (1.0 + redshift)
+            lamp_delay_rg * (_G * _M_SUN / _C**3) * mass / 86_400.0 * (1.0 + redshift)
         )
         observer_delay = transfer.relative_delay_days.to(
             device=radius.device,
@@ -309,9 +299,7 @@ class ThermalReprocessingSource:
                 "lamp_fraction": (
                     None if lamp_fraction is None else float(lamp_fraction)
                 ),
-                "lamppost_hit_fraction": float(
-                    profile.hit_fraction.detach().cpu()
-                ),
+                "lamppost_hit_fraction": float(profile.hit_fraction.detach().cpu()),
             },
             **kwargs,
         )
@@ -328,6 +316,20 @@ class ThermalReprocessingSource:
         )
         return temperature4
 
+    def with_bands(
+        self, bands_angstrom: Mapping[str, float]
+    ) -> ThermalReprocessingSource:
+        """Reuse the disk and observer transfer at new observed wavelengths."""
+
+        return replace(self, geometry=self.geometry.with_bands(bands_angstrom))
+
+    def at_driver_mean(self) -> ThermalReprocessingSource:
+        """Return the same heated disk with stochastic driver fluctuations disabled."""
+
+        from .variability import _source_at_driver_mean
+
+        return _source_at_driver_mean(self)
+
     def brightness(
         self,
         times_days: torch.Tensor | Sequence[float] | float,
@@ -341,16 +343,18 @@ class ThermalReprocessingSource:
         device = times.device if device is None else device
         dtype = torch.get_default_dtype() if dtype is None else dtype
         times = times.to(device=device, dtype=dtype)
+        output_count = times.numel()
+        evaluation_times = times[:1] if self.is_time_static else times
         transfer = self.transfer.to(device=device, dtype=dtype)
         delay = self.delay_days.to(device=device, dtype=dtype)
         safe_delay = torch.where(transfer.hit, delay, torch.zeros_like(delay))
-        query = times[:, None, None] - safe_delay[None]
+        query = evaluation_times[:, None, None] - safe_delay[None]
         driving = self.signal.amplitudes(
             query.reshape(-1),
             bands=1,
             dtype=dtype,
             device=device,
-        ).reshape(times.numel(), *self.geometry.shape)
+        ).reshape(evaluation_times.numel(), *self.geometry.shape)
         static_temperature4 = self._static_temperature4(
             device=device,
             dtype=dtype,
@@ -359,17 +363,17 @@ class ThermalReprocessingSource:
             device=device,
             dtype=dtype,
         )
-        temperature4 = (
-            static_temperature4[None]
-            + response_temperature4[None] * driving
-        )
-        return _transferred_brightness_from_temperature4(
+        temperature4 = static_temperature4[None] + response_temperature4[None] * driving
+        brightness = _transferred_brightness_from_temperature4(
             temperature4,
             geometry=self.geometry,
             transfer=transfer,
             source_redshift=self.source_redshift,
             color_correction=self.color_correction,
         )
+        if self.is_time_static and output_count > 1:
+            brightness = brightness.expand(output_count, *brightness.shape[1:])
+        return brightness
 
     def linear_response_weights(
         self,
@@ -393,9 +397,7 @@ class ThermalReprocessingSource:
                 dtype=dtype,
                 device=device,
             )
-            return weights / weights.sum(dim=(0, 1), keepdim=True).clamp_min(
-                1.0e-30
-            )
+            return weights / weights.sum(dim=(0, 1), keepdim=True).clamp_min(1.0e-30)
         cache_key = (float(driver_amplitude), device, dtype)
         if not torch.is_grad_enabled():
             entry = self._linear_response_cache.get(cache_key)
@@ -420,17 +422,25 @@ class ThermalReprocessingSource:
             device=device,
             dtype=dtype,
         )
-        wavelength = torch.as_tensor(
-            self.geometry.wavelengths_angstrom,
-            device=device,
-            dtype=dtype,
-        ) * 1.0e-10 / (1.0 + redshift)
-        exponent = _H * _C / (
-            wavelength
-            * transfer.gfactor[..., None]
-            * _K_B
-            * color
-            * temperature[..., None]
+        wavelength = (
+            torch.as_tensor(
+                self.geometry.wavelengths_angstrom,
+                device=device,
+                dtype=dtype,
+            )
+            * 1.0e-10
+            / (1.0 + redshift)
+        )
+        exponent = (
+            _H
+            * _C
+            / (
+                wavelength
+                * transfer.gfactor[..., None]
+                * _K_B
+                * color
+                * temperature[..., None]
+            )
         )
         exponent = exponent.clamp(max=85.0)
         exponential = torch.exp(exponent)
@@ -538,9 +548,7 @@ class ThermalReprocessingSource:
                 * weights[None, start:stop]
             )
             denominator.add_(contribution.sum(dim=1))
-            numerator.add_(
-                (contribution * delay[None, start:stop, None]).sum(dim=1)
-            )
+            numerator.add_((contribution * delay[None, start:stop, None]).sum(dim=1))
         return numerator / denominator.clamp_min(1.0e-30)
 
     def transfer_function(
@@ -571,8 +579,10 @@ class ThermalReprocessingSource:
             device=weights.device,
             dtype=weights.dtype,
         )
-        if edges.ndim != 1 or edges.numel() < 2 or not bool(
-            torch.all(edges[1:] > edges[:-1])
+        if (
+            edges.ndim != 1
+            or edges.numel() < 2
+            or not bool(torch.all(edges[1:] > edges[:-1]))
         ):
             raise ValueError("delay_edges_days must be strictly increasing")
         delay = self.delay_days.to(device=weights.device, dtype=weights.dtype)
@@ -624,8 +634,10 @@ class ThermalReprocessingSource:
             device=weights.device,
             dtype=weights.dtype,
         )
-        if edges.ndim != 1 or edges.numel() < 2 or not bool(
-            torch.all(edges[1:] > edges[:-1])
+        if (
+            edges.ndim != 1
+            or edges.numel() < 2
+            or not bool(torch.all(edges[1:] > edges[:-1]))
         ):
             raise ValueError("delay_edges_days must be strictly increasing")
         delay = self.delay_days.to(device=weights.device, dtype=weights.dtype)
@@ -645,8 +657,7 @@ class ThermalReprocessingSource:
             stop = min(positions.numel(), start + spatial_chunk_size)
             chunk_positions = positions[start:stop]
             contribution = (
-                magnification[:, chunk_positions, None]
-                * weights[None, start:stop]
+                magnification[:, chunk_positions, None] * weights[None, start:stop]
             )
             scatter_indices = indices[None, start:stop, None].expand(
                 magnification.shape[0],
@@ -673,9 +684,7 @@ class ThermalReprocessingSource:
             "source_redshift": scalar(self.source_redshift),
             "color_correction": scalar(self.color_correction),
             "temperature_slope_beta": scalar(self.temperature_slope_beta),
-            "viscous_flux_profile": _prescription_name(
-                self.viscous_flux_profile
-            ),
+            "viscous_flux_profile": _prescription_name(self.viscous_flux_profile),
             "viscous_flux_profile_metadata": _prescription_metadata(
                 self.viscous_flux_profile
             ),

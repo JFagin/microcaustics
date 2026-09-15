@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-import venv
+import zipfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -106,13 +106,12 @@ class WheelInstallationTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "pip",
-                    "wheel",
-                    ".",
-                    "--no-deps",
-                    "--no-build-isolation",
-                    "--wheel-dir",
+                    "build",
+                    "--wheel",
+                    "--no-isolation",
+                    "--outdir",
                     str(wheel_dir),
+                    ".",
                 ],
                 cwd=PACKAGE_ROOT,
                 check=True,
@@ -123,40 +122,31 @@ class WheelInstallationTests(unittest.TestCase):
             self.assertEqual(len(wheels), 1)
 
             environment = root / "environment"
-            venv.EnvBuilder(with_pip=True, system_site_packages=True).create(
-                environment
-            )
-            executable = (
-                environment / "Scripts" / "python.exe"
-                if os.name == "nt"
-                else environment / "bin" / "python"
-            )
-            subprocess.run(
-                [
-                    str(executable),
-                    "-m",
-                    "pip",
-                    "install",
-                    "--no-deps",
-                    str(wheels[0]),
-                ],
-                cwd=root,
-                check=True,
-                capture_output=True,
-                text=True,
+            environment.mkdir()
+            with zipfile.ZipFile(wheels[0]) as archive:
+                archive.extractall(environment)
+            child_environment = os.environ.copy()
+            child_environment["PYTHONPATH"] = os.pathsep.join(
+                filter(
+                    None,
+                    (str(environment), child_environment.get("PYTHONPATH", "")),
+                )
             )
             completed = subprocess.run(
                 [
-                    str(executable),
+                    sys.executable,
                     "-c",
                     (
-                        "import json, microcaustics as mc; "
+                        "import json, pathlib, microcaustics as mc; "
                         "from microcaustics.cli import main; "
+                        f"root = pathlib.Path({str(environment)!r}).resolve(); "
+                        "assert pathlib.Path(mc.__file__).resolve().is_relative_to(root); "
                         "assert mc.__version__; "
                         "assert main(['doctor']) == 0"
                     ),
                 ],
                 cwd=root,
+                env=child_environment,
                 check=True,
                 capture_output=True,
                 text=True,

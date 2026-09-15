@@ -871,6 +871,33 @@ class MicrolensingSystemTests(unittest.TestCase):
         self.assertEqual(variable.geometry, static.geometry)
         self.assertTrue(bool(torch.all(torch.isfinite(variable.brightness(0.0)))))
 
+    def test_float32_kerr_reprocessing_accepts_arbitrary_physical_parameters(self) -> None:
+        model = mc.KerrDiskModel(
+            black_hole_mass_solar=1.0e8,
+            eddington_ratio=0.2,
+            bands_angstrom={"g": 5000.0},
+            spin=0.73123456789,
+            inclination_deg=49.52234964316163,
+            source_redshift=1.723456789,
+            driving_signal=mc.TabulatedDrivingSignal(
+                [-100.0, 100.0], [1.0, 1.0], extrapolation="hold"
+            ),
+            source_grid_shape=8,
+            compile_solver=False,
+            lamppost_nalpha=16,
+            lamppost_radial_bins=16,
+        )
+        distances = mc.LensingDistances.from_redshifts(0.25, 1.723456789)
+        source = model.pixelate(
+            distances,
+            runtime=mc.RuntimeConfig(
+                device="cpu", backend="torch-eager", dtype=torch.float32
+            ),
+        )
+
+        self.assertIsInstance(source, mc.ThermalReprocessingSource)
+        self.assertEqual(source.geometry.shape, (8, 8))
+
     def test_system_materializes_a_physical_kerr_source(self) -> None:
         model = mc.KerrDiskModel(
             black_hole_mass_solar=1.0e8,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from time import perf_counter
@@ -65,7 +66,7 @@ class DynamicMapScheduler:
         self.lens_region = lens_region
         self.source_grid = source_grid
         self.times = tuple(float(value) for value in times_days)
-        if any(not torch.isfinite(torch.tensor(value)).item() for value in self.times):
+        if any(not math.isfinite(value) for value in self.times):
             raise ValueError("dynamic map times must be finite")
         self.tuning_result = None
         if config.tuning.enabled and self.times:

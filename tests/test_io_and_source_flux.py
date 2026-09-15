@@ -37,6 +37,7 @@ class ResultIOAndSourceFluxTests(unittest.TestCase):
             ("g", "i"),
             unlensed_flux=torch.ones(2, 2),
             metadata={"source": "test"},
+            microlensing_only_flux=torch.full((2, 2), 0.5),
         )
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -51,6 +52,9 @@ class ResultIOAndSourceFluxTests(unittest.TestCase):
         self.assertEqual(loaded_map.method, "ipm")
         torch.testing.assert_close(loaded_curve.flux, curve.flux)
         torch.testing.assert_close(loaded_curve.unlensed_flux, curve.unlensed_flux)
+        torch.testing.assert_close(
+            loaded_curve.microlensing_only_flux, curve.microlensing_only_flux
+        )
         self.assertEqual(loaded_curve.band_names, curve.band_names)
         self.assertEqual(loaded_curve.metadata, curve.metadata)
 

@@ -85,6 +85,8 @@ class LightCurve:
     original flux density in Jy. Both have shape ``[time, band]``. Retained
     maps are indexed by integer, with aligned epochs in ``map_times_days``.
     Optional center labels have their own, potentially coarser, time axis.
+    ``microlensing_only_flux`` contains the shared-map mean-driver comparison
+    when requested.
     Accessing an output never repeats the simulation.
     """
 
@@ -96,6 +98,7 @@ class LightCurve:
     timing: TimingBreakdown = field(default_factory=TimingBreakdown)
     maps: tuple[MagnificationMap, ...] = ()
     labels: LightCurveLabels | None = None
+    microlensing_only_flux: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         times = torch.as_tensor(self.times_days)
@@ -109,6 +112,11 @@ class LightCurve:
             if unlensed.shape != flux.shape:
                 raise ValueError("unlensed_flux must match flux shape")
             object.__setattr__(self, "unlensed_flux", unlensed)
+        if self.microlensing_only_flux is not None:
+            microlensing_only = torch.as_tensor(self.microlensing_only_flux)
+            if microlensing_only.shape != flux.shape:
+                raise ValueError("microlensing_only_flux must match flux shape")
+            object.__setattr__(self, "microlensing_only_flux", microlensing_only)
         object.__setattr__(self, "times_days", times)
         object.__setattr__(self, "flux", flux)
         maps = self.maps.values() if isinstance(self.maps, Mapping) else self.maps
@@ -128,6 +136,34 @@ class LightCurve:
         from .photometry import flux_to_magnitude
 
         return flux_to_magnitude(self.flux)
+
+    @property
+    def microlensing_only_magnitude(self) -> torch.Tensor | None:
+        """Mean-driver microlensing magnitude, when requested."""
+
+        if self.microlensing_only_flux is None:
+            return None
+        from .photometry import flux_to_magnitude
+
+        return flux_to_magnitude(self.microlensing_only_flux)
+
+    def with_microlensing_only(self, comparison: LightCurve) -> LightCurve:
+        """Attach a mean-driver curve evaluated through the same map sequence."""
+
+        if comparison.band_names != self.band_names:
+            raise ValueError("microlensing-only comparison must use the same bands")
+        if comparison.times_days.shape != self.times_days.shape or not torch.allclose(
+            comparison.times_days.to(device="cpu", dtype=torch.float64),
+            self.times_days.to(device="cpu", dtype=torch.float64),
+            rtol=0.0,
+            atol=1.0e-6,
+        ):
+            raise ValueError("microlensing-only comparison must use the same times")
+        return replace(
+            self,
+            microlensing_only_flux=comparison.flux,
+            metadata={**self.metadata, "microlensing_only_included": True},
+        )
 
     @property
     def map_times_days(self) -> torch.Tensor:
@@ -942,6 +978,18 @@ class MacroImageLightCurve:
         """Apparent AB magnitude, shaped [time, band]."""
 
         return self.light_curve.magnitude
+
+    @property
+    def microlensing_only_flux(self) -> torch.Tensor | None:
+        """Mean-driver microlensing flux, when requested."""
+
+        return self.light_curve.microlensing_only_flux
+
+    @property
+    def microlensing_only_magnitude(self) -> torch.Tensor | None:
+        """Mean-driver microlensing magnitude, when requested."""
+
+        return self.light_curve.microlensing_only_magnitude
 
     @property
     def times_days(self) -> torch.Tensor:
