@@ -147,6 +147,13 @@ physical stellar realization remains unchanged when integration methods are
 compared. Its coordinate components may be expressed in the shear eigenframe
 for the rectangular strategy.
 
+The internal stellar velocities are evolved with specular reflection at the
+circular aperture so the finite population does not diffuse away or change
+the local macro parameters. Coherent bulk motion is applied after this
+confined internal evolution. The fixed-source lens mapping includes the
+corresponding uniform smooth-term offset, making coherent translation of the
+explicit stars equivalent to translation of the complete local lens pattern.
+
 The integration region chooses where rays or IPM cells originate.
 
 - `IntegrationDomain.SCOUT` starts from the complete bounding domain and keeps
@@ -273,6 +280,11 @@ refinement 2, virtual refinement 4, the validated Taylor far field, a
 49-frame temporal batch, a ten-frame endpoint-union scout refresh, and the
 frame-zero scout-ratio normalization correction. Source-center labels use nine
 anchors and nine gauges on an 8192-square determinant grid.
+
+On CUDA float32 runs, temporal caustic segments remain in packed ragged form
+through fused Triton crossing and distance reductions. The implementation falls
+back first to the padded Triton reduction and then to the portable Torch path if
+the preferred kernel is unavailable.
 
 Every nested setting remains independently replaceable. Existing low-level
 configuration constructors remain public.

@@ -18,6 +18,30 @@ if TYPE_CHECKING:
     from .simulation import MicrolensingSimulation
 
 
+def _expand_interval_scout_cells(
+    anchor_masks: torch.Tensor,
+    positions: dict[int, int],
+    pair,
+    *,
+    ratio: int,
+    fine_nx: int,
+) -> torch.Tensor:
+    """Expand a coarse endpoint-mask union directly to fine IPM cell indices."""
+
+    mask = anchor_masks[
+        [positions[index] for index in dict.fromkeys(pair)]
+    ].any(dim=0)
+    tiles = mask.nonzero(as_tuple=False)
+    local_y, local_x = torch.meshgrid(
+        torch.arange(ratio, device=anchor_masks.device),
+        torch.arange(ratio, device=anchor_masks.device),
+        indexing="ij",
+    )
+    fine_rows = tiles[:, 0, None] * ratio + local_y.reshape(1, -1)
+    fine_columns = tiles[:, 1, None] * ratio + local_x.reshape(1, -1)
+    return (fine_rows * fine_nx + fine_columns).reshape(-1)
+
+
 def _scheduled_map(
     result: MagnificationMap,
     *,
@@ -594,6 +618,7 @@ class DynamicMapScheduler:
                 self.lens_region,
                 self.source_grid,
                 self.method,
+                _return_selected_masks=True,
             )
             fused_component_scouts = batched_scout is not None
             if batched_scout is not None:
@@ -603,6 +628,7 @@ class DynamicMapScheduler:
                     fine_nx,
                     scout_metadata_rows,
                     anchor_cells,
+                    anchor_masks,
                 ) = (
                     batched_scout
                 )
@@ -629,15 +655,32 @@ class DynamicMapScheduler:
                 fine_ny, fine_nx = fine_shape
                 endpoint_cells = torch.unique(torch.cat(all_cells))
                 anchor_cells = tuple(all_cells)
-            cells_by_anchor = dict(
-                zip(scout_anchor_indices, anchor_cells, strict=True)
-            )
-            interval_cells = {
-                pair: torch.unique(
-                    torch.cat(tuple(cells_by_anchor[index] for index in set(pair)))
+            if batched_scout is not None:
+                ratio = int(self.method.scout_ratio)
+                positions = {
+                    index: position
+                    for position, index in enumerate(scout_anchor_indices)
+                }
+                interval_cells = {
+                    pair: _expand_interval_scout_cells(
+                        anchor_masks,
+                        positions,
+                        pair,
+                        ratio=ratio,
+                        fine_nx=fine_nx,
+                    )
+                    for pair in interval_pairs
+                }
+            else:
+                cells_by_anchor = dict(
+                    zip(scout_anchor_indices, anchor_cells, strict=True)
                 )
-                for pair in interval_pairs
-            }
+                interval_cells = {
+                    pair: torch.unique(
+                        torch.cat(tuple(cells_by_anchor[index] for index in set(pair)))
+                    )
+                    for pair in interval_pairs
+                }
             frame_scout_cells = tuple(
                 interval_cells[
                     (
@@ -940,23 +983,38 @@ def _cross_system_tiled_ipm_maps(
             first_region,
             first_grid,
             method,
+            _return_selected_masks=True,
         )
         if scout is None:
             raise RuntimeError("cross-system fusion requires the fused source scout")
-        _, fine_ny, fine_nx, _scout_rows, packed_anchor_cells = scout
+        (
+            _,
+            fine_ny,
+            fine_nx,
+            _scout_rows,
+            _packed_anchor_cells,
+            packed_anchor_masks,
+        ) = scout
 
         for system_index, (
             (simulation, region, grid, _, _, _),
             far_by_index,
         ) in enumerate(zip(requests, far_by_system, strict=True)):
             anchor_offset = system_index * len(anchor_indices)
-            anchor_cells = packed_anchor_cells[
+            anchor_masks = packed_anchor_masks[
                 anchor_offset : anchor_offset + len(anchor_indices)
             ]
-            cells_by_anchor = dict(zip(anchor_indices, anchor_cells, strict=True))
+            ratio = int(method.scout_ratio)
+            positions = {
+                index: position for position, index in enumerate(anchor_indices)
+            }
             interval_cells = {
-                pair: torch.unique(
-                    torch.cat(tuple(cells_by_anchor[index] for index in set(pair)))
+                pair: _expand_interval_scout_cells(
+                    anchor_masks,
+                    positions,
+                    pair,
+                    ratio=ratio,
+                    fine_nx=fine_nx,
                 )
                 for pair in interval_pairs
             }

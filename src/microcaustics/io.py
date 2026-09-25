@@ -16,7 +16,12 @@ import numpy as np
 import torch
 
 from .geometry import PlaneGrid
-from .results import LightCurve, LightCurveLabels, MagnificationMap
+from .results import (
+    LightCurve,
+    LightCurveLabels,
+    MagnificationMap,
+    TimeDependentSpectrum,
+)
 
 _LABEL_ARRAYS = (
     "times_days",
@@ -49,6 +54,11 @@ def _light_curve_payload(light_curve: LightCurve) -> dict[str, np.ndarray]:
         if light_curve.microlensing_only_flux is None
         else light_curve.microlensing_only_flux.detach().cpu().numpy()
     )
+    microlensing_only_unlensed = (
+        np.asarray([], dtype=np.float32)
+        if light_curve.microlensing_only_unlensed_flux is None
+        else light_curve.microlensing_only_unlensed_flux.detach().cpu().numpy()
+    )
     payload = {
         "schema_version": np.asarray(_LIGHT_CURVE_SCHEMA_VERSION),
         "has_labels": np.asarray(light_curve.labels is not None),
@@ -60,9 +70,55 @@ def _light_curve_payload(light_curve: LightCurve) -> dict[str, np.ndarray]:
         "has_microlensing_only": np.asarray(
             light_curve.microlensing_only_flux is not None
         ),
+        "microlensing_only_unlensed_flux": microlensing_only_unlensed,
+        "has_microlensing_only_unlensed": np.asarray(
+            light_curve.microlensing_only_unlensed_flux is not None
+        ),
         "band_names": np.asarray(light_curve.band_names),
         "metadata_json": np.asarray(_json_text(light_curve.metadata)),
+        "component_names": np.asarray(tuple(light_curve.component_flux)),
+        "has_spectrum": np.asarray(light_curve.spectrum is not None),
     }
+    for index, value in enumerate(light_curve.component_flux.values()):
+        payload[f"component_{index:03d}_flux"] = value.detach().cpu().numpy()
+    if light_curve.spectrum is not None:
+        spectrum = light_curve.spectrum
+        payload.update(
+            {
+                "spectrum_times_days": spectrum.times_days.detach().cpu().numpy(),
+                "spectrum_wavelengths_angstrom": spectrum.wavelengths_angstrom.detach()
+                .cpu()
+                .numpy(),
+                "spectrum_total_flux": spectrum.total_flux.detach().cpu().numpy(),
+                "spectrum_continuum_flux": spectrum.continuum_flux.detach()
+                .cpu()
+                .numpy(),
+                "spectrum_metadata_json": np.asarray(_json_text(spectrum.metadata)),
+                "spectrum_component_names": np.asarray(tuple(spectrum.components)),
+                "spectrum_has_microlensing_only": np.asarray(
+                    spectrum.microlensing_only_continuum_flux is not None
+                ),
+                "spectrum_has_unlensed": np.asarray(
+                    spectrum.unlensed_continuum_flux is not None
+                ),
+                "spectrum_microlensing_only_continuum_flux": (
+                    np.asarray([], dtype=np.float32)
+                    if spectrum.microlensing_only_continuum_flux is None
+                    else spectrum.microlensing_only_continuum_flux.detach()
+                    .cpu()
+                    .numpy()
+                ),
+                "spectrum_unlensed_continuum_flux": (
+                    np.asarray([], dtype=np.float32)
+                    if spectrum.unlensed_continuum_flux is None
+                    else spectrum.unlensed_continuum_flux.detach().cpu().numpy()
+                ),
+            }
+        )
+        for index, value in enumerate(spectrum.components.values()):
+            payload[f"spectrum_component_{index:03d}_flux"] = (
+                value.detach().cpu().numpy()
+            )
     if light_curve.labels is not None:
         payload.update(
             {
@@ -104,6 +160,59 @@ def _light_curve_from_payload(
         microlensing_only = torch.from_numpy(
             payload["microlensing_only_flux"].copy()
         ).to(device)
+    microlensing_only_unlensed = None
+    if bool(payload.get("has_microlensing_only_unlensed", False)):
+        microlensing_only_unlensed = torch.from_numpy(
+            payload["microlensing_only_unlensed_flux"].copy()
+        ).to(device)
+    component_names = tuple(str(value) for value in payload.get("component_names", ()))
+    component_flux = {
+        name: torch.from_numpy(payload[f"component_{index:03d}_flux"].copy()).to(
+            device
+        )
+        for index, name in enumerate(component_names)
+    }
+    spectrum = None
+    if bool(payload.get("has_spectrum", False)):
+        spectrum_names = tuple(
+            str(value) for value in payload.get("spectrum_component_names", ())
+        )
+        spectrum_components = {
+            name: torch.from_numpy(
+                payload[f"spectrum_component_{index:03d}_flux"].copy()
+            ).to(device)
+            for index, name in enumerate(spectrum_names)
+        }
+        spectrum = TimeDependentSpectrum(
+            times_days=torch.from_numpy(payload["spectrum_times_days"].copy()).to(
+                device
+            ),
+            wavelengths_angstrom=torch.from_numpy(
+                payload["spectrum_wavelengths_angstrom"].copy()
+            ).to(device),
+            total_flux=torch.from_numpy(payload["spectrum_total_flux"].copy()).to(
+                device
+            ),
+            continuum_flux=torch.from_numpy(
+                payload["spectrum_continuum_flux"].copy()
+            ).to(device),
+            microlensing_only_continuum_flux=(
+                torch.from_numpy(
+                    payload["spectrum_microlensing_only_continuum_flux"].copy()
+                ).to(device)
+                if bool(payload.get("spectrum_has_microlensing_only", False))
+                else None
+            ),
+            unlensed_continuum_flux=(
+                torch.from_numpy(
+                    payload["spectrum_unlensed_continuum_flux"].copy()
+                ).to(device)
+                if bool(payload.get("spectrum_has_unlensed", False))
+                else None
+            ),
+            components=spectrum_components,
+            metadata=json.loads(str(payload["spectrum_metadata_json"])),
+        )
     return LightCurve(
         times_days=torch.from_numpy(payload["times_days"].copy()).to(device),
         flux=torch.from_numpy(payload["flux"].copy()).to(device),
@@ -112,6 +221,9 @@ def _light_curve_from_payload(
         metadata=json.loads(str(payload["metadata_json"])),
         labels=labels,
         microlensing_only_flux=microlensing_only,
+        microlensing_only_unlensed_flux=microlensing_only_unlensed,
+        spectrum=spectrum,
+        component_flux=component_flux,
     )
 
 

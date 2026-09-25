@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
 
@@ -68,7 +69,43 @@ class MicrolensingSimulation:
     def lens_state(self, time_days: float = 0.0) -> PointMassField:
         """Return the point-lens positions at one simulation time."""
 
-        return self.point_masses.at_time(time_days)
+        return self.point_masses.at_time(time_days, runtime=self.runtime)
+
+    def lens_states(self, times_days) -> tuple[PointMassField, ...]:
+        """Return point-lens states after one batched motion evaluation."""
+
+        x_by_time, y_by_time = self.point_masses.positions_at_times(
+            times_days,
+            runtime=self.runtime,
+        )
+        return tuple(
+            self.point_masses._with_positions(x_by_time[index], y_by_time[index])
+            for index in range(int(x_by_time.shape[0]))
+        )
+
+    def bulk_source_offset_uas(self, time_days: float = 0.0) -> tuple[float, float]:
+        r"""Return the source-plane offset for a coherent lens translation.
+
+        The explicit stars carry the coherent displacement
+        :math:`\boldsymbol d`, while the smooth convergence and shear remain
+        fixed. Adding :math:`(I-A_s)\boldsymbol d` to the lens mapping makes
+        that representation exactly equivalent to translating the complete
+        local lens pattern by :math:`\boldsymbol d`. Internal stellar motions
+        are not included in this uniform correction.
+        """
+
+        velocity_x, velocity_y = self.point_masses.bulk_velocity_uas_per_day
+        displacement_x = float(time_days) * velocity_x
+        displacement_y = float(time_days) * velocity_y
+        macro = self.macro_lens
+        angle = 2.0 * macro.shear_angle_rad
+        gamma1 = macro.shear * math.cos(angle)
+        gamma2 = macro.shear * math.sin(angle)
+        kappa_sheet = macro.smooth_convergence
+        return (
+            (kappa_sheet + gamma1) * displacement_x + gamma2 * displacement_y,
+            gamma2 * displacement_x + (kappa_sheet - gamma1) * displacement_y,
+        )
 
     def raytrace_direct(
         self,
@@ -310,13 +347,21 @@ class MicrolensingSimulation:
         map_observer=None,
         microlensing_only_source: PixelatedSource | None = None,
         band_batch_size: int | None = None,
+        source_evolution: str = "exact",
+        response_delay_bin_days: float = 0.25,
     ):
         """Stream a finite-source LC with aligned center-crossing labels."""
 
         from .caustics import streaming_labeled_light_curves
         from .photometry import LightCurveRequest
 
-        requests = [LightCurveRequest(source, distances, trajectory, strict_coverage)]
+        requests = [
+            LightCurveRequest(
+                source, distances, trajectory, strict_coverage,
+                source_evolution=source_evolution,
+                response_delay_bin_days=response_delay_bin_days,
+            )
+        ]
         if microlensing_only_source is not None:
             requests.append(
                 LightCurveRequest(
@@ -423,6 +468,8 @@ class MicrolensingSimulation:
         map_observer=None,
         band_batch_size: int | None = None,
         microlensing_only_source: PixelatedSource | None = None,
+        source_evolution: str = "exact",
+        response_delay_bin_days: float = 0.25,
     ) -> LightCurve:
         """Stream dynamic maps directly into an arbitrary source light curve.
 
@@ -431,11 +478,19 @@ class MicrolensingSimulation:
         sequence is not itself a required output.
         """
 
-        if band_batch_size is not None or microlensing_only_source is not None:
+        if (
+            band_batch_size is not None
+            or microlensing_only_source is not None
+            or source_evolution != "exact"
+        ):
             from .photometry import LightCurveRequest, streaming_light_curves
 
             requests = [
-                LightCurveRequest(source, distances, trajectory, strict_coverage)
+                LightCurveRequest(
+                    source, distances, trajectory, strict_coverage,
+                    source_evolution=source_evolution,
+                    response_delay_bin_days=response_delay_bin_days,
+                )
             ]
             if microlensing_only_source is not None:
                 requests.append(
@@ -532,6 +587,8 @@ class MicrolensingSimulation:
         map_observer=None,
         band_batch_size: int | None = None,
         microlensing_only_source: PixelatedSource | None = None,
+        source_evolution: str = "exact",
+        response_delay_bin_days: float = 0.25,
     ) -> LightCurve:
         """Combine sparse dynamic maps with a finer source/light-curve cadence.
 
@@ -542,11 +599,19 @@ class MicrolensingSimulation:
         fine cadence is not restricted to quasar variability.
         """
 
-        if band_batch_size is not None or microlensing_only_source is not None:
+        if (
+            band_batch_size is not None
+            or microlensing_only_source is not None
+            or source_evolution != "exact"
+        ):
             from .photometry import LightCurveRequest, streaming_light_curves
 
             requests = [
-                LightCurveRequest(source, distances, trajectory, strict_coverage)
+                LightCurveRequest(
+                    source, distances, trajectory, strict_coverage,
+                    source_evolution=source_evolution,
+                    response_delay_bin_days=response_delay_bin_days,
+                )
             ]
             if microlensing_only_source is not None:
                 requests.append(
@@ -610,6 +675,8 @@ class MicrolensingSimulation:
         map_observer=None,
         microlensing_only_source: PixelatedSource | None = None,
         band_batch_size: int | None = None,
+        source_evolution: str = "exact",
+        response_delay_bin_days: float = 0.25,
     ):
         """Return fine-cadence flux with labels at the dynamic-map epochs.
 
@@ -621,7 +688,13 @@ class MicrolensingSimulation:
         from .caustics import streaming_labeled_light_curves
         from .photometry import LightCurveRequest
 
-        requests = [LightCurveRequest(source, distances, trajectory, strict_coverage)]
+        requests = [
+            LightCurveRequest(
+                source, distances, trajectory, strict_coverage,
+                source_evolution=source_evolution,
+                response_delay_bin_days=response_delay_bin_days,
+            )
+        ]
         if microlensing_only_source is not None:
             requests.append(
                 LightCurveRequest(

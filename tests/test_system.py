@@ -225,6 +225,219 @@ class MicrolensingSystemTests(unittest.TestCase):
         self.assertEqual(model.grid.shape, (24, 24))
         self.assertAlmostEqual(model.grid.enclosed_flux_fraction, 0.995)
 
+    def test_bandpass_light_curve_retains_shared_spectrum_products(self) -> None:
+        model = mc.ThinDiskModel(
+            black_hole_mass_solar=1.0e8,
+            eddington_ratio=0.1,
+            bands_angstrom={"reference": 6_000.0},
+            source_grid_shape=16,
+            enclosed_flux_fraction=0.99,
+            source_margin=1.05,
+        )
+        model = model.with_driving_signal(
+            mc.CallableDrivingSignal(lambda times: torch.ones_like(times))
+        )
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            source=model,
+            stars=self._stars(),
+            integration_domain="full",
+            lens_region=self.lens_region,
+            caustic_grid_shape=8,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        result = system.light_curve(
+            (0.0,),
+            method=self.method,
+            schedule=mc.DynamicConfig(
+                temporal_batch_size=1,
+                fused_temporal_ipm=False,
+                scout_refresh_frames=1,
+            ),
+            bandpasses="lsst",
+            spectral_model=mc.QuasarSpectrum(
+                ebv=0.0,
+                include_emission_lines=False,
+                include_host=False,
+                include_igm_absorption=False,
+            ),
+            wavelength_samples=4,
+            wavelength_batch_size=4,
+            include_labels=True,
+            caustics=mc.CausticConfig(
+                far_field_approx=mc.FarFieldApproxConfig(enabled=False),
+                minimum_determinant_sign_pixels=1,
+                anchor_count=3,
+                gauge_count=3,
+                minimum_alignment_gauges=1,
+            ),
+            include_microlensing_only=True,
+            return_spectrum=True,
+            spectrum_wavelengths=(4_000.0, 6_000.0, 8_000.0),
+        )
+        self.assertEqual(result.band_names, tuple("ugrizy"))
+        self.assertEqual(result.flux.shape, (1, 6))
+        self.assertEqual(result.microlensing_only_flux.shape, (1, 6))
+        self.assertIsNotNone(result.labels)
+        self.assertEqual(result.spectrum.total_flux.shape, (1, 3))
+        self.assertEqual(result.spectrum.wavelengths_angstrom.tolist(), [
+            4_000.0,
+            6_000.0,
+            8_000.0,
+        ])
+        intrinsic = system.source_light_curve(
+            (0.0, 1.0),
+            bandpasses="lsst",
+            spectral_model=mc.QuasarSpectrum(
+                ebv=0.0,
+                include_emission_lines=False,
+                include_host=False,
+                include_igm_absorption=False,
+            ),
+            wavelength_samples=4,
+            wavelength_batch_size=4,
+            include_microlensing_only=True,
+            return_spectrum=True,
+            spectrum_wavelengths=(5_000.0, 8_000.0),
+        )
+        self.assertEqual(intrinsic.flux.shape, (2, 6))
+        self.assertEqual(intrinsic.spectrum.total_flux.shape, (2, 2))
+
+    def test_multi_image_bandpass_photometry_shares_the_spectral_source(self) -> None:
+        model = mc.ThinDiskModel(
+            black_hole_mass_solar=1.0e8,
+            eddington_ratio=0.1,
+            bands_angstrom={"reference": 6_000.0},
+            source_grid_shape=16,
+            enclosed_flux_fraction=0.99,
+            source_margin=1.05,
+        )
+        model = model.with_driving_signal(
+            mc.CallableDrivingSignal(lambda times: torch.ones_like(times))
+        )
+        base = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            source=model,
+            stars=self._stars(),
+            integration_domain="full",
+            lens_region=self.lens_region,
+            caustic_grid_shape=8,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        system = mc.MultiImageSystem(
+            images={"A": base, "B": base.with_seed(2)},
+            source=model,
+        )
+        options = dict(
+            method=self.method,
+            temporal_batch_size=1,
+            scout_refresh_frames=1,
+            include_labels=True,
+            caustics=mc.CausticConfig(
+                far_field_approx=mc.FarFieldApproxConfig(enabled=False),
+                minimum_determinant_sign_pixels=1,
+                anchor_count=3,
+                gauge_count=3,
+                minimum_alignment_gauges=1,
+            ),
+            bandpasses="lsst",
+            spectral_model=mc.QuasarSpectrum(
+                ebv=0.0,
+                include_emission_lines=False,
+                include_host=False,
+                include_igm_absorption=False,
+            ),
+            wavelength_samples=2,
+            wavelength_batch_size=4,
+            include_microlensing_only=True,
+            return_spectrum=True,
+            spectrum_wavelengths=(5_000.0, 8_000.0),
+        )
+        result = system.light_curves((0.0,), **options)
+        self.assertEqual(result.image_names, ("A", "B"))
+        for image in result.images:
+            self.assertEqual(image.light_curve.flux.shape, (1, 6))
+            self.assertIsNotNone(image.light_curve.labels)
+            self.assertEqual(
+                image.light_curve.microlensing_only_flux.shape, (1, 6)
+            )
+            self.assertEqual(image.light_curve.spectrum.total_flux.shape, (1, 2))
+        batched = mc.batched_system_light_curves(
+            (system,), (0.0,), curves_per_batch=2, **options
+        ).light_curves[0]
+        for direct, grouped in zip(result.images, batched.images, strict=True):
+            self.assertIsNotNone(grouped.light_curve.labels)
+            torch.testing.assert_close(
+                direct.light_curve.flux, grouped.light_curve.flux
+            )
+            torch.testing.assert_close(
+                direct.light_curve.spectrum.total_flux,
+                grouped.light_curve.spectrum.total_flux,
+            )
+
+    def test_independent_batch_supports_dense_spectral_postprocessing(self) -> None:
+        model = mc.ThinDiskModel(
+            black_hole_mass_solar=1.0e8,
+            eddington_ratio=0.1,
+            bands_angstrom={"reference": 6_000.0},
+            source_grid_shape=16,
+            enclosed_flux_fraction=0.99,
+            source_margin=1.05,
+        )
+        model = model.with_driving_signal(
+            mc.CallableDrivingSignal(lambda times: torch.ones_like(times))
+        )
+        system = mc.MicrolensingSystem(
+            macro=self.macro,
+            distances=self.distances,
+            source=model,
+            stars=self._stars(),
+            integration_domain="full",
+            lens_region=self.lens_region,
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+        )
+        spectral_models = (
+            mc.QuasarSpectrum(
+                ebv=0.0,
+                include_emission_lines=False,
+                include_host=False,
+                include_igm_absorption=False,
+            ),
+            mc.QuasarSpectrum(
+                ebv=0.0,
+                include_emission_lines=False,
+                include_host=False,
+                include_igm_absorption=False,
+                global_magnitude_offset=0.1,
+            ),
+        )
+        results = mc.batched_system_light_curves(
+            (system, system.with_seed(9)),
+            (0.0,),
+            curves_per_batch=2,
+            method=self.method,
+            schedule=mc.DynamicConfig(
+                temporal_batch_size=1,
+                fused_temporal_ipm=False,
+                scout_refresh_frames=1,
+            ),
+            bandpasses="lsst",
+            spectral_model=spectral_models,
+            wavelength_samples=2,
+            wavelength_batch_size=4,
+            include_microlensing_only=True,
+            return_spectrum=True,
+            spectrum_wavelengths=(5_000.0, 8_000.0),
+        ).light_curves
+        result = results[0]
+        self.assertEqual(result.band_names, tuple("ugrizy"))
+        self.assertEqual(result.flux.shape, (1, 6))
+        self.assertEqual(result.microlensing_only_flux.shape, (1, 6))
+        self.assertEqual(result.spectrum.total_flux.shape, (1, 2))
+        self.assertFalse(torch.equal(results[0].flux, results[1].flux))
+
     def test_component_seeds_are_stable_and_independent(self) -> None:
         system = mc.MicrolensingSystem(
             macro=self.macro,
@@ -434,6 +647,40 @@ class MicrolensingSystemTests(unittest.TestCase):
             torch.tensor([0.3, -0.5, 0.6]),
             einstein_radius_uas=torch.tensor([0.2, 0.16, 0.12]),
         )
+
+    def test_explicit_stellar_aperture_can_enlarge_but_not_truncate(self) -> None:
+        common = dict(
+            macro=self.macro,
+            distances=self.distances,
+            source_grid=self.source_grid,
+            stellar_population=mc.StellarPopulation.salpeter(count=8),
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+            seed=41,
+        )
+        automatic = mc.MicrolensingSystem(**common).realization
+        required = automatic.stellar_aperture
+        assert required is not None
+        enlarged = mc.StellarAperture(
+            required.radius_uas * 1.1,
+            required.center_uas,
+        )
+        realized = mc.MicrolensingSystem(
+            **common,
+            stellar_aperture_override=enlarged,
+        ).realization
+        self.assertEqual(realized.stellar_aperture, enlarged)
+        self.assertEqual(
+            realized.lens_region.field_of_view_uas,
+            enlarged.bounding_region.field_of_view_uas,
+        )
+        with self.assertRaisesRegex(ValueError, "smaller than the complete aperture"):
+            mc.MicrolensingSystem(
+                **common,
+                stellar_aperture_override=mc.StellarAperture(
+                    required.radius_uas * 0.9,
+                    required.center_uas,
+                ),
+            ).realize()
 
     def test_salpeter_constructor_matches_requested_mean_and_ratio(self) -> None:
         population = mc.StellarPopulation.salpeter(
@@ -871,7 +1118,9 @@ class MicrolensingSystemTests(unittest.TestCase):
         self.assertEqual(variable.geometry, static.geometry)
         self.assertTrue(bool(torch.all(torch.isfinite(variable.brightness(0.0)))))
 
-    def test_float32_kerr_reprocessing_accepts_arbitrary_physical_parameters(self) -> None:
+    def test_float32_kerr_reprocessing_accepts_arbitrary_physical_parameters(
+        self,
+    ) -> None:
         model = mc.KerrDiskModel(
             black_hole_mass_solar=1.0e8,
             eddington_ratio=0.2,
@@ -1110,8 +1359,12 @@ class MicrolensingSystemTests(unittest.TestCase):
             self.assertNotEqual(first_velocity, second_velocity)
             self.assertIsNone(first.seed)
             self.assertIsNone(second.seed)
-            self.assertEqual(first._peculiar_standard_draws, tuple(expected_first.tolist()))
-            self.assertEqual(second._peculiar_standard_draws, tuple(expected_second.tolist()))
+            self.assertEqual(
+                first._peculiar_standard_draws, tuple(expected_first.tolist())
+            )
+            self.assertEqual(
+                second._peculiar_standard_draws, tuple(expected_second.tolist())
+            )
             torch.testing.assert_close(torch.rand(3), expected_next, rtol=0, atol=0)
 
     def test_seeded_sky_kinematics_does_not_advance_global_stream(self) -> None:
@@ -1222,22 +1475,27 @@ class MicrolensingSystemTests(unittest.TestCase):
         ):
             system.realize()
 
-    def test_empty_dynamic_catalog_has_no_motion_warning_or_invalid_metadata(self) -> None:
+    def test_empty_dynamic_catalog_has_no_motion_warning_or_invalid_metadata(
+        self,
+    ) -> None:
         system = mc.MicrolensingSystem(
             macro=mc.MacroLens(0.0, 0.0),
             distances=self.distances,
             source_grid=self.source_grid,
-            stars=mc.PointMassField([], [], [],
-                velocity_x_uas_per_day=[], velocity_y_uas_per_day=[]),
+            stars=mc.PointMassField(
+                [], [], [], velocity_x_uas_per_day=[], velocity_y_uas_per_day=[]
+            ),
             duration_days=10.0,
             runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
         )
         with warnings.catch_warnings():
             warnings.simplefilter("error", mc.IncompleteKinematicsWarning)
-            self.assertFalse(system.realize().metadata()["stellar_motion"]["has_motion"])
+            self.assertFalse(
+                system.realize().metadata()["stellar_motion"]["has_motion"]
+            )
 
     def test_dynamic_explicit_motion_warns_for_missing_components(self) -> None:
-        def system(velocity_x, velocity_y):
+        def system(velocity_x, velocity_y, *, bulk_velocity=(0.0, 0.0)):
             return mc.MicrolensingSystem(
                 macro=self.macro,
                 distances=self.distances,
@@ -1248,6 +1506,7 @@ class MicrolensingSystemTests(unittest.TestCase):
                     [0.3, 0.2],
                     velocity_x_uas_per_day=velocity_x,
                     velocity_y_uas_per_day=velocity_y,
+                    bulk_velocity_uas_per_day=bulk_velocity,
                 ),
                 duration_days=10.0,
                 runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
@@ -1256,12 +1515,20 @@ class MicrolensingSystemTests(unittest.TestCase):
         with self.assertWarnsRegex(
             mc.IncompleteKinematicsWarning, "stellar velocity dispersion"
         ):
-            system([0.1, 0.1], [-0.2, -0.2]).realize()
+            system(
+                [0.1, 0.1],
+                [-0.2, -0.2],
+                bulk_velocity=(0.1, -0.2),
+            ).realize()
         with self.assertWarnsRegex(mc.IncompleteKinematicsWarning, "bulk motion"):
             system([0.1, -0.1], [-0.2, 0.2]).realize()
         with warnings.catch_warnings():
             warnings.simplefilter("error", mc.IncompleteKinematicsWarning)
-            system([0.11, 0.09], [-0.18, -0.22]).realize()
+            system(
+                [0.11, 0.09],
+                [-0.18, -0.22],
+                bulk_velocity=(0.1, -0.2),
+            ).realize()
 
     def test_complete_sky_kinematics_emits_no_dynamic_warning(self) -> None:
         system = mc.MicrolensingSystem(
@@ -1305,6 +1572,7 @@ class MicrolensingSystemTests(unittest.TestCase):
             dtype=torch.float64,
         )
         expected = population.kinematics.mean_velocity_uas_per_day(self.distances)
+        self.assertEqual(field.bulk_velocity_uas_per_day, expected)
         self.assertAlmostEqual(
             float(field.velocity_x_uas_per_day.mean()),
             expected[0],
@@ -1987,8 +2255,12 @@ class MicrolensingSystemTests(unittest.TestCase):
         self.assertIsNone(first.stellar_population.kinematics.seed)
         self.assertIsNone(second.stellar_population.kinematics.seed)
         self.assertEqual(
-            first.stellar_population.kinematics.mean_velocity_uas_per_day(self.distances),
-            second.stellar_population.kinematics.mean_velocity_uas_per_day(self.distances),
+            first.stellar_population.kinematics.mean_velocity_uas_per_day(
+                self.distances
+            ),
+            second.stellar_population.kinematics.mean_velocity_uas_per_day(
+                self.distances
+            ),
         )
         self.assertFalse(torch.equal(first.stars.x_uas, second.stars.x_uas))
 
@@ -2268,7 +2540,9 @@ class MicrolensingSystemTests(unittest.TestCase):
             rtol=0.0,
             atol=0.0,
         )
-        torch.testing.assert_close(actual.labels.crossing_labels, expected.crossing_labels)
+        torch.testing.assert_close(
+            actual.labels.crossing_labels, expected.crossing_labels
+        )
 
     def test_high_level_multirate_light_curve_matches_low_level_pipeline(self) -> None:
         pixel_scale_m = self.distances.uas_to_source_length(

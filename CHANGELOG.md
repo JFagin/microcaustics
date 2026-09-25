@@ -10,7 +10,7 @@
   across every macroimage in resolved lensed-system observations.
 - Expose configurable Rubin band-noise parameters and document the cadence and
   observation workflow.
-- Add built-in Novikov--Thorne and Shakura--Sunyaev viscous profiles, custom
+- Add built-in Novikov–Thorne and Shakura–Sunyaev viscous profiles, custom
   profile and radiative-efficiency callables, and a dedicated source notebook.
 - Add compilation warnings, enabled by default and configurable through the
   runtime, so first-call Torch and Triton specialization costs are explicit.
@@ -23,6 +23,8 @@
   compact-node plans.
 - Batch transfer-function and mean-response-delay generation across times,
   bands, and macroimages.
+- Cache immutable reverberating-disk tensors and compile the relativistic
+  multiband brightness kernel for faster, lower-memory temporal source batches.
 - Reorganize and re-execute the complete tutorial collection, including new
   spectral-microlensing and disk-profile demonstrations.
 

@@ -216,7 +216,7 @@ measured delays and local lens parameters directly.
 
 Intrinsic variability and reprocessing often require a much finer time grid
 than the moving microlens field. Generate maps sparsely and return daily fluxes
-with two map--source contractions per source epoch:
+with two map–source contractions per source epoch:
 
 The paper example uses `broken_power_law_driving_signal` with a 200-day PSD
 break. This choice belongs to the source model. Any custom `DrivingSignal` can

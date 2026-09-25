@@ -96,14 +96,8 @@ def rectangular_lens_region(
     half_source_y = 0.5 * source_fov_y + stochastic_margin
     center_x = inverse_xx * source_center_x + inverse_xy * source_center_y
     center_y = inverse_xy * source_center_x + inverse_yy * source_center_y
-    half_x = (
-        abs(inverse_xx) * half_source_x
-        + abs(inverse_xy) * half_source_y
-    )
-    half_y = (
-        abs(inverse_xy) * half_source_x
-        + abs(inverse_yy) * half_source_y
-    )
+    half_x = abs(inverse_xx) * half_source_x + abs(inverse_xy) * half_source_y
+    half_y = abs(inverse_xy) * half_source_x + abs(inverse_yy) * half_source_y
     return PlaneRegion(
         (2.0 * padding * half_y, 2.0 * padding * half_x),
         (center_y, center_x),
@@ -193,8 +187,10 @@ def sample_uniform_point_masses(
                 mass_function.mean_mass(),
                 dtype=torch.float64,
             )
-            expected = target * math.prod(region.field_of_view_uas) / (
-                math.pi * float(mean_radius.square())
+            expected = (
+                target
+                * math.prod(region.field_of_view_uas)
+                / (math.pi * float(mean_radius.square()))
             )
             count = max(1, int(round(expected)))
     if int(count) < 0:
@@ -235,12 +231,10 @@ def sample_uniform_point_masses(
                 "velocity dispersion must be non-negative and scalar or length two"
             )
         velocity_x.add_(
-            torch.randn(count, generator=generator, dtype=torch.float64)
-            * dispersion[0]
+            torch.randn(count, generator=generator, dtype=torch.float64) * dispersion[0]
         )
         velocity_y.add_(
-            torch.randn(count, generator=generator, dtype=torch.float64)
-            * dispersion[1]
+            torch.randn(count, generator=generator, dtype=torch.float64) * dispersion[1]
         )
     if velocity_x is not None:
         velocity_x.add_(mean_velocity[0])
@@ -253,6 +247,7 @@ def sample_uniform_point_masses(
         distances,
         velocity_x_uas_per_day=velocity_x,
         velocity_y_uas_per_day=velocity_y,
+        bulk_velocity_uas_per_day=velocity_mean_uas_per_day,
         device=device,
         dtype=dtype,
     )
@@ -347,12 +342,10 @@ def sample_uniform_circular_point_masses(
                 "velocity dispersion must be non-negative and scalar or length two"
             )
         velocity_x.add_(
-            torch.randn(count, generator=generator, dtype=torch.float64)
-            * dispersion[0]
+            torch.randn(count, generator=generator, dtype=torch.float64) * dispersion[0]
         )
         velocity_y.add_(
-            torch.randn(count, generator=generator, dtype=torch.float64)
-            * dispersion[1]
+            torch.randn(count, generator=generator, dtype=torch.float64) * dispersion[1]
         )
     if velocity_x is not None:
         velocity_x.add_(mean_velocity[0])
@@ -365,6 +358,9 @@ def sample_uniform_circular_point_masses(
         distances,
         velocity_x_uas_per_day=velocity_x,
         velocity_y_uas_per_day=velocity_y,
+        bulk_velocity_uas_per_day=velocity_mean_uas_per_day,
+        reflecting_boundary_center_uas=(center_y, center_x),
+        reflecting_boundary_radius_uas=radius,
         device=device,
         dtype=dtype,
     )

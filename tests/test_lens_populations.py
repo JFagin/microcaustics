@@ -148,6 +148,9 @@ class LensPopulationTests(unittest.TestCase):
             rtol=0.0,
             atol=0.0,
         )
+        self.assertEqual(field.bulk_velocity_uas_per_day, (0.003, -0.002))
+        self.assertEqual(field.reflecting_boundary_center_uas, (0.0, 0.0))
+        self.assertEqual(field.reflecting_boundary_radius_uas, 3.0)
 
     def test_light_loss_rectangle_handles_rotated_shear_coordinates(self) -> None:
         macro = mc.MacroLens(0.31, 0.22, shear_angle_deg=math.degrees(0.37))

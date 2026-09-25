@@ -25,6 +25,9 @@ output/
 .torchinductor/
 .torchinductor-*/
 .torchinductor_*/
+.inductor/
+.inductor-*/
+.inductor_*/
 .numba-cache/
 .jupyter/
 .jupyter-*/

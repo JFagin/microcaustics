@@ -58,7 +58,7 @@ share one tested plotting implementation.
 
 The dynamic IPM path is now implemented behind the public solver contracts.
 Its CUDA specialization fuses temporal Taylor far-field queries and direct-cell
-rasterization while retaining the exact portable Sutherland--Hodgman reference
+rasterization while retaining the exact portable Sutherland–Hodgman reference
 for validation and non-CUDA systems. Source scouting, tail padding, and memory
 backoff are scheduler policies with explicit result metadata. None are hidden
 inside a numerical kernel. Far-field coefficients are evaluated independently

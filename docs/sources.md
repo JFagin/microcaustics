@@ -284,9 +284,13 @@ signal = mc.broken_power_law_driving_signal(
 )
 ```
 
-This convenience function reproduces the paper convention. Random Fourier
-phases, five-times padding, trimming, normalization, and a positive lognormal
-transform. `BrokenPowerLawPSD` can also be evaluated independently.
+This convenience function draws Gaussian real and imaginary Fourier coefficients
+(random amplitudes and phases), generates a five-times-longer series, and retains
+an interior segment. It standardizes that latent sequence before applying the
+positive lognormal transform. The requested PSD describes the latent sequence,
+not the exact PSD after exponentiation. `BrokenPowerLawPSD` can also be evaluated
+independently. This replaces the previous fixed-amplitude random-phase default,
+so seeded driver realizations change, but stellar random draws do not.
 
 No PSD shape is required by the package. Supply any callable that maps positive
 frequencies in inverse days to non-negative power:
@@ -468,6 +472,145 @@ independently set `flux_cadence_days` and `apply_driving_signal=False`; no
 manual distance calculation, pixelation, or constant-driver source is needed.
 The final partial wavelength batch is padded internally and trimmed from the
 returned `[time, band]` arrays.
+
+## Empirical quasar spectra and bandpasses
+
+`QuasarSpectrum` adds static broad and narrow emission lines, host-galaxy
+light, intrinsic dust attenuation, and intergalactic absorption to the
+physical disk continuum. `QuasarSpectrumPopulation` samples its configurable
+parameters with an isolated random generator, so its seed does not alter the
+disk, driver, stars, or observing cadence.
+The empirical templates and their luminosity-dependent scaling follow
+[Temple et al. (2021)](https://arxiv.org/abs/2109.04472), with the physical
+continuum construction adapted from the spectral workflow in
+[Fagin et al. (2024)](https://arxiv.org/abs/2410.18423).
+
+```python
+model = mc.QuasarSpectrumPopulation(
+    host_fraction=mc.ClippedNormal(0.244, 0.075, 0.0, 0.7),
+    ebv=mc.LogNormal(-2.0, 0.5),
+).sample(seed=42)
+
+result = system.light_curve(
+    duration_days=3650,
+    map_cadence_days=25,
+    source_cadence_days=1,
+    bandpasses="lsst",
+    spectral_model=model,
+    wavelength_samples=32,
+    wavelength_batch_size=16,
+    return_spectrum=True,
+    include_microlensing_only=True,
+    spectrum_wavelengths=np.linspace(3250.0, 10900.0, 1000),
+)
+```
+
+`wavelength_samples` controls the log-spaced physical continuum grid across the
+combined filter support (32 by default); normalization of host or line templates
+may add hidden physical wavelengths outside that range.
+`wavelength_batch_size` controls how many spatial disk channels are
+evaluated together. Emission-line templates and response curves are evaluated
+on a separate fine one-dimensional grid using log-flux interpolation of the
+continuum. Consequently, increasing
+`spectrum_wavelengths` does not increase the number of spatial source images.
+Increase `wavelength_samples` and check convergence for unusually sharp
+chromatic caustic features or custom filters with narrow structure.
+Omitting `spectrum_wavelengths` retains 1000 evenly spaced samples across the
+combined filter support.
+The returned `LightCurve` contains six integrated bands in `flux`, a shared-map
+mean-driver result in `microlensing_only_flux`, component band fluxes in
+`component_flux`, and the optional `[time, wavelength]` product in `spectrum`.
+
+The continuum and its bandpass integrals are evaluated at every requested
+source epoch, including daily intrinsic variability between 25-day maps.
+
+### Experimental response-based source evolution
+
+The default `source_evolution="exact"` evaluates the nonlinear thermal disk at
+every requested source epoch. For a stationary `ThermalReprocessingSource`,
+`source_evolution="linear_response"` instead contracts the mean disk and its
+unnormalized delay response with each sparse magnification map, then
+interpolates those products between map epochs. The driver and output remain
+sampled daily; only the expensive spatial disk evaluation is approximated.
+The unnormalized kernel is essential because microlensing changes both its
+shape and response amplitude. Adjacent delay bins share each pixel's weight,
+preserving the response's total weight and mean delay.
+
+```python
+approximate = system.light_curve(
+    duration_days=3650,
+    map_cadence_days=25,
+    source_cadence_days=1,
+    bandpasses="lsst",
+    wavelength_samples=32,
+    wavelength_batch_size=16,
+    include_microlensing_only=True,
+    source_evolution="linear_response",  # opt in; "exact" is the default
+    response_delay_bin_days=0.25,
+)
+```
+
+The same controls work on individual `LightCurveRequest` objects, with
+optional caustic labels, and with `TimeShiftedSource` arrival delays. Source
+trajectories must be stationary in these modes; a moving source currently
+raises an error rather than reusing invalid response weights.
+
+This is an approximation to the nonlinear Planck response, not merely a
+coarser time grid. In one matched Q2237 B full-field test (1024×1024-pixel disk,
+10 million rays per map, 147 maps, 3651 daily epochs, 32 continuum wavelengths,
+RTX 5070 Ti), warmed complete calls were about 1.37–1.38 s exact versus
+1.01–1.02 s linear response after compiling the map-response projection.
+Across that test the maximum six-band error was 2.01 mmag, and the maximum
+within 25 days of the day-1300 crossing was
+1.96 mmag. A best-shift fit to the crossing-window variable component gave
+0.13–0.24 day across the six bands relative to exact, even though the binned
+response itself preserves its mean delay. The shift reflects the physical
+first-order approximation and can matter for continuum-lag studies.
+
+With a sampled `QuasarSpectrum` and the same 32-wavelength continuum,
+warmed calls were 1.57–1.65 s exact versus 1.10–1.15 s with linear
+response (about 1.43 times faster). Both runs returned a spectrum at every
+daily epoch; neither reduced the intrinsic cadence to the 25-day map cadence.
+These timings include map generation and spectral post-processing but not
+caustic labels or first-call compilation.
+
+`source_evolution="quadratic_response"` adds the second-order thermal
+coefficient. In the full-spectrum test its maximum six-band error was 0.09 mmag
+and the best-fit shift was 0.01–0.02 day. With the same compiled projection,
+it took 1.16–1.19 s, about 1.33 times faster than exact in this case.
+These measurements are for one realization and are not general error bounds;
+compare with `"exact"` for
+other disks, drivers, and caustics. The response modes cache one spatial
+weight per sampled disk wavelength and use more GPU memory than the exact
+streaming path. Moderate wavelength sets use one compiled, fused map projection;
+larger sets retain chunked projections under a GPU-memory cap. Check available
+memory before using hundreds of wavelengths.
+
+Thermal disks share the retarded driving signal and temperature field across
+wavelength chunks. On compiled backends, regular grids use tiled Planck emission
+and map-weighted flux reductions without retaining a full
+time-by-pixel-by-wavelength cube. Irregular grids remain supported.
+NVIDIA CUDA float32 uses a wavelength-vectorized Triton kernel; requests needing
+gradients, float64, or another GPU backend retain the compiled PyTorch path.
+This also applies to source-only photometry and time-shifted multi-image sources.
+Temporal tails repeat the last valid evaluation time internally and are trimmed
+from the result, so padding never extends the driving-signal horizon.
+
+For a stationary mean-driver disk, the code contracts the static source with
+each map once and interpolates the resulting band fluxes. This is algebraically
+equivalent to the original map interpolation, not an approximation to intrinsic
+variability. Static brightness caches are memory-bounded; larger spectra retain
+the wavelength-streaming path. `include_labels=True` shares the same map stream
+and preserves the caustic labels through spectral post-processing.
+
+The physical continuum determines the empirical $M_i(z=2)$ luminosity scaling
+unless `absolute_i_magnitude` is supplied. In a lensed macroimage, host light is
+omitted by default because a local microlensing model does not specify the host
+aperture or its macro magnification. Emission lines are static and receive the
+local macro magnification, but are not microlensed. `host_lensing="macro"` and
+`host_lensing="unlensed"` are explicit approximations. The unlensed
+`system.source_light_curve(...)` path includes the host directly. Pass a
+`BandpassSet` instead of `"lsst"` for custom response curves.
 
 ## Automatic physical source grids
 

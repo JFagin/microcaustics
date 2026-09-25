@@ -53,6 +53,106 @@ if triton is not None:
             tl.store(counts + block, tl.sum(active.to(tl.int32)))
 
     @triton.jit
+    def _packed_crossing_kernel(
+        segments,
+        frame_offsets,
+        anchors,
+        points,
+        counts,
+        max_segment_blocks,
+        n_anchors,
+        n_points,
+        BLOCK: tl.constexpr,
+    ):
+        """Count crossings for packed, ragged temporal segment arrays."""
+        program = tl.program_id(0)
+        segment_block = program % max_segment_blocks
+        task = program // max_segment_blocks
+        anchor = task % n_anchors
+        task = task // n_anchors
+        point = task % n_points
+        frame = task // n_points
+        frame_start = tl.load(frame_offsets + frame).to(tl.int64)
+        frame_stop = tl.load(frame_offsets + frame + 1).to(tl.int64)
+        segment = frame_start + segment_block * BLOCK + tl.arange(0, BLOCK)
+        active = segment < frame_stop
+        base = segment * 4
+        ax = tl.load(segments + base, mask=active, other=0.0)
+        ay = tl.load(segments + base + 1, mask=active, other=0.0)
+        bx = tl.load(segments + base + 2, mask=active, other=0.0)
+        by = tl.load(segments + base + 3, mask=active, other=0.0)
+        anchor_x = tl.load(anchors + anchor * 2)
+        anchor_y = tl.load(anchors + anchor * 2 + 1)
+        point_x = tl.load(points + point * 2)
+        point_y = tl.load(points + point * 2 + 1)
+        ray_x = point_x - anchor_x
+        ray_y = point_y - anchor_y
+        segment_x = bx - ax
+        segment_y = by - ay
+        offset_ax = ax - anchor_x
+        offset_ay = ay - anchor_y
+        offset_bx = bx - anchor_x
+        offset_by = by - anchor_y
+        denominator = ray_x * segment_y - ray_y * segment_x
+        non_parallel = tl.abs(denominator) > 1.0e-7
+        safe = tl.where(non_parallel, denominator, 1.0)
+        fraction = (offset_ax * segment_y - offset_ay * segment_x) / safe
+        side_a = ray_x * offset_ay - ray_y * offset_ax
+        side_b = ray_x * offset_by - ray_y * offset_bx
+        intersects = (
+            active
+            & non_parallel
+            & (fraction > 1.0e-7)
+            & (fraction < 1.0 - 1.0e-7)
+            & ((side_a > 0.0) != (side_b > 0.0))
+        )
+        output = (frame * n_points + point) * n_anchors + anchor
+        tl.atomic_add(counts + output, tl.sum(intersects.to(tl.int32), axis=0))
+
+    @triton.jit
+    def _packed_distance_kernel(
+        segments,
+        frame_offsets,
+        points,
+        distance2,
+        max_segment_blocks,
+        n_points,
+        BLOCK: tl.constexpr,
+    ):
+        """Reduce point-to-segment distances for packed temporal frames."""
+        program = tl.program_id(0)
+        segment_block = program % max_segment_blocks
+        task = program // max_segment_blocks
+        point = task % n_points
+        frame = task // n_points
+        frame_start = tl.load(frame_offsets + frame).to(tl.int64)
+        frame_stop = tl.load(frame_offsets + frame + 1).to(tl.int64)
+        segment = frame_start + segment_block * BLOCK + tl.arange(0, BLOCK)
+        active = segment < frame_stop
+        base = segment * 4
+        ax = tl.load(segments + base, mask=active, other=0.0)
+        ay = tl.load(segments + base + 1, mask=active, other=0.0)
+        bx = tl.load(segments + base + 2, mask=active, other=0.0)
+        by = tl.load(segments + base + 3, mask=active, other=0.0)
+        point_x = tl.load(points + point * 2)
+        point_y = tl.load(points + point * 2 + 1)
+        segment_x = bx - ax
+        segment_y = by - ay
+        length2 = tl.maximum(
+            segment_x * segment_x + segment_y * segment_y,
+            1.0e-24,
+        )
+        projection = ((point_x - ax) * segment_x + (point_y - ay) * segment_y) / length2
+        projection = tl.maximum(0.0, tl.minimum(1.0, projection))
+        dx = point_x - (ax + projection * segment_x)
+        dy = point_y - (ay + projection * segment_y)
+        partial = tl.min(
+            tl.where(active, dx * dx + dy * dy, float("inf")),
+            axis=0,
+        )
+        tl.atomic_min(distance2 + frame * n_points + point, partial)
+
+    @triton.jit
     def _regular_grid_winding_updates_kernel(
         segments,
         y_axis,
@@ -590,6 +690,99 @@ def batched_caustic_crossings_distances_triton(
             distance_count,
             blocks,
             BLOCK=int(block_segments),
+            num_warps=4,
+        )
+    return counts, torch.sqrt(distance2)
+
+
+def packed_caustic_crossings_distances_triton(
+    segments,
+    frame_offsets,
+    anchors,
+    crossing_points,
+    distance_points,
+    *,
+    maximum_segments: int | None = None,
+    compute_distances: bool = True,
+    block_segments: int = 256,
+):
+    """Fuse label reductions without padding ragged temporal segment arrays."""
+
+    if not triton_caustics_available() or segments.device.type != "cuda":
+        raise RuntimeError("Triton caustic labels are unavailable")
+    if segments.dtype != torch.float32:
+        raise ValueError("Triton caustic labels require float32")
+    if segments.ndim != 3 or tuple(segments.shape[-2:]) != (2, 2):
+        raise ValueError("segments must have shape [segments, 2, 2]")
+    segments = segments.contiguous()
+    frame_offsets = frame_offsets.to(
+        device=segments.device,
+        dtype=torch.int64,
+    ).contiguous()
+    if frame_offsets.ndim != 1 or int(frame_offsets.numel()) < 2:
+        raise ValueError("frame_offsets must have shape [frames + 1]")
+    anchors = anchors.to(device=segments.device, dtype=segments.dtype).contiguous()
+    crossing_points = crossing_points.to(
+        device=segments.device,
+        dtype=segments.dtype,
+    ).contiguous()
+    distance_points = distance_points.to(
+        device=segments.device,
+        dtype=segments.dtype,
+    ).contiguous()
+    frames = int(frame_offsets.numel()) - 1
+    anchor_count = int(anchors.shape[0])
+    point_count = int(crossing_points.shape[0])
+    distance_count = int(distance_points.shape[0])
+    counts = torch.zeros(
+        (frames, point_count, anchor_count),
+        device=segments.device,
+        dtype=torch.int32,
+    )
+    distance2 = torch.full(
+        (frames, distance_count),
+        float("inf"),
+        device=segments.device,
+        dtype=segments.dtype,
+    )
+    if int(segments.shape[0]) == 0:
+        return counts, torch.sqrt(distance2)
+    block_segments = int(block_segments)
+    if block_segments not in {64, 128, 256, 512, 1024}:
+        raise ValueError("block_segments must be a power of two from 64 to 1024")
+    if maximum_segments is None:
+        lengths = frame_offsets[1:] - frame_offsets[:-1]
+        maximum_segments = int(lengths.max().item())
+    maximum_segments = int(maximum_segments)
+    if maximum_segments < 0:
+        raise ValueError("maximum_segments must be nonnegative")
+    segment_blocks = triton.cdiv(maximum_segments, block_segments)
+    count_programs = frames * point_count * anchor_count * segment_blocks
+    if count_programs:
+        _packed_crossing_kernel[(count_programs,)](
+            segments,
+            frame_offsets,
+            anchors,
+            crossing_points,
+            counts,
+            segment_blocks,
+            anchor_count,
+            point_count,
+            BLOCK=block_segments,
+            num_warps=4,
+        )
+    distance_programs = (
+        frames * distance_count * segment_blocks if compute_distances else 0
+    )
+    if distance_programs:
+        _packed_distance_kernel[(distance_programs,)](
+            segments,
+            frame_offsets,
+            distance_points,
+            distance2,
+            segment_blocks,
+            distance_count,
+            BLOCK=block_segments,
             num_warps=4,
         )
     return counts, torch.sqrt(distance2)

@@ -1,0 +1,1 @@
+"""Bundled photometric response curves."""

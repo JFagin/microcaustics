@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import torch
 
+from ..compile import run_tensor_kernel
+from ..config import Backend
 from ..relativity import ObserverTransfer, kerr_isco_radius
+from ..runtime import ResolvedRuntime
 from .base import SourceGeometry, _as_times
 from .thin_disk import (
     _C,
@@ -22,40 +25,26 @@ from .thin_disk import (
     _validate_viscous_prescriptions,
     thin_disk_temperature4,
 )
+from .triton_thermal_flux import triton_thermal_flux
 
 
-def _transferred_brightness_from_temperature4(
+def _planck_brightness(
     temperature4: torch.Tensor,
-    *,
-    geometry: SourceGeometry,
-    transfer: ObserverTransfer,
-    source_redshift: float | torch.Tensor,
-    color_correction: float | torch.Tensor,
+    gfactor: torch.Tensor,
+    solid_angle_sr: torch.Tensor,
+    hit: torch.Tensor,
+    rest_wavelength_m: torch.Tensor,
+    color: torch.Tensor,
+    redshift_dimming: torch.Tensor,
+    inverse_pixel_area: torch.Tensor,
 ) -> torch.Tensor:
-    """Evaluate redshifted Planck brightness through an observer transfer."""
+    """Planck emission for explicitly broadcast spatial/spectral dimensions."""
 
-    temperature4 = torch.as_tensor(temperature4)
-    device, dtype = temperature4.device, temperature4.dtype
-    local_transfer = transfer.to(device=device, dtype=dtype)
     temperature = temperature4.clamp_min(0.0).pow(0.25)
-    redshift = torch.as_tensor(source_redshift, device=device, dtype=dtype)
-    color = torch.as_tensor(color_correction, device=device, dtype=dtype)
-    wavelengths = torch.as_tensor(
-        geometry.wavelengths_angstrom,
-        device=device,
-        dtype=dtype,
-    )
-    rest_wavelength_m = wavelengths * 1.0e-10 / (1.0 + redshift)
     exponent = (
         _H
         * _C
-        / (
-            rest_wavelength_m
-            * local_transfer.gfactor[..., None]
-            * _K_B
-            * color
-            * temperature[..., None].clamp_min(1.0e-12)
-        )
+        / (rest_wavelength_m * gfactor * _K_B * color * temperature.clamp_min(1.0e-12))
     )
     intensity_nu = (
         2.0
@@ -65,15 +54,173 @@ def _transferred_brightness_from_temperature4(
         / torch.expm1(exponent.clamp(max=85.0))
         / color.pow(4)
     )
-    flux_per_pixel_jy = (
-        intensity_nu
-        * local_transfer.solid_angle_sr[..., None]
-        / (1.0 + redshift).pow(3)
-        * 1.0e26
+    brightness = (
+        intensity_nu * solid_angle_sr * redshift_dimming * 1.0e26 * inverse_pixel_area
     )
-    pixel_area = geometry.pixel_scale_m[0] * geometry.pixel_scale_m[1]
-    brightness = flux_per_pixel_jy / pixel_area
-    return torch.where(local_transfer.hit[..., None], brightness, 0.0)
+    return torch.where(hit, brightness, 0.0)
+
+
+def _transferred_brightness_kernel(
+    temperature4,
+    gfactor,
+    solid_angle_sr,
+    hit,
+    rest_wavelength_m,
+    color,
+    redshift_dimming,
+    inverse_pixel_area,
+):
+    """Materialized brightness retains the public [time,y,x,band] layout."""
+    return _planck_brightness(
+        temperature4[..., None],
+        gfactor[..., None],
+        solid_angle_sr[..., None],
+        hit[..., None],
+        rest_wavelength_m,
+        color,
+        redshift_dimming,
+        inverse_pixel_area,
+    )
+
+
+def _transferred_arguments(
+    temperature4: torch.Tensor,
+    *,
+    geometry: SourceGeometry,
+    transfer: ObserverTransfer,
+    source_redshift: float | torch.Tensor,
+    color_correction: float | torch.Tensor,
+    runtime: ResolvedRuntime | None = None,
+    spectral_cache: dict | None = None,
+) -> tuple[tuple[torch.Tensor, ...], ResolvedRuntime | None]:
+    """Resolve the shared tensor inputs for brightness and fused photometry."""
+
+    temperature4 = torch.as_tensor(temperature4)
+    device, dtype = temperature4.device, temperature4.dtype
+    # The prepared thermal state already owns a validated transfer on this
+    # device. Reconstructing it per wavelength chunk would revalidate every
+    # observer pixel and synchronize CUDA several times for no change.
+    local_transfer = (
+        transfer
+        if transfer.radius_rg.device == device and transfer.radius_rg.dtype == dtype
+        else transfer.to(device=device, dtype=dtype)
+    )
+    cacheable = (
+        spectral_cache is not None
+        and not torch.is_grad_enabled()
+        and not isinstance(source_redshift, torch.Tensor)
+        and not isinstance(color_correction, torch.Tensor)
+    )
+    key = (device, dtype) if cacheable else None
+    cached = spectral_cache.get(key) if cacheable else None
+    if cached is None:
+        redshift = torch.as_tensor(source_redshift, device=device, dtype=dtype)
+        color = torch.as_tensor(color_correction, device=device, dtype=dtype)
+        wavelengths = torch.as_tensor(
+            geometry.wavelengths_angstrom, device=device, dtype=dtype
+        )
+        pixel_area = geometry.pixel_scale_m[0] * geometry.pixel_scale_m[1]
+        spectral_inputs = (
+            wavelengths * 1.0e-10 / (1.0 + redshift),
+            color,
+            (1.0 + redshift).pow(-3),
+            torch.as_tensor(1.0 / pixel_area, device=device, dtype=dtype),
+        )
+        if cacheable:
+            ready = None
+            if device.type == "cuda":
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(device))
+            spectral_cache[key] = (spectral_inputs, ready)
+    else:
+        spectral_inputs, ready = cached
+        if ready is not None:
+            torch.cuda.current_stream(device).wait_event(ready)
+    arguments = (
+        temperature4,
+        local_transfer.gfactor,
+        local_transfer.solid_angle_sr,
+        local_transfer.hit,
+        *spectral_inputs,
+    )
+    compatible_runtime = (
+        runtime
+        if runtime is not None
+        and runtime.device.type == device.type
+        and (runtime.device.index is None or runtime.device.index == device.index)
+        and runtime.dtype == dtype
+        else None
+    )
+    return arguments, compatible_runtime
+
+
+def _transferred_brightness_from_temperature4(temperature4, **kwargs):
+    """Evaluate Planck brightness with the physical source's compiled runtime."""
+
+    arguments, compatible_runtime = _transferred_arguments(temperature4, **kwargs)
+    if compatible_runtime is None:
+        return _transferred_brightness_kernel(*arguments)
+    brightness, _ = run_tensor_kernel(
+        compatible_runtime,
+        "relativistic disk brightness",
+        _transferred_brightness_kernel,
+        *arguments,
+    )
+    return brightness
+
+
+def _transferred_flux_kernel(left, right, fraction, *arguments):
+    """Fuse Planck emission, map interpolation and both spatial reductions.
+
+    Compiling the entire contraction avoids writing a [time,y,x,wavelength]
+    brightness cube and a second equally large magnified cube to GPU memory.
+    """
+
+    temperature4, gfactor, solid_angle, hit, wavelength, color, dimming, area = (
+        arguments
+    )
+    # Make pixels the innermost axis and reduce small spatial tiles first.
+    # A single reduction of [time,y,x,band] makes Inductor materialize the
+    # entire brightness cube before summing it. This layout lets each tile
+    # evaluate Planck emission in registers and write only partial fluxes.
+    pixels = gfactor.numel()
+    tile = 64 if pixels % 64 == 0 else 1
+    brightness = _planck_brightness(
+        temperature4.reshape(temperature4.shape[0], 1, -1, tile),
+        gfactor.reshape(1, 1, -1, tile),
+        solid_angle.reshape(1, 1, -1, tile),
+        hit.reshape(1, 1, -1, tile),
+        wavelength[None, :, None, None],
+        color,
+        dimming,
+        area,
+    )
+    left = left.expand(-1, *gfactor.shape).reshape(left.shape[0], 1, -1, tile)
+    right = right.expand(-1, *gfactor.shape).reshape(right.shape[0], 1, -1, tile)
+    magnification = left + fraction[:, None, None, None] * (right - left)
+    return (brightness * magnification).sum(-1).sum(-1), brightness.sum(-1).sum(-1)
+
+
+def _transferred_flux_from_temperature4(temperature4, left, right, fraction, **kwargs):
+    """Integrate a thermal state without retaining its spatial brightness cube."""
+
+    arguments, runtime = _transferred_arguments(temperature4, **kwargs)
+    if runtime is not None and runtime.backend is Backend.TRITON:
+        fast_result = triton_thermal_flux(left, right, fraction, arguments, runtime)
+        if fast_result is not None:
+            return fast_result
+    if runtime is None:
+        return _transferred_flux_kernel(left, right, fraction, *arguments)
+    result, _ = run_tensor_kernel(
+        runtime,
+        "thermal spectral photometry",
+        _transferred_flux_kernel,
+        left,
+        right,
+        fraction,
+        *arguments,
+    )
+    return result
 
 
 @dataclass(frozen=True)
@@ -98,6 +245,12 @@ class TransferredThinDiskSource:
     radiative_efficiency: RadiativeEfficiency = None
     name: str = "transferred_thin_disk"
     is_time_static: bool = True
+    _brightness_cache: dict = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _validate_viscous_prescriptions(
@@ -141,7 +294,7 @@ class TransferredThinDiskSource:
         if scalar["temperature_slope_beta"] <= 0:
             raise ValueError("temperature_slope_beta must be positive")
 
-    def _frame(self, *, device, dtype) -> torch.Tensor:
+    def _uncached_frame(self, *, device, dtype) -> torch.Tensor:
         transfer = self.transfer.to(device=device, dtype=dtype)
         temperature4, _ = thin_disk_temperature4(
             transfer.radius_rg,
@@ -159,6 +312,25 @@ class TransferredThinDiskSource:
             source_redshift=self.source_redshift,
             color_correction=self.color_correction,
         )
+
+    def _frame(self, *, device, dtype) -> torch.Tensor:
+        device = torch.device(device)
+        key = (device.type, device.index, dtype)
+        if not torch.is_grad_enabled():
+            entry = self._brightness_cache.get(key)
+            if entry is not None:
+                frame, ready = entry
+                if ready is not None:
+                    torch.cuda.current_stream(device).wait_event(ready)
+                return frame
+        frame = self._uncached_frame(device=device, dtype=dtype)
+        if not torch.is_grad_enabled():
+            ready = None
+            if device.type == "cuda":
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(device))
+            self._brightness_cache[key] = (frame, ready)
+        return frame
 
     def support_radius_m(self, distances=None) -> float:
         """Return the circular disk support represented by the observer grid.

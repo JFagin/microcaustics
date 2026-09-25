@@ -123,6 +123,7 @@ class TaylorFarFieldApproximation:
         *,
         time_days: float = 0.0,
         star_chunk_size: int = 4096,
+        _field_override=None,
         _coefficient_override=None,
         _local_override=None,
         _defer_synchronize: bool = False,
@@ -140,6 +141,7 @@ class TaylorFarFieldApproximation:
         self.config = config
         self.time_days = float(time_days)
         self.star_chunk_size = int(star_chunk_size)
+        self._field_override = _field_override
         self._coefficient_override = _coefficient_override
         self._local_override = _local_override
         self._defer_synchronize = bool(_defer_synchronize)
@@ -149,7 +151,16 @@ class TaylorFarFieldApproximation:
     def _build(self) -> None:
         started = perf_counter()
         runtime = self.simulation.runtime
-        field = self.simulation.lens_state(self.time_days)
+        field = (
+            self.simulation.lens_state(self.time_days)
+            if self._field_override is None
+            else self._field_override
+        )
+        self.bulk_source_offset_uas = torch.tensor(
+            self.simulation.bulk_source_offset_uas(self.time_days),
+            device=runtime.device,
+            dtype=runtime.dtype,
+        )
         fov_y, fov_x = self.region.field_of_view_uas
         self.nx = max(1, int(self.config.cells_per_axis * math.sqrt(fov_x / fov_y)))
         self.ny = max(1, int(self.config.cells_per_axis * math.sqrt(fov_y / fov_x)))
@@ -545,8 +556,18 @@ class TaylorFarFieldApproximation:
         gamma1 = macro.shear * torch.cos(angle)
         gamma2 = macro.shear * torch.sin(angle)
         sheet = macro.smooth_convergence
-        source_x = (1.0 - sheet - gamma1) * x - gamma2 * y - alpha_x
-        source_y = -gamma2 * x + (1.0 - sheet + gamma1) * y - alpha_y
+        source_x = (
+            (1.0 - sheet - gamma1) * x
+            - gamma2 * y
+            - alpha_x
+            + self.bulk_source_offset_uas[0]
+        )
+        source_y = (
+            -gamma2 * x
+            + (1.0 - sheet + gamma1) * y
+            - alpha_y
+            + self.bulk_source_offset_uas[1]
+        )
         return source_x, source_y
 
     def jacobian_determinant(self, x_uas, y_uas) -> torch.Tensor:
@@ -783,7 +804,7 @@ def temporal_taylor_far_fields(
     local_overrides = {}
     batched_accumulator = False
     runtime = simulation.runtime
-    states = [simulation.lens_state(times[index]) for index in frame_indices]
+    states = simulation.lens_states(times)
     if (
         len(frame_indices) > 1
         and runtime.backend.value == "triton"
@@ -824,8 +845,23 @@ def temporal_taylor_far_fields(
                 exact_radius=membership_radius,
                 order=config.center_translation_order,
             )
-            counts_host = local_counts.detach().cpu()
-            overflow_host = local_overflow.detach().cpu()
+            # Only compact diagnostics and the required pack width belong on
+            # the host. Copying the complete frame-by-cell count table added a
+            # needless transfer and synchronization to every temporal batch.
+            frame_statistics = (
+                torch.stack(
+                    (
+                        local_counts.amax(dim=1).to(torch.float32),
+                        local_counts.to(torch.float32).mean(dim=1),
+                        local_overflow.reshape(len(states), -1)
+                        .any(dim=1)
+                        .to(torch.float32),
+                    ),
+                    dim=1,
+                )
+                .detach()
+                .cpu()
+            )
             nodes = int(config.nodes_per_cell_axis)
             offset_x = (
                 (torch.arange(nodes, device=runtime.device, dtype=runtime.dtype) + 0.5)
@@ -859,7 +895,7 @@ def temporal_taylor_far_fields(
                 index: (node_real[position], node_imag[position])
                 for position, index in enumerate(frame_indices)
             }
-            if bool(torch.any(overflow_host)):
+            if bool(torch.any(frame_statistics[:, 2])):
                 packed = _batched_local_star_packs(
                     simulation,
                     region,
@@ -867,7 +903,7 @@ def temporal_taylor_far_fields(
                     states,
                 )
             else:
-                maximum = max(1, int(counts_host.max()))
+                maximum = max(1, int(frame_statistics[:, 0].max()))
                 # The fused evaluator treats these packs as dense contiguous
                 # rows, so compact the fixed-capacity Triton workspace before
                 # handing it to the per-frame approximation objects.
@@ -880,8 +916,8 @@ def temporal_taylor_far_fields(
                         local_y[index],
                         local_mass[index],
                         local_counts[index],
-                        int(counts_host[index].max()),
-                        float(counts_host[index].to(torch.float64).mean()),
+                        int(frame_statistics[index, 0]),
+                        float(frame_statistics[index, 1]),
                     )
                     for index in range(len(states))
                 )
@@ -903,6 +939,7 @@ def temporal_taylor_far_fields(
             config,
             time_days=times[index],
             star_chunk_size=star_chunk_size,
+            _field_override=states[index],
             _coefficient_override=anchor_overrides.get(index),
             _local_override=local_overrides.get(index),
             _defer_synchronize=index in local_overrides,
@@ -992,22 +1029,41 @@ class BatchedTaylorFarFieldApproximation:
         maximum_local = max(int(item.local_x.shape[-1]) for item in self.far_fields)
         cells = self.nx * self.ny
         runtime = self.simulation.runtime
-        local_shape = (self.frame_count, cells, maximum_local)
-        self.local_x = torch.zeros(
-            local_shape, device=runtime.device, dtype=runtime.dtype
-        )
-        self.local_y = torch.zeros_like(self.local_x)
-        self.local_mass = torch.zeros_like(self.local_x)
-        for frame, item in enumerate(self.far_fields):
-            width = int(item.local_x.shape[-1])
-            self.local_x[frame, :, :width] = item.local_x
-            self.local_y[frame, :, :width] = item.local_y
-            self.local_mass[frame, :, :width] = item.local_mass
+        widths = tuple(int(item.local_x.shape[-1]) for item in self.far_fields)
+        if len(set(widths)) == 1:
+            # Production's fused coefficient builder already gives every
+            # frame the same compact local-star width. Stack those tensors in
+            # three launches instead of zero-filling buffers and issuing three
+            # indexed copies per frame.
+            self.local_x = torch.stack(
+                [item.local_x for item in self.far_fields]
+            ).contiguous()
+            self.local_y = torch.stack(
+                [item.local_y for item in self.far_fields]
+            ).contiguous()
+            self.local_mass = torch.stack(
+                [item.local_mass for item in self.far_fields]
+            ).contiguous()
+        else:
+            local_shape = (self.frame_count, cells, maximum_local)
+            self.local_x = torch.zeros(
+                local_shape, device=runtime.device, dtype=runtime.dtype
+            )
+            self.local_y = torch.zeros_like(self.local_x)
+            self.local_mass = torch.zeros_like(self.local_x)
+            for frame, item in enumerate(self.far_fields):
+                width = widths[frame]
+                self.local_x[frame, :, :width] = item.local_x
+                self.local_y[frame, :, :width] = item.local_y
+                self.local_mass[frame, :, :width] = item.local_mass
         self.coefficient_real = torch.stack(
             [item.coefficient_real for item in self.far_fields]
         ).contiguous()
         self.coefficient_imag = torch.stack(
             [item.coefficient_imag for item in self.far_fields]
+        ).contiguous()
+        self.bulk_source_offset_uas = torch.stack(
+            [item.bulk_source_offset_uas for item in self.far_fields]
         ).contiguous()
         runtime.synchronize()
         self.pack_seconds = perf_counter() - started

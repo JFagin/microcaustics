@@ -154,6 +154,8 @@ def test_dataset_tutorial_runs_without_scripts_or_saved_simulations(
         label_batch_size=1,
         curves_per_batch=2,
         source_setup_batch_size=1,
+        wavelength_samples=8,
+        wavelength_batch_size=4,
         labeled_curves_per_batch=1,
         scout_refresh_frames=10,
         count=2,
@@ -206,6 +208,9 @@ def test_dataset_tutorial_runs_without_scripts_or_saved_simulations(
         stars=mc.PointMassField([0.0], [0.0], [1e-8]),
     )
     namespace["systems"] = [system, system.with_seed(1)]
+    namespace["spectral_models"] = mc.QuasarSpectrumPopulation().sample(
+        2, seed=2026
+    )
     try:
         for index in (3, 5):
             exec(
@@ -246,6 +251,10 @@ def test_dataset_tutorial_runs_without_scripts_or_saved_simulations(
         )
         only_micro = namespace["microlensing_only_fluxes"][0]
         direct = system.light_curve(
+            bandpasses="lsst",
+            spectral_model=namespace["spectral_models"][0],
+            wavelength_samples=8,
+            wavelength_batch_size=4,
             duration_days=50,
             map_cadence_days=25,
             source_cadence_days=10,

@@ -37,23 +37,27 @@ def _warn_incomplete_explicit_motion(stars: PointMassField) -> None:
         (stars.velocity_x_uas_per_day, stars.velocity_y_uas_per_day),
         dim=1,
     )
-    mean = velocity.mean(dim=0)
-    centered = velocity - mean
+    bulk = torch.as_tensor(
+        stars.bulk_velocity_uas_per_day,
+        device=velocity.device,
+        dtype=velocity.dtype,
+    )
+    internal = velocity - bulk
     floating = torch.finfo(velocity.dtype)
     scale = max(float(velocity.abs().max()), floating.tiny)
     tolerance = 32.0 * floating.eps * scale
     missing = []
-    if float(mean.abs().max()) <= tolerance:
+    if float(bulk.abs().max()) <= tolerance:
         missing.append("bulk motion")
-    if len(stars) < 2 or float(centered.abs().max()) <= tolerance:
+    if len(stars) < 2 or float(internal.abs().max()) <= tolerance:
         missing.append("stellar velocity dispersion")
     if missing:
         warnings.warn(
             "Dynamic explicit point-mass velocities omit "
             + " and ".join(missing)
             + ". Explicit arrays are interpreted as final observer-frame "
-            "velocities. Include projected CMB, lens, and source motion in "
-            "their common drift, plus independent stellar motion, or use a "
+            "velocities. Identify their common drift with "
+            "bulk_velocity_uas_per_day, include independent stellar motion, or use a "
             "StellarPopulation with SkyProjectedKinematics.",
             IncompleteKinematicsWarning,
             stacklevel=4,
@@ -74,17 +78,30 @@ def _stellar_motion_metadata(stars: PointMassField) -> dict[str, object]:
         (stars.velocity_x_uas_per_day, stars.velocity_y_uas_per_day),
         dim=1,
     )
-    mean = velocity.mean(dim=0)
-    centered = velocity - mean
-    component_rms = torch.sqrt(torch.mean(centered.square(), dim=0))
-    return {
+    bulk = torch.as_tensor(
+        stars.bulk_velocity_uas_per_day,
+        device=velocity.device,
+        dtype=velocity.dtype,
+    )
+    internal = velocity - bulk
+    component_rms = torch.sqrt(torch.mean(internal.square(), dim=0))
+    metadata = {
         "has_motion": True,
         "coordinate_basis": "realization x/y",
-        "mean_velocity_uas_per_day": [float(value) for value in mean],
-        "component_rms_uas_per_day": [
-            float(value) for value in component_rms
+        "bulk_velocity_uas_per_day": [float(value) for value in bulk],
+        "realized_mean_velocity_uas_per_day": [
+            float(value) for value in velocity.mean(dim=0)
         ],
+        "component_rms_uas_per_day": [float(value) for value in component_rms],
     }
+    if stars.reflecting_boundary_radius_uas is not None:
+        metadata["reflecting_boundary_center_uas"] = list(
+            stars.reflecting_boundary_center_uas
+        )
+        metadata["reflecting_boundary_radius_uas"] = float(
+            stars.reflecting_boundary_radius_uas
+        )
+    return metadata
 
 
 def _rotate_cartesian_components(
@@ -125,6 +142,21 @@ def _rotate_point_mass_field(
             stars.velocity_y_uas_per_day,
             angle_deg,
         )
+    bulk_angle = math.radians(float(angle_deg))
+    bulk_cosine = math.cos(bulk_angle)
+    bulk_sine = math.sin(bulk_angle)
+    bulk_x_sky, bulk_y_sky = stars.bulk_velocity_uas_per_day
+    bulk_velocity = (
+        bulk_cosine * bulk_x_sky + bulk_sine * bulk_y_sky,
+        -bulk_sine * bulk_x_sky + bulk_cosine * bulk_y_sky,
+    )
+    boundary_center = None
+    if stars.reflecting_boundary_center_uas is not None:
+        center_y_sky, center_x_sky = stars.reflecting_boundary_center_uas
+        boundary_center = (
+            -bulk_sine * center_x_sky + bulk_cosine * center_y_sky,
+            bulk_cosine * center_x_sky + bulk_sine * center_y_sky,
+        )
     return PointMassField._from_einstein_radii(
         x,
         y,
@@ -132,6 +164,9 @@ def _rotate_point_mass_field(
         mass_solar=stars.mass_solar,
         velocity_x_uas_per_day=velocity_x,
         velocity_y_uas_per_day=velocity_y,
+        bulk_velocity_uas_per_day=bulk_velocity,
+        reflecting_boundary_center_uas=boundary_center,
+        reflecting_boundary_radius_uas=stars.reflecting_boundary_radius_uas,
     )
 
 

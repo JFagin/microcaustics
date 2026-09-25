@@ -308,6 +308,60 @@ def test_disabling_thermal_variability_preserves_mean_lamp_heating():
     assert mean.is_time_static and signal._sampled is None
 
 
+def test_high_level_linear_response_can_return_mean_companion():
+    distances = mc.LensingDistances.from_redshifts(0.5, 1.5)
+    geometry = mc.SourceGeometry(
+        4, field_of_view_uas=2.0, bands_angstrom={"g": 4800.0}
+    ).resolve(distances)
+    shape = geometry.shape
+    transfer = mc.ObserverTransfer(
+        torch.full(shape, 20.0), torch.ones(shape), torch.ones(shape),
+        torch.ones(shape, dtype=torch.bool),
+    )
+    source = mc.ThermalReprocessingSource(
+        geometry, transfer,
+        mc.TabulatedDrivingSignal(
+            torch.tensor([-2.0, 0.0, 1.0, 2.0]),
+            torch.tensor([1.0, 1.002, 1.005, 0.998]),
+        ),
+        torch.full(shape, 1e20),
+        torch.full(shape, 0.1),
+        black_hole_mass_solar=1e8, eddington_ratio=0.1,
+        spin=0.0, source_redshift=1.5,
+    )
+    system = small_system(source=source, duration_days=2.0)
+    exact = system.light_curve(
+        duration_days=2.0, map_cadence_days=1.0, source_cadence_days=0.5,
+        include_microlensing_only=True, **small_options(),
+    )
+    approximate = system.light_curve(
+        duration_days=2.0, map_cadence_days=1.0, source_cadence_days=0.5,
+        include_microlensing_only=True, source_evolution="linear_response",
+        response_delay_bin_days=0.05, **small_options(),
+    )
+    torch.testing.assert_close(approximate.flux, exact.flux, rtol=1e-3, atol=0)
+    torch.testing.assert_close(
+        approximate.microlensing_only_flux, exact.microlensing_only_flux,
+        rtol=1e-6, atol=0,
+    )
+    assert approximate.metadata["source_evolution"] == "linear_response"
+    caustics = mc.CausticConfig(
+        far_field_approx=mc.FarFieldApproxConfig(enabled=False),
+        minimum_determinant_sign_pixels=1,
+        anchor_count=3, gauge_count=3, minimum_alignment_gauges=1,
+    )
+    spectral = system.light_curve(
+        duration_days=2.0, map_cadence_days=1.0, source_cadence_days=0.5,
+        include_labels=True, include_microlensing_only=True,
+        bandpasses="lsst", wavelength_samples=16, wavelength_batch_size=8,
+        return_spectrum=True, source_evolution="linear_response",
+        caustics=caustics, **small_options(),
+    )
+    assert spectral.labels.times_days.numel() == 3
+    assert spectral.flux.shape == (5, 6)
+    assert spectral.spectrum.continuum_flux.shape[0] == 5
+
+
 def test_request_specific_cadence_driver_state_and_padded_band_batches():
     distances = mc.LensingDistances.from_redshifts(0.5, 1.5)
     bands = {f"b{index}": 4000.0 + 500.0 * index for index in range(5)}
@@ -1075,18 +1129,19 @@ def test_system_constructors_no_longer_accept_drivers():
         )
 
 
-def test_kerr_disk_driver_is_optional_and_invalid_driver_is_rejected():
+@pytest.mark.parametrize("disk_model", [mc.KerrDiskModel, mc.ThinDiskModel])
+def test_disk_driver_is_optional_and_invalid_driver_is_rejected(disk_model):
     settings = dict(
         black_hole_mass_solar=1e8, eddington_ratio=0.1, bands_angstrom={"g": 4800}
     )
-    disk = mc.KerrDiskModel(**settings)
+    disk = disk_model(**settings)
     assert disk.driving_signal is None
     with patch.object(mc.MicrolensingSystem, "_realize_for_times") as realize:
         with pytest.raises(ValueError, match="configured driving signal"):
             small_system(source=disk).light_curve((0,), apply_driving_signal=True)
         realize.assert_not_called()
     with pytest.raises(TypeError, match="amplitudes and metadata"):
-        mc.KerrDiskModel(**settings, driving_signal=lambda t: t)
+        disk_model(**settings, driving_signal=lambda t: t)
 
 
 def test_shared_unseeded_multi_image_driver_survives_delay_updates():

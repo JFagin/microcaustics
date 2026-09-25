@@ -7,7 +7,13 @@ from pathlib import Path
 
 import numpy as np
 
-from ._common import add_scale_bar, hide_image_axes, panel_colorbar
+from ._common import (
+    add_scale_bar,
+    band_colors,
+    finish_axis,
+    hide_image_axes,
+    panel_colorbar,
+)
 
 
 def save_fixed_palette_gif(
@@ -148,6 +154,194 @@ def save_fixed_palette_gif(
         optimize=False,
         disposal=2,
     )
+    return destination
+
+
+def plot_bandpass_background(
+    axis, bandpasses="lsst", *, alpha: float = 0.10, show_axis: bool = True
+):
+    """Draw faint observed-frame response curves behind a spectrum axis.
+
+    The right axis shows dimensionless throughput, independent of the flux
+    scale on the left. Return that axis so callers can adjust or inspect it.
+    """
+
+    from ..bandpasses import resolve_bandpasses
+
+    resolved = resolve_bandpasses(bandpasses)
+    colors = band_colors(resolved.names)
+    response_axis = axis.twinx()
+    for bandpass in resolved.bandpasses:
+        wavelength = np.asarray(bandpass.wavelength_angstrom)
+        response = np.asarray(bandpass.response)
+        color = colors[bandpass.name]
+        response_axis.fill_between(
+            wavelength, response, color=color, alpha=alpha, linewidth=0
+        )
+        response_axis.plot(wavelength, response, color=color, alpha=0.35, lw=0.7)
+    response_axis.set(ylim=(0.0, 1.05), ylabel="Filter throughput")
+    response_axis.set_yticks((0.0, 0.5, 1.0))
+    response_axis.tick_params(axis="y", colors="0.55", labelsize=8)
+    response_axis.yaxis.label.set_color("0.55")
+    response_axis.spines["right"].set_color("0.75")
+    response_axis.set_zorder(axis.get_zorder() - 1)
+    axis.patch.set_alpha(0.0)
+    if not show_axis:
+        response_axis.set_yticks(())
+        response_axis.set_ylabel("")
+        response_axis.spines["right"].set_visible(False)
+    return response_axis
+
+
+def animate_spectrum_and_photometry(
+    light_curve,
+    path: str | Path,
+    *,
+    max_frames: int = 48,
+    fps: float = 8.0,
+    wavelength_limits: tuple[float, float] | None = (3000.0, 11000.0),
+    figsize: tuple[float, float] = (8.4, 6.2),
+    bandpasses=None,
+) -> Path:
+    """Animate one retained spectrum above its synchronized light curves.
+
+    The input must be a :class:`~microcaustics.LightCurve` produced with
+    ``return_spectrum=True``. At most ``max_frames`` evenly spaced epochs are
+    rendered, while the lower panel always shows the full photometric cadence.
+    Axis limits and the GIF palette remain fixed across the animation.
+    ``bandpasses`` optionally adds faint response curves behind the spectrum.
+    """
+
+    import matplotlib.pyplot as plt
+
+    spectrum = light_curve.spectrum
+    if spectrum is None:
+        raise ValueError("light_curve must contain a retained spectrum")
+    if not isinstance(max_frames, int) or isinstance(max_frames, bool) or max_frames < 1:
+        raise ValueError("max_frames must be a positive integer")
+    times = spectrum.times_days.detach().cpu().numpy()
+    curve_times = light_curve.times_days.detach().cpu().numpy()
+    wavelengths = spectrum.wavelengths_angstrom.detach().cpu().numpy()
+    total = spectrum.total_flux.detach().cpu().numpy()
+    continuum = spectrum.continuum_flux.detach().cpu().numpy()
+    microlensing_only = (
+        None
+        if spectrum.microlensing_only_continuum_flux is None
+        else spectrum.microlensing_only_continuum_flux.detach().cpu().numpy()
+    )
+    magnitudes = light_curve.magnitude.detach().cpu().numpy()
+    microlensing_magnitudes = (
+        None
+        if light_curve.microlensing_only_magnitude is None
+        else light_curve.microlensing_only_magnitude.detach().cpu().numpy()
+    )
+    frame_count = min(max_frames, len(times))
+    frame_indices = np.unique(
+        np.linspace(0, len(times) - 1, frame_count).round().astype(int)
+    )
+    selected = total[:, (
+        np.ones_like(wavelengths, dtype=bool)
+        if wavelength_limits is None
+        else (wavelengths >= wavelength_limits[0])
+        & (wavelengths <= wavelength_limits[1])
+    )]
+    if selected.size == 0:
+        raise ValueError("wavelength_limits do not overlap the retained spectrum")
+    spectrum_max = 1.08e3 * float(np.nanpercentile(selected, 99.9))
+    magnitude_values = (
+        magnitudes.ravel()
+        if microlensing_magnitudes is None
+        else np.concatenate((magnitudes.ravel(), microlensing_magnitudes.ravel()))
+    )
+    magnitude_pad = max(0.05, 0.04 * float(np.ptp(magnitude_values)))
+    magnitude_limits = (
+        float(np.nanmin(magnitude_values) - magnitude_pad),
+        float(np.nanmax(magnitude_values) + magnitude_pad),
+    )
+    colors = band_colors(light_curve.band_names)
+
+    figure, (spectrum_axis, curve_axis) = plt.subplots(
+        2,
+        1,
+        figsize=figsize,
+        gridspec_kw={"height_ratios": (1.0, 0.82)},
+    )
+    total_line, = spectrum_axis.plot(
+        wavelengths, 1.0e3 * total[0], color="0.12", lw=1.7, label="Total"
+    )
+    continuum_line, = spectrum_axis.plot(
+        wavelengths,
+        1.0e3 * continuum[0],
+        color="#3569a8",
+        ls="--",
+        lw=1.35,
+        label="Continuum",
+    )
+    microlensing_line = None
+    if microlensing_only is not None:
+        microlensing_line, = spectrum_axis.plot(
+            wavelengths,
+            1.0e3 * microlensing_only[0],
+            color="0.60",
+            lw=1.0,
+            label="Mean-driver continuum",
+        )
+    spectrum_axis.set(
+        xlim=wavelength_limits,
+        ylim=(0.0, spectrum_max),
+        xlabel=r"Observed wavelength [$\AA$]",
+        ylabel=r"Observed $F_\nu$ [mJy]",
+    )
+    if bandpasses is not None:
+        plot_bandpass_background(spectrum_axis, bandpasses)
+    spectrum_axis.legend(loc="upper right", frameon=True)
+    finish_axis(spectrum_axis)
+
+    for band_index, band in enumerate(light_curve.band_names):
+        curve_axis.plot(
+            curve_times,
+            magnitudes[:, band_index],
+            color=colors[band],
+            lw=1.1,
+            label=band,
+        )
+        if microlensing_magnitudes is not None:
+            curve_axis.plot(
+                curve_times,
+                microlensing_magnitudes[:, band_index],
+                color=colors[band],
+                ls="--",
+                lw=0.9,
+                alpha=0.8,
+            )
+    marker = curve_axis.axvline(times[0], color="0.15", ls=":", lw=1.2)
+    curve_axis.set(
+        xlim=(float(curve_times[0]), float(curve_times[-1])),
+        ylim=magnitude_limits[::-1],
+        xlabel="Observer time [days]",
+        ylabel="brightness [mag]",
+    )
+    curve_axis.legend(loc="upper right", ncol=3, frameon=True, fontsize=8)
+    finish_axis(curve_axis)
+    figure.tight_layout()
+
+    frames = []
+    for index in frame_indices:
+        total_line.set_ydata(1.0e3 * total[index])
+        continuum_line.set_ydata(1.0e3 * continuum[index])
+        if microlensing_line is not None:
+            microlensing_line.set_ydata(1.0e3 * microlensing_only[index])
+        marker.set_xdata([times[index], times[index]])
+        spectrum_axis.set_title(f"Evolving observed spectrum: t = {times[index]:.0f} days")
+        figure.canvas.draw()
+        frames.append(np.asarray(figure.canvas.buffer_rgba())[..., :3].copy())
+    destination = save_fixed_palette_gif(
+        frames,
+        path,
+        fps=fps,
+        dither=False,
+    )
+    plt.close(figure)
     return destination
 
 

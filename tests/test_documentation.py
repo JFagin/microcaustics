@@ -237,8 +237,8 @@ class DocumentationIntegrityTests(unittest.TestCase):
                 self.assertNotIn("dynamic=True", text)
                 self.assertNotIn("dynamic=False", text)
 
-    def test_distributed_notebooks_do_not_embed_generated_outputs(self) -> None:
-        """Keep the source distribution small and execution-environment neutral."""
+    def test_distributed_notebooks_embed_executed_visual_outputs(self) -> None:
+        """Show finished tutorials on GitHub without oversized notebook files."""
 
         notebooks = tuple((PACKAGE_ROOT / "examples" / "notebooks").rglob("*.ipynb"))
         self.assertGreaterEqual(len(notebooks), 16)
@@ -251,14 +251,23 @@ class DocumentationIntegrityTests(unittest.TestCase):
                     if cell.get("cell_type") == "code"
                 ]
                 self.assertTrue(code_cells)
-                self.assertTrue(
-                    all(cell.get("execution_count") is None for cell in code_cells),
-                    f"{path.name} contains saved execution counts",
-                )
+                self.assertTrue(all(cell.get("execution_count") is not None for cell in code_cells))
                 outputs = [
                     output for cell in code_cells for output in cell.get("outputs", ())
                 ]
-                self.assertFalse(outputs, f"{path.name} contains saved outputs")
+                self.assertFalse(
+                    any(output.get("output_type") == "error" for output in outputs),
+                    f"{path.name} contains a saved execution error",
+                )
+                self.assertTrue(
+                    any(
+                        "image/png" in output.get("data", {})
+                        or "image/gif" in output.get("data", {})
+                        for output in outputs
+                    ),
+                    f"{path.name} has no embedded visual output",
+                )
+                self.assertLess(path.stat().st_size, 100_000_000)
 
     def test_release_notebook_sequence_is_complete(self) -> None:
         root = PACKAGE_ROOT / "examples" / "notebooks"

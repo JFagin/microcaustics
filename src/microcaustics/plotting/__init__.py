@@ -13,7 +13,12 @@ from ._common import (
     panel_colorbar,
     publication_style,
 )
-from .animations import animate_standardized_source_bands, save_fixed_palette_gif
+from .animations import (
+    animate_spectrum_and_photometry,
+    animate_standardized_source_bands,
+    plot_bandpass_background,
+    save_fixed_palette_gif,
+)
 from .caustics import plot_anchor_gauge, plot_caustics
 from .datasets import plot_labeled_map_gallery, plot_light_curve_dataset
 from .light_curves import (
@@ -100,5 +105,7 @@ __all__ = [
     "hide_image_axes",
     "panel_colorbar",
     "save_fixed_palette_gif",
+    "animate_spectrum_and_photometry",
     "animate_standardized_source_bands",
+    "plot_bandpass_background",
 ]

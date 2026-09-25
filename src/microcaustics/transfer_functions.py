@@ -11,7 +11,7 @@ import torch
 from .config import DynamicConfig, IPMConfig, IRSConfig
 from .geometry import PlaneGrid, PlaneRegion
 from .lens import LensingDistances
-from .photometry import _sample_map, _source_offsets_uas
+from .photometry import _sample_map, _source_is_map_aligned, _source_offsets_uas
 from .results import (
     MagnificationMap,
     TimingBreakdown,
@@ -137,23 +137,35 @@ def microlensed_mean_response_delays_batch(
     device, dtype = maps[0].values.device, maps[0].values.dtype
     if any(item.values.device != device or item.values.dtype != dtype for item in maps):
         raise ValueError("all magnification maps must share device and dtype")
-    offset_x, offset_y = _source_offsets_uas(
+    aligned = all(center == (0.0, 0.0) for center in centers) and all(
+        item.grid == maps[0].grid for item in maps
+    )
+    aligned = aligned and _source_is_map_aligned(
         source,
         distances,
-        device=device,
-        dtype=dtype,
+        None,
+        maps[0].grid,
     )
-    sampled = torch.stack(
-        [
-            _sample_map(
-                magnification_map,
-                offset_x + float(center[0]),
-                offset_y + float(center[1]),
-                strict_coverage=strict_coverage,
-            )
-            for magnification_map, center in zip(maps, centers, strict=True)
-        ]
-    )
+    if aligned:
+        sampled = torch.stack([item.values for item in maps])
+    else:
+        offset_x, offset_y = _source_offsets_uas(
+            source,
+            distances,
+            device=device,
+            dtype=dtype,
+        )
+        sampled = torch.stack(
+            [
+                _sample_map(
+                    magnification_map,
+                    offset_x + float(center[0]),
+                    offset_y + float(center[1]),
+                    strict_coverage=strict_coverage,
+                )
+                for magnification_map, center in zip(maps, centers, strict=True)
+            ]
+        )
     batched = getattr(source, "batched_mean_response_delays", None)
     if callable(batched):
         return batched(

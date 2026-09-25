@@ -40,7 +40,8 @@ class WeisenbachExternalComparisonTests(unittest.TestCase):
     def test_adapter_contract_preserves_the_fixed_aperture_problem(self) -> None:
         self.assertGreaterEqual(int(self.data["external_benchmark_schema_version"]), 6)
         self.assertEqual(
-            str(self.data["luke_adapter_contract"]), "fixed_aperture_recenter_v1"
+            str(self.data["luke_adapter_contract"]),
+            "fixed_aperture_pattern_translation_v2",
         )
         self.assertEqual(
             str(self.data["starfile_format"]), "luke_binary_fixed_aperture"

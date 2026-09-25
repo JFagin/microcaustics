@@ -152,6 +152,212 @@ def test_standalone_reverberation_transfer_requires_no_lens():
     assert torch.isfinite(result.values).all()
 
 
+def test_reprocessing_brightness_reuses_static_evaluation_tensors(monkeypatch):
+    model = mc.ThinDiskModel(
+        black_hole_mass_solar=1e8,
+        eddington_ratio=0.1,
+        source_grid_shape=16,
+        bands_angstrom={"g": 4800, "i": 7500},
+        driving_signal=mc.TabulatedDrivingSignal(
+            [-1000.0, 1000.0],
+            [1.0, 1.0],
+        ),
+    )
+    source = model.pixelate(
+        source_redshift=1.5,
+        H0=70,
+        Om0=0.3,
+        runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+    )
+    calls = 0
+    original = type(source)._static_temperature4
+
+    def counted(instance, *, device, dtype):
+        nonlocal calls
+        calls += 1
+        return original(instance, device=device, dtype=dtype)
+
+    monkeypatch.setattr(type(source), "_static_temperature4", counted)
+    with torch.no_grad():
+        source.brightness([-1.0, 0.0])
+        source.brightness([1.0, 2.0])
+    assert calls == 1
+    assert len(source._evaluation_cache) == 1
+
+
+def test_newtonian_disk_exposes_the_full_reverberation_interface():
+    driver = mc.TabulatedDrivingSignal(
+        [-100.0, 0.0, 100.0],
+        [0.8, 1.2, 0.8],
+    )
+    model = mc.ThinDiskModel(
+        black_hole_mass_solar=1e8,
+        eddington_ratio=0.1,
+        bands_angstrom={"g": 4800, "i": 7500},
+        source_grid_shape=32,
+        spin=0.4,
+        inclination_deg=35.0,
+        position_angle_deg=20.0,
+        lamp_fraction=0.1,
+        corona_height_above_isco_rg=15.0,
+        driving_signal=driver,
+    )
+    source = model.pixelate(
+        source_redshift=1.5,
+        H0=70,
+        Om0=0.3,
+        runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+    )
+    assert isinstance(source, mc.ThermalReprocessingSource)
+    assert source.heating_metadata["model"] == "axis_newtonian_lamppost"
+    brightness = source.brightness([-1.0, 0.0, 1.0])
+    assert brightness.shape == (3, 32, 32, 2)
+    assert torch.isfinite(brightness).all()
+    steady = mc.steady_mean_response_delays(source)
+    magnification = torch.stack(
+        (torch.ones((32, 32)), torch.linspace(0.5, 1.5, 32).expand(32, -1))
+    )
+    microlensed = source.batched_mean_response_delays(magnification=magnification)
+    assert steady.shape == (2,)
+    assert microlensed.shape == (2, 2)
+    assert torch.isfinite(microlensed).all()
+    torch.testing.assert_close(microlensed[0], steady)
+    maximum_delay = source.delay_days[torch.isfinite(source.delay_days)].max()
+    edges = torch.linspace(0.0, float(maximum_delay) + 1.0, 65)
+    transfer = source.batched_transfer_function(edges, magnification=magnification)
+    assert transfer.shape == (2, 64, 2)
+    torch.testing.assert_close(transfer.sum(dim=1), torch.ones((2, 2)))
+
+
+def test_straight_screen_disks_approach_the_kerr_weak_field_image():
+    runtime = mc.RuntimeConfig(
+        device="cpu",
+        backend="torch-eager",
+        dtype=torch.float64,
+    )
+    distances = mc.LensingDistances.from_redshifts(
+        0.3, 1.5, H0=70, Om0=0.3, device="cpu", dtype=torch.float64
+    )
+
+    def normalized_image(source):
+        image = source.brightness([0.0], dtype=torch.float64)[0, ..., 0]
+        return image / image.sum()
+
+    for inclination_deg in (1.0e-2, 45.0):
+        settings = dict(
+            black_hole_mass_solar=1.0e8,
+            eddington_ratio=0.1,
+            bands_angstrom={"long": 20_000.0},
+            source_redshift=1.5,
+            spin=0.0,
+            inclination_deg=inclination_deg,
+            position_angle_deg=0.0,
+            source_grid_shape=96,
+            enclosed_flux_fraction=0.99,
+            source_margin=1.05,
+        )
+        kerr = mc.KerrDiskModel(**settings, compile_solver=False).pixelate(
+            distances, runtime=runtime
+        )
+        grid = mc.PlaneGrid(
+            kerr.geometry.shape,
+            tuple(kerr.transfer.metadata["source_field_of_view_uas"]),
+        )
+        straight = {
+            relativity: mc.ThinDiskModel(
+                **settings,
+                relativity=relativity,
+            ).pixelate(distances, grid=grid, runtime=runtime)
+            for relativity in ("none", "approximate")
+        }
+        reference = normalized_image(kerr)
+        errors = {
+            name: float((normalized_image(source) - reference).abs().sum())
+            for name, source in straight.items()
+        }
+        if inclination_deg < 1.0:
+            assert errors["none"] < 0.01
+            assert errors["approximate"] < 0.01
+        else:
+            assert errors["none"] < 0.10
+            assert errors["approximate"] < 0.02
+            assert errors["approximate"] < 0.25 * errors["none"]
+
+
+def test_kerr_and_straight_screen_reprocessing_agree_in_controlled_limit():
+    runtime = mc.RuntimeConfig(
+        device="cpu",
+        backend="torch-eager",
+        dtype=torch.float64,
+    )
+    distances = mc.LensingDistances.from_redshifts(
+        0.3, 1.5, H0=70, Om0=0.3, device="cpu", dtype=torch.float64
+    )
+    driver = mc.TabulatedDrivingSignal([-10_000.0, 10_000.0], [1.0, 1.0])
+    settings = dict(
+        black_hole_mass_solar=1.0e8,
+        eddington_ratio=0.1,
+        bands_angstrom={"near": 3000.0, "middle": 5000.0, "far": 10_000.0},
+        source_redshift=1.5,
+        spin=0.0,
+        inclination_deg=1.0e-2,
+        position_angle_deg=0.0,
+        source_grid_shape=96,
+        enclosed_flux_fraction=0.95,
+        source_margin=1.05,
+        lamp_fraction=0.1,
+        corona_height_above_isco_rg=100.0,
+        driving_signal=driver,
+    )
+    kerr = mc.KerrDiskModel(
+        **settings,
+        compile_solver=False,
+        lamppost_nalpha=1024,
+        lamppost_radial_bins=512,
+    ).pixelate(distances, runtime=runtime)
+    grid = mc.PlaneGrid(
+        kerr.geometry.shape,
+        tuple(kerr.transfer.metadata["source_field_of_view_uas"]),
+    )
+    straight_sources = tuple(
+        mc.ThinDiskModel(**settings, relativity=relativity).pixelate(
+            distances,
+            grid=grid,
+            runtime=runtime,
+        )
+        for relativity in ("none", "approximate")
+    )
+    sources = (kerr, *straight_sources)
+    maximum_delay = max(
+        float(source.delay_days[torch.isfinite(source.delay_days)].max())
+        for source in sources
+    )
+    edges = torch.linspace(0.0, maximum_delay + 1.0, 257, dtype=torch.float64)
+    kerr_lags = kerr.mean_response_delays()
+    kerr_differential = kerr_lags - kerr_lags[0]
+    kerr_transfer = kerr.transfer_function(edges)
+    torch.testing.assert_close(
+        kerr_transfer.sum(dim=0),
+        torch.ones(3, dtype=torch.float64),
+    )
+    for source in straight_sources:
+        lags = source.mean_response_delays()
+        differential = lags - lags[0]
+        assert bool(torch.all(differential[1:] > 0.0))
+        relative_error = (
+            (differential[1:] - kerr_differential[1:]).abs()
+            / kerr_differential[1:]
+        )
+        assert float(relative_error.max()) < 0.25
+        transfer = source.transfer_function(edges)
+        torch.testing.assert_close(
+            transfer.sum(dim=0),
+            torch.ones(3, dtype=torch.float64),
+        )
+        cdf_error = (transfer.cumsum(0) - kerr_transfer.cumsum(0)).abs()
+        assert float(cdf_error.max()) < 0.15
+
+
 def test_batched_kerr_source_setup_matches_serial_sources():
     runtime = mc.RuntimeConfig(device="cpu", backend="torch-eager", dtype=torch.float32)
     distances = mc.LensingDistances.from_redshifts(
@@ -182,6 +388,36 @@ def test_batched_kerr_source_setup_matches_serial_sources():
         torch.testing.assert_close(source.brightness([0]), reference.brightness([0]))
     with pytest.raises(ValueError, match="batch_size"):
         mc.batched_pixelate_sources(models, distances, batch_size=0, runtime=runtime)
+
+
+def test_wide_kerr_disk_places_coordinate_observer_outside_emission():
+    runtime = mc.RuntimeConfig(device="cpu", backend="torch-eager", dtype=torch.float32)
+    distances = mc.LensingDistances.from_redshifts(
+        0.3, 1.301, device="cpu", dtype=torch.float32
+    )
+    model = mc.KerrDiskModel(
+        black_hole_mass_solar=4.8e7,
+        eddington_ratio=0.34,
+        bands_angstrom={"red": 10990.0},
+        spin=-0.277,
+        inclination_deg=33.28,
+        source_grid_shape=64,
+        compile_solver=False,
+        lamppost_nalpha=32,
+        lamppost_radial_bins=32,
+        driving_signal=mc.TabulatedDrivingSignal([-100.0, 100.0], [1.0, 1.0]),
+    )
+    serial = model.pixelate(distances, runtime=runtime)
+    batched = mc.batched_pixelate_sources(
+        (model, replace(model, spin=-0.2)), distances, batch_size=2, runtime=runtime
+    )
+    for source in (serial, *batched):
+        metadata = source.transfer.metadata
+        assert metadata["disk_outer_rg"] > 3000.0
+        assert metadata["observer_radius_rg"] > metadata["disk_outer_rg"]
+        assert bool(source.transfer.hit.any())
+        assert bool(torch.isfinite(source.delay_days[source.transfer.hit]).all())
+    torch.testing.assert_close(serial.delay_days, batched[0].delay_days, equal_nan=True)
 
 
 def test_system_source_setup_batch_counts_one_shared_multi_image_disk():

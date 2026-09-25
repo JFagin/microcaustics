@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ..config import FarFieldApproxConfig
+from ..config import Backend, FarFieldApproxConfig
 from ..geometry import PlaneGrid
 from ..results import CausticField, TimingBreakdown
 from ..runtime import warn_backend_fallback
@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 def _extract_zero_segments(
     determinant: torch.Tensor,
     lens_grid: PlaneGrid,
+    *,
+    strict_backend: bool = False,
 ) -> tuple[torch.Tensor, str]:
     """Use compact CUDA marching squares with an exact portable fallback."""
 
@@ -37,7 +39,15 @@ def _extract_zero_segments(
                     "triton_compact",
                 )
         except Exception as error:
+            if strict_backend:
+                raise RuntimeError(
+                    "strict Triton backend required for complete-field marching squares"
+                ) from error
             warn_backend_fallback("Triton complete-field marching squares", error)
+        if strict_backend:
+            raise RuntimeError(
+                "strict Triton backend required for complete-field marching squares"
+            )
     x_grid, y_grid = lens_grid.mesh(
         device=determinant.device,
         dtype=determinant.dtype,
@@ -76,7 +86,11 @@ def direct_caustic_field(
         ray_chunk_size=ray_chunk_size,
     )
     determinant_finished = perf_counter()
-    critical, rasterizer = _extract_zero_segments(determinant, lens_grid)
+    critical, rasterizer = _extract_zero_segments(
+        determinant,
+        lens_grid,
+        strict_backend=runtime.strict_backend and runtime.backend is Backend.TRITON,
+    )
     marching_finished = perf_counter()
     if critical.numel():
         source_x, source_y, _ = raytrace_direct(
@@ -178,7 +192,20 @@ def far_field_caustic_field(
                 )
                 regular_grid_triton = True
         except Exception as error:
+            if runtime.strict_backend and runtime.backend is Backend.TRITON:
+                raise RuntimeError(
+                    "strict Triton backend required for regular-grid determinant"
+                ) from error
             warn_backend_fallback("Triton regular-grid determinant", error)
+    if (
+        runtime.strict_backend
+        and runtime.backend is Backend.TRITON
+        and config.taylor_order == 4
+        and regular_grid_query is None
+    ):
+        raise RuntimeError(
+            "strict Triton backend required for regular-grid determinant"
+        )
     if regular_grid_query is not None and ray_chunk_size is None:
         # Grid coordinates are loaded from two short axes inside the kernel,
         # so one full launch requires no point-sized coordinate workspace.
@@ -196,6 +223,10 @@ def far_field_caustic_field(
                 )
                 continue
             except Exception as error:
+                if runtime.strict_backend and runtime.backend is Backend.TRITON:
+                    raise RuntimeError(
+                        "strict Triton backend required for regular-grid determinant"
+                    ) from error
                 warn_backend_fallback("Triton regular-grid determinant", error)
                 regular_grid_query = None
                 regular_grid_triton = False
@@ -207,7 +238,11 @@ def far_field_caustic_field(
         determinant[start:stop] = approximation.jacobian_determinant(x, y)
     determinant = determinant.reshape(ny, nx)
     determinant_finished = perf_counter()
-    critical, rasterizer = _extract_zero_segments(determinant, lens_grid)
+    critical, rasterizer = _extract_zero_segments(
+        determinant,
+        lens_grid,
+        strict_backend=runtime.strict_backend and runtime.backend is Backend.TRITON,
+    )
     marching_finished = perf_counter()
     if critical.numel():
         source_x, source_y = approximation.raytrace(

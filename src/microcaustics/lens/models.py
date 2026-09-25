@@ -83,17 +83,27 @@ class LensingDistances(_SourceCoordinates):
     source_redshift: float | None = None
 
     def __post_init__(self) -> None:
-        if self.lens_m <= 0 or self.source_m <= 0 or self.lens_to_source_m <= 0:
-            raise ValueError("all angular-diameter distances must be positive")
-        if self.lens_redshift is not None and self.lens_redshift < 0:
-            raise ValueError("lens_redshift must be non-negative")
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in (self.lens_m, self.source_m, self.lens_to_source_m)
+        ):
+            raise ValueError(
+                "all angular-diameter distances must be finite and positive"
+            )
+        if self.lens_redshift is not None and (
+            not math.isfinite(self.lens_redshift) or self.lens_redshift < 0
+        ):
+            raise ValueError("lens_redshift must be finite and non-negative")
         if self.source_redshift is not None:
             if self.lens_redshift is None:
                 raise ValueError(
                     "source_redshift requires lens_redshift so their ordering is known"
                 )
-            if self.source_redshift <= self.lens_redshift:
-                raise ValueError("source_redshift must exceed lens_redshift")
+            if (
+                not math.isfinite(self.source_redshift)
+                or self.source_redshift <= self.lens_redshift
+            ):
+                raise ValueError("source_redshift must be finite and exceed lens_redshift")
 
     @classmethod
     def from_redshifts(
@@ -120,8 +130,16 @@ class LensingDistances(_SourceCoordinates):
         arbitrary expansion histories and independent validation.
         """
 
-        if lens_redshift < 0 or source_redshift <= lens_redshift:
-            raise ValueError("source_redshift must exceed a non-negative lens_redshift")
+        if (
+            not math.isfinite(lens_redshift)
+            or not math.isfinite(source_redshift)
+            or lens_redshift < 0
+            or source_redshift <= lens_redshift
+        ):
+            raise ValueError(
+                "source_redshift must be finite and exceed a finite, "
+                "non-negative lens_redshift"
+            )
         if cosmology is None:
             if not math.isfinite(float(H0)) or float(H0) <= 0.0:
                 raise ValueError("H0 must be positive and finite")
@@ -222,8 +240,8 @@ class LensingDistances(_SourceCoordinates):
         """Convert point-lens masses in solar units to angular Einstein radii."""
 
         mass = torch.as_tensor(mass_solar, device=device, dtype=dtype)
-        if bool(torch.any(mass <= 0)):
-            raise ValueError("point-lens masses must be positive")
+        if bool(torch.any(~torch.isfinite(mass) | (mass <= 0))):
+            raise ValueError("point-lens masses must be finite and positive")
         distance_factor = self.lens_to_source_m / (self.lens_m * self.source_m)
         radius_rad = torch.sqrt(
             (4.0 * _GRAVITATIONAL_CONSTANT_SI * _SOLAR_MASS_KG / _SPEED_OF_LIGHT_SI**2)
@@ -371,10 +389,10 @@ class MacroLens:
             "smooth_matter_fraction",
             float(self.smooth_matter_fraction),
         )
-        if self.convergence < 0:
-            raise ValueError("convergence must be non-negative")
-        if self.shear < 0:
-            raise ValueError("shear must be non-negative")
+        if not math.isfinite(self.convergence) or self.convergence < 0:
+            raise ValueError("convergence must be finite and non-negative")
+        if not math.isfinite(self.shear) or self.shear < 0:
+            raise ValueError("shear must be finite and non-negative")
         if not math.isfinite(self.shear_angle_deg):
             raise ValueError("shear_angle_deg must be finite")
         if not 0.0 <= self.smooth_matter_fraction <= 1.0:
@@ -399,12 +417,88 @@ class MacroLens:
         return self.convergence - self.smooth_convergence
 
 
+def _evolve_reflecting_circle(
+    x0: torch.Tensor,
+    y0: torch.Tensor,
+    velocity_x: torch.Tensor,
+    velocity_y: torch.Tensor,
+    time_days: torch.Tensor,
+    parameters: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evolve circular billiard trajectories, then add coherent translation.
+
+    The closed-form billiard map avoids a data-dependent reflection loop. It
+    computes the first boundary encounter, the conserved chord crossing time,
+    and the number of subsequent reflections analytically for every star.
+    """
+
+    bulk_x, bulk_y, center_x, center_y, radius = parameters.unbind()
+    signed_time = time_days.reshape(-1, 1)
+    duration = torch.abs(signed_time)
+    direction = torch.where(signed_time < 0.0, -1.0, 1.0)
+    internal_x = direction * (velocity_x[None, :] - bulk_x)
+    internal_y = direction * (velocity_y[None, :] - bulk_y)
+    relative_x = x0[None, :] - center_x
+    relative_y = y0[None, :] - center_y
+    speed2 = internal_x.square() + internal_y.square()
+    tiny = torch.finfo(x0.dtype).tiny
+    safe_speed2 = speed2.clamp_min(tiny)
+    speed = torch.sqrt(safe_speed2)
+
+    radial_velocity = 2.0 * (relative_x * internal_x + relative_y * internal_y)
+    radial_offset = relative_x.square() + relative_y.square() - radius.square()
+    discriminant = (
+        radial_velocity.square() - 4.0 * safe_speed2 * radial_offset
+    ).clamp_min(0.0)
+    first_hit = (-radial_velocity + torch.sqrt(discriminant)) / (2.0 * safe_speed2)
+    moving = speed2 > tiny
+    collides = moving & (first_hit < duration)
+
+    hit_x = relative_x + first_hit * internal_x
+    hit_y = relative_y + first_hit * internal_y
+    unit_x = internal_x / speed
+    unit_y = internal_y / speed
+    normal_x = hit_x / radius
+    normal_y = hit_y / radius
+    cosine_incidence = (normal_x * unit_x + normal_y * unit_y).clamp(0.0, 1.0)
+    sine_incidence = (normal_x * unit_y - normal_y * unit_x).clamp(-1.0, 1.0)
+    incidence = torch.atan2(sine_incidence, cosine_incidence)
+    orientation = torch.where(sine_incidence < 0.0, -1.0, 1.0)
+    boundary_step = orientation * (torch.pi - 2.0 * torch.abs(incidence))
+    chord_time = (2.0 * radius * cosine_incidence / speed).clamp_min(
+        torch.finfo(x0.dtype).eps
+    )
+    time_after_hit = (duration - first_hit).clamp_min(0.0)
+    complete_chords = torch.floor(time_after_hit / chord_time)
+    collision_angle = torch.atan2(hit_y, hit_x) + complete_chords * boundary_step
+    collision_angle = torch.remainder(collision_angle, 2.0 * torch.pi)
+    residual_time = time_after_hit - complete_chords * chord_time
+    outgoing_angle = collision_angle + torch.pi - incidence
+    reflected_x = radius * torch.cos(
+        collision_angle
+    ) + speed * residual_time * torch.cos(outgoing_angle)
+    reflected_y = radius * torch.sin(
+        collision_angle
+    ) + speed * residual_time * torch.sin(outgoing_angle)
+    linear_x = relative_x + duration * internal_x
+    linear_y = relative_y + duration * internal_y
+    evolved_x = torch.where(collides, reflected_x, linear_x)
+    evolved_y = torch.where(collides, reflected_y, linear_y)
+    return (
+        evolved_x + center_x + signed_time * bulk_x,
+        evolved_y + center_y + signed_time * bulk_y,
+    )
+
+
 @dataclass(frozen=True, init=False)
 class PointMassField:
     """Point lenses specified by physical masses and angular positions.
 
     Public construction uses ``mass_solar``. Positions are in microarcseconds
-    and optional velocities are in microarcseconds per day. A
+    and optional velocities are in microarcseconds per day.
+    ``bulk_velocity_uas_per_day`` identifies the coherent part shared by all
+    stars, allowing the fixed-source lens mapping to translate the smooth
+    macro term consistently. A
     :class:`~microcaustics.MicrolensingSystem` converts the masses to angular
     Einstein radii from its cosmological distances before ray tracing.
 
@@ -417,6 +511,10 @@ class PointMassField:
     mass_solar: torch.Tensor | None
     velocity_x_uas_per_day: torch.Tensor | None = None
     velocity_y_uas_per_day: torch.Tensor | None = None
+    bulk_velocity_uas_per_day: tuple[float, float] = (0.0, 0.0)
+    reflecting_boundary_center_uas: tuple[float, float] | None = None
+    reflecting_boundary_radius_uas: float | None = None
+    _motion_parameters: torch.Tensor | None = field(default=None, repr=False)
     _einstein_radius_uas: torch.Tensor | None = field(default=None, repr=False)
 
     def __init__(
@@ -427,12 +525,27 @@ class PointMassField:
         *,
         velocity_x_uas_per_day=None,
         velocity_y_uas_per_day=None,
+        bulk_velocity_uas_per_day: tuple[float, float] = (0.0, 0.0),
+        reflecting_boundary_center_uas: tuple[float, float] | None = None,
+        reflecting_boundary_radius_uas: float | None = None,
     ) -> None:
         object.__setattr__(self, "x_uas", x_uas)
         object.__setattr__(self, "y_uas", y_uas)
         object.__setattr__(self, "mass_solar", mass_solar)
         object.__setattr__(self, "velocity_x_uas_per_day", velocity_x_uas_per_day)
         object.__setattr__(self, "velocity_y_uas_per_day", velocity_y_uas_per_day)
+        object.__setattr__(self, "bulk_velocity_uas_per_day", bulk_velocity_uas_per_day)
+        object.__setattr__(
+            self,
+            "reflecting_boundary_center_uas",
+            reflecting_boundary_center_uas,
+        )
+        object.__setattr__(
+            self,
+            "reflecting_boundary_radius_uas",
+            reflecting_boundary_radius_uas,
+        )
+        object.__setattr__(self, "_motion_parameters", None)
         object.__setattr__(self, "_einstein_radius_uas", None)
         self.__post_init__()
 
@@ -446,6 +559,9 @@ class PointMassField:
         mass_solar=None,
         velocity_x_uas_per_day=None,
         velocity_y_uas_per_day=None,
+        bulk_velocity_uas_per_day: tuple[float, float] = (0.0, 0.0),
+        reflecting_boundary_center_uas: tuple[float, float] | None = None,
+        reflecting_boundary_radius_uas: float | None = None,
     ) -> PointMassField:
         """Construct an already resolved field for package internals."""
 
@@ -455,6 +571,20 @@ class PointMassField:
         object.__setattr__(instance, "mass_solar", mass_solar)
         object.__setattr__(instance, "velocity_x_uas_per_day", velocity_x_uas_per_day)
         object.__setattr__(instance, "velocity_y_uas_per_day", velocity_y_uas_per_day)
+        object.__setattr__(
+            instance, "bulk_velocity_uas_per_day", bulk_velocity_uas_per_day
+        )
+        object.__setattr__(
+            instance,
+            "reflecting_boundary_center_uas",
+            reflecting_boundary_center_uas,
+        )
+        object.__setattr__(
+            instance,
+            "reflecting_boundary_radius_uas",
+            reflecting_boundary_radius_uas,
+        )
+        object.__setattr__(instance, "_motion_parameters", None)
         object.__setattr__(instance, "_einstein_radius_uas", einstein_radius_uas)
         instance.__post_init__()
         return instance
@@ -466,17 +596,26 @@ class PointMassField:
         y = torch.as_tensor(self.y_uas, device=x.device, dtype=x.dtype)
         if x.ndim != 1 or y.shape != x.shape:
             raise ValueError("point-lens positions must be 1D arrays of equal length")
+        if not bool(torch.all(torch.isfinite(x)) & torch.all(torch.isfinite(y))):
+            raise ValueError("point-lens positions must be finite")
         mass = self.mass_solar
         if mass is not None:
             mass = torch.as_tensor(mass, device=x.device, dtype=x.dtype)
-            if mass.shape != x.shape or bool(torch.any(mass <= 0)):
-                raise ValueError("mass_solar must be positive and match the positions")
+            if mass.shape != x.shape or bool(
+                torch.any(~torch.isfinite(mass) | (mass <= 0))
+            ):
+                raise ValueError(
+                    "mass_solar must be finite, positive, and match the positions"
+                )
         radius = self._einstein_radius_uas
         if radius is not None:
             radius = torch.as_tensor(radius, device=x.device, dtype=x.dtype)
-            if radius.shape != x.shape or bool(torch.any(radius <= 0)):
+            if radius.shape != x.shape or bool(
+                torch.any(~torch.isfinite(radius) | (radius <= 0))
+            ):
                 raise ValueError(
-                    "resolved Einstein radii must be positive and match the positions"
+                    "resolved Einstein radii must be finite, positive, "
+                    "and match the positions"
                 )
         if mass is None and radius is None and x.numel() != 0:
             raise ValueError("mass_solar is required for a non-empty point-mass field")
@@ -488,12 +627,62 @@ class PointMassField:
             vy = torch.as_tensor(vy, device=x.device, dtype=x.dtype)
             if vx.shape != x.shape or vy.shape != x.shape:
                 raise ValueError("velocity arrays must match the position shape")
+            if not bool(torch.all(torch.isfinite(vx)) & torch.all(torch.isfinite(vy))):
+                raise ValueError("point-lens velocities must be finite")
+        bulk_velocity = tuple(float(value) for value in self.bulk_velocity_uas_per_day)
+        if len(bulk_velocity) != 2 or any(
+            not math.isfinite(value) for value in bulk_velocity
+        ):
+            raise ValueError("bulk_velocity_uas_per_day must contain two finite values")
+        if vx is None and x.numel() and any(value != 0.0 for value in bulk_velocity):
+            raise ValueError(
+                "nonzero bulk_velocity_uas_per_day requires point-lens velocities"
+            )
+        boundary_center = self.reflecting_boundary_center_uas
+        boundary_radius = self.reflecting_boundary_radius_uas
+        if (boundary_center is None) != (boundary_radius is None):
+            raise ValueError(
+                "reflecting boundary center and radius must be supplied together"
+            )
+        if boundary_center is not None:
+            boundary_center = tuple(float(value) for value in boundary_center)
+            boundary_radius = float(boundary_radius)
+            if len(boundary_center) != 2 or any(
+                not math.isfinite(value) for value in boundary_center
+            ):
+                raise ValueError(
+                    "reflecting_boundary_center_uas must contain finite (y, x) values"
+                )
+            if not math.isfinite(boundary_radius) or boundary_radius <= 0.0:
+                raise ValueError("reflecting_boundary_radius_uas must be positive")
+            center_y, center_x = boundary_center
+            inside = (x - center_x).square() + (y - center_y).square()
+            tolerance = 64.0 * torch.finfo(x.dtype).eps * boundary_radius**2
+            if bool(torch.any(inside > boundary_radius**2 + tolerance)):
+                raise ValueError(
+                    "point lenses must begin inside the reflecting boundary"
+                )
+        motion_parameters = torch.tensor(
+            (
+                bulk_velocity[0],
+                bulk_velocity[1],
+                0.0 if boundary_center is None else boundary_center[1],
+                0.0 if boundary_center is None else boundary_center[0],
+                float("nan") if boundary_radius is None else boundary_radius,
+            ),
+            device=x.device,
+            dtype=x.dtype,
+        )
         object.__setattr__(self, "x_uas", x)
         object.__setattr__(self, "y_uas", y)
         object.__setattr__(self, "_einstein_radius_uas", radius)
         object.__setattr__(self, "velocity_x_uas_per_day", vx)
         object.__setattr__(self, "velocity_y_uas_per_day", vy)
         object.__setattr__(self, "mass_solar", mass)
+        object.__setattr__(self, "bulk_velocity_uas_per_day", bulk_velocity)
+        object.__setattr__(self, "reflecting_boundary_center_uas", boundary_center)
+        object.__setattr__(self, "reflecting_boundary_radius_uas", boundary_radius)
+        object.__setattr__(self, "_motion_parameters", motion_parameters)
 
     @property
     def einstein_radius_uas(self) -> torch.Tensor:
@@ -529,6 +718,9 @@ class PointMassField:
             mass_solar=self.mass_solar,
             velocity_x_uas_per_day=self.velocity_x_uas_per_day,
             velocity_y_uas_per_day=self.velocity_y_uas_per_day,
+            bulk_velocity_uas_per_day=self.bulk_velocity_uas_per_day,
+            reflecting_boundary_center_uas=self.reflecting_boundary_center_uas,
+            reflecting_boundary_radius_uas=self.reflecting_boundary_radius_uas,
         )
 
     @classmethod
@@ -541,6 +733,9 @@ class PointMassField:
         *,
         velocity_x_uas_per_day=None,
         velocity_y_uas_per_day=None,
+        bulk_velocity_uas_per_day: tuple[float, float] = (0.0, 0.0),
+        reflecting_boundary_center_uas: tuple[float, float] | None = None,
+        reflecting_boundary_radius_uas: float | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
     ) -> PointMassField:
@@ -554,6 +749,9 @@ class PointMassField:
             mass_solar=mass,
             velocity_x_uas_per_day=velocity_x_uas_per_day,
             velocity_y_uas_per_day=velocity_y_uas_per_day,
+            bulk_velocity_uas_per_day=bulk_velocity_uas_per_day,
+            reflecting_boundary_center_uas=reflecting_boundary_center_uas,
+            reflecting_boundary_radius_uas=reflecting_boundary_radius_uas,
         )
 
     @classmethod
@@ -592,20 +790,66 @@ class PointMassField:
 
         return self.velocity_x_uas_per_day is not None
 
-    def at_time(self, time_days: float | torch.Tensor) -> PointMassField:
-        """Return the point-mass field after linear motion for ``time_days``."""
+    def at_time(
+        self, time_days: float | torch.Tensor, *, runtime=None
+    ) -> PointMassField:
+        """Return the point-mass field at ``time_days``.
 
-        if not self.has_motion:
-            return self
-        time = torch.as_tensor(
-            time_days, device=self.x_uas.device, dtype=self.x_uas.dtype
-        )
+        Circular populations reflect their internal trajectories specularly
+        before the coherent bulk translation is added. Other fields retain
+        unconstrained linear motion.
+        """
+
+        time = torch.as_tensor(time_days)
         if time.numel() != 1:
             raise ValueError("at_time expects one scalar time")
+        if not self.has_motion:
+            return self
+        moved_x, moved_y = self.positions_at_times(time, runtime=runtime)
+        return self._with_positions(moved_x[0], moved_y[0])
+
+    def positions_at_times(
+        self, times_days, *, runtime=None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return all stellar positions for a one-dimensional time array."""
+
+        times = torch.as_tensor(
+            times_days, device=self.x_uas.device, dtype=self.x_uas.dtype
+        ).reshape(-1)
+        if not self.has_motion:
+            shape = (int(times.numel()), len(self))
+            return self.x_uas.expand(shape), self.y_uas.expand(shape)
         assert self.velocity_x_uas_per_day is not None
         assert self.velocity_y_uas_per_day is not None
-        moved_x = self.x_uas + time * self.velocity_x_uas_per_day
-        moved_y = self.y_uas + time * self.velocity_y_uas_per_day
+        if self.reflecting_boundary_radius_uas is None:
+            return (
+                self.x_uas[None, :] + times[:, None] * self.velocity_x_uas_per_day,
+                self.y_uas[None, :] + times[:, None] * self.velocity_y_uas_per_day,
+            )
+        assert self._motion_parameters is not None
+        arguments = (
+            self.x_uas,
+            self.y_uas,
+            self.velocity_x_uas_per_day,
+            self.velocity_y_uas_per_day,
+            times,
+            self._motion_parameters,
+        )
+        if runtime is None:
+            return _evolve_reflecting_circle(*arguments)
+        from ..compile import run_tensor_kernel
+
+        positions, _ = run_tensor_kernel(
+            runtime,
+            "specular stellar-boundary evolution",
+            _evolve_reflecting_circle,
+            *arguments,
+        )
+        return positions
+
+    def _with_positions(self, moved_x, moved_y) -> PointMassField:
+        """Reuse validated lens properties with replacement position tensors."""
+
         # Motion changes only the two position arrays. Re-running ``__post_init__``
         # here would validate the same masses, Einstein radii, and velocities at
         # every epoch; on CUDA, each positivity check would also force a device
@@ -631,6 +875,22 @@ class PointMassField:
             "_einstein_radius_uas",
             self._einstein_radius_uas,
         )
+        object.__setattr__(
+            instance,
+            "bulk_velocity_uas_per_day",
+            self.bulk_velocity_uas_per_day,
+        )
+        object.__setattr__(
+            instance,
+            "reflecting_boundary_center_uas",
+            self.reflecting_boundary_center_uas,
+        )
+        object.__setattr__(
+            instance,
+            "reflecting_boundary_radius_uas",
+            self.reflecting_boundary_radius_uas,
+        )
+        object.__setattr__(instance, "_motion_parameters", self._motion_parameters)
         return instance
 
     def to(
@@ -661,6 +921,9 @@ class PointMassField:
                 mass,
                 velocity_x_uas_per_day=velocity_x,
                 velocity_y_uas_per_day=velocity_y,
+                bulk_velocity_uas_per_day=self.bulk_velocity_uas_per_day,
+                reflecting_boundary_center_uas=self.reflecting_boundary_center_uas,
+                reflecting_boundary_radius_uas=self.reflecting_boundary_radius_uas,
             )
         return PointMassField._from_einstein_radii(
             self.x_uas.to(**kwargs),
@@ -669,4 +932,7 @@ class PointMassField:
             mass_solar=mass,
             velocity_x_uas_per_day=velocity_x,
             velocity_y_uas_per_day=velocity_y,
+            bulk_velocity_uas_per_day=self.bulk_velocity_uas_per_day,
+            reflecting_boundary_center_uas=self.reflecting_boundary_center_uas,
+            reflecting_boundary_radius_uas=self.reflecting_boundary_radius_uas,
         )

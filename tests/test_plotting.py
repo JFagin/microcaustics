@@ -72,6 +72,23 @@ class PlottingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mcp.add_scale_bar(ax, 0.0)
 
+    def test_bandpass_background_uses_six_lsst_throughputs(self) -> None:
+        figure, axis = plt.subplots()
+        axis.plot([3000.0, 11000.0], [1.0, 2.0])
+        response_axis = mcp.plot_bandpass_background(axis, "lsst")
+        self.assertEqual(len(response_axis.collections), 6)
+        self.assertEqual(len(response_axis.lines), 6)
+        self.assertEqual(response_axis.get_ylabel(), "Filter throughput")
+        self.assertEqual(response_axis.get_ylim(), (0.0, 1.05))
+        self.assertEqual(len(figure.axes), 2)
+
+        figure, axis = plt.subplots()
+        response_axis = mcp.plot_bandpass_background(
+            axis, mc.BandpassSet.lsst(), show_axis=False
+        )
+        self.assertEqual(response_axis.get_ylabel(), "")
+        self.assertEqual(len(response_axis.collections), 6)
+
     def test_image_axes_keep_a_panel_frame_by_default(self) -> None:
         figure, ax = plt.subplots()
         mcp.hide_image_axes(ax)

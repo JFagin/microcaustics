@@ -43,6 +43,7 @@ from .sources import (
 )
 from .sources.variability import (
     _FixedHorizonDrivingSignal,
+    _source_at_driver_mean,
     _source_driving_signal,
     _validate_source_driver,
 )
@@ -627,6 +628,13 @@ class MultiImageSystem:
         apply_driving_signal: bool | None = None,
         include_microlensing_only: bool = False,
         band_batch_size: int | None = None,
+        bandpasses=None,
+        spectral_model=None,
+        wavelength_samples: int = 32,
+        wavelength_batch_size: int | None = None,
+        return_spectrum: bool = False,
+        spectrum_wavelengths=None,
+        host_lensing: str = "omit",
         keep_maps_at_days: Sequence[float]
         | Mapping[str, Sequence[float]]
         | None = None,
@@ -658,6 +666,14 @@ class MultiImageSystem:
             raise ValueError(
                 "include_microlensing_only=True requires the driven light curves"
             )
+        if wavelength_batch_size is not None and band_batch_size is not None:
+            raise ValueError(
+                "supply wavelength_batch_size or band_batch_size, not both"
+            )
+        if spectral_model is not None and bandpasses is None:
+            raise ValueError("spectral_model requires bandpasses")
+        if return_spectrum and bandpasses is None:
+            raise ValueError("return_spectrum requires bandpasses")
         for value, label in (
             (times_days, "times_days"),
             (flux_times_days, "flux_times_days"),
@@ -695,6 +711,28 @@ class MultiImageSystem:
         system = self if source is None else self.with_source(source)
         for image in system.images.values():
             _validate_source_driver(image.source, apply_driving_signal)
+        spectral_plan = None
+        resolved_bandpasses = None
+        redshift = system._shared_distances().source_redshift
+        if bandpasses is not None:
+            from .spectral_photometry import prepare_spectral_source
+
+            base_source = system.source
+            if base_source is None:
+                base_source = next(iter(system.images.values())).source
+            prepared_source, spectral_plan, resolved_bandpasses, redshift = (
+                prepare_spectral_source(
+                    base_source,
+                    system._shared_distances(),
+                    bandpasses,
+                    spectral_model=spectral_model,
+                    wavelength_samples=wavelength_samples,
+                    spectrum_wavelengths=spectrum_wavelengths,
+                    return_spectrum=return_spectrum,
+                    host_lensing=host_lensing,
+                )
+            )
+            system = system.with_source(prepared_source)
         simulation, realizations = system._build_simulation(
             map_times,
             solver_options,
@@ -702,11 +740,10 @@ class MultiImageSystem:
         )
         shared_source = system._shared_source(None, realizations)
         microlensing_only_source = None
-        if include_microlensing_only:
-            _validate_source_driver(shared_source, True)
-            microlensing_only_source = realizations[0]._mean_source
+        if include_microlensing_only or spectral_model is not None:
+            microlensing_only_source = _source_at_driver_mean(shared_source)
         if apply_driving_signal is False:
-            shared_source = realizations[0]._mean_source
+            shared_source = _source_at_driver_mean(shared_source)
         if use_multirate:
             result = simulation.multirate_light_curves(
                 map_times,
@@ -714,7 +751,11 @@ class MultiImageSystem:
                 shared_source,
                 self._shared_distances(),
                 include_labels=include_labels,
-                band_batch_size=band_batch_size,
+                band_batch_size=(
+                    band_batch_size
+                    if wavelength_batch_size is None
+                    else wavelength_batch_size
+                ),
                 map_observers=observers,
                 microlensing_only_source=microlensing_only_source,
             )
@@ -724,10 +765,48 @@ class MultiImageSystem:
                 shared_source,
                 self._shared_distances(),
                 include_labels=include_labels,
-                band_batch_size=band_batch_size,
+                band_batch_size=(
+                    band_batch_size
+                    if wavelength_batch_size is None
+                    else wavelength_batch_size
+                ),
                 map_observers=observers,
                 microlensing_only_source=microlensing_only_source,
             )
+        images = result.images
+        if spectral_plan is not None:
+            from .spectral_photometry import finish_spectral_light_curve
+            from .system import _macro_magnification
+
+            processed = []
+            for image in images:
+                curve = image.light_curve
+                mean_curve = None
+                if curve.microlensing_only_flux is not None:
+                    mean_curve = replace(
+                        curve,
+                        flux=curve.microlensing_only_flux,
+                        unlensed_flux=curve.microlensing_only_unlensed_flux,
+                        microlensing_only_flux=None,
+                        microlensing_only_unlensed_flux=None,
+                    )
+                image_system = system.images[image.image_name]
+                curve = finish_spectral_light_curve(
+                    curve,
+                    mean_curve,
+                    spectral_plan,
+                    spectral_model=spectral_model,
+                    source_redshift=float(redshift),
+                    luminosity_distance_m=(1.0 + float(redshift)) ** 2
+                    * image_system.distances.source_m,
+                    macro_magnification=_macro_magnification(image_system.macro),
+                    include_microlensing_only=include_microlensing_only,
+                    return_spectrum=return_spectrum,
+                    host_lensing=host_lensing,
+                    bandpass_version=resolved_bandpasses.version,
+                )
+                processed.append(replace(image, light_curve=curve))
+            images = tuple(processed)
         return replace(
             result,
             images=tuple(
@@ -737,7 +816,7 @@ class MultiImageSystem:
                         image.light_curve, maps=retained[image.image_name]
                     ),
                 )
-                for image in result.images
+                for image in images
             ),
         )
 

@@ -282,10 +282,17 @@ def batched_magnification_maps(
         try:
             outputs.extend(_calculate_compatible_batch(chunk, method))
             start += count
-        except torch.cuda.OutOfMemoryError:
-            if count == 1:
+        except Exception as error:
+            if not _is_cuda_oom(error) or count == 1:
                 raise
             current_batch = max(1, count // 2)
+            warnings.warn(
+                f"CUDA memory was insufficient for {count} independent maps. "
+                f"Retrying with batch_size={current_batch}; numerical settings "
+                "are unchanged",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             torch.cuda.empty_cache()
     return tuple(outputs)
 
@@ -520,6 +527,46 @@ class _CurveJob:
     include_distance_map: bool = False
     multi_image: bool = False
     include_microlensing_only: bool = False
+    spectral_plan: object | None = None
+    spectral_model: object | None = None
+    spectral_redshift: float | None = None
+    spectral_luminosity_distance_m: float | None = None
+    spectral_macro_magnification: float | None = None
+    spectral_return_spectrum: bool = False
+    spectral_host_lensing: str = "omit"
+    spectral_bandpass_version: str | None = None
+    spectral_include_microlensing_only: bool = False
+
+
+def _finish_job_curve(job: _CurveJob, curve):
+    """Convert sparse continuum channels into dense spectral photometry."""
+
+    if job.spectral_plan is None:
+        return curve
+    from .spectral_photometry import finish_spectral_light_curve
+
+    mean_curve = None
+    if curve.microlensing_only_flux is not None:
+        mean_curve = replace(
+            curve,
+            flux=curve.microlensing_only_flux,
+            unlensed_flux=curve.microlensing_only_unlensed_flux,
+            microlensing_only_flux=None,
+            microlensing_only_unlensed_flux=None,
+        )
+    return finish_spectral_light_curve(
+        curve,
+        mean_curve,
+        job.spectral_plan,
+        spectral_model=job.spectral_model,
+        source_redshift=job.spectral_redshift,
+        luminosity_distance_m=job.spectral_luminosity_distance_m,
+        macro_magnification=job.spectral_macro_magnification,
+        include_microlensing_only=job.spectral_include_microlensing_only,
+        return_spectrum=job.spectral_return_spectrum,
+        host_lensing=job.spectral_host_lensing,
+        bandpass_version=job.spectral_bandpass_version,
+    )
 
 
 @dataclass(frozen=True)
@@ -560,6 +607,7 @@ def _run_independent_curve(job: _CurveJob, stream: torch.cuda.Stream | None) -> 
             include_labels=job.include_labels,
             **kwargs,
         )
+        curve = _finish_job_curve(job, curve)
         if job.multi_image:
             curve = replace(
                 curve,
@@ -760,6 +808,7 @@ def _run_cross_system_ipm_group(jobs: Sequence[_CurveJob]) -> tuple[object, ...]
             curve = _unified_light_curve(wrapper)
         else:
             curve = _unified_light_curve(curve)
+        curve = _finish_job_curve(job, curve)
         if job.multi_image:
             curve = replace(
                 curve,
@@ -885,13 +934,63 @@ def _jobs_for_system(
     apply_driving_signal: bool | None,
     include_microlensing_only: bool,
     band_batch_size: int | None,
+    bandpasses,
+    spectral_model,
+    wavelength_samples: int,
+    return_spectrum: bool,
+    spectrum_wavelengths,
+    host_lensing: str,
     single_options: dict[str, object],
     raw_options: dict[str, object],
     observer,
 ) -> tuple[_ParentInfo, tuple[_CurveJob, ...]]:
     from .multi_system import MultiImageSystem
     from .sources import TimeShiftedSource
-    from .sources.variability import _validate_source_driver
+    from .sources.variability import _source_at_driver_mean, _validate_source_driver
+
+    spectral_plan = None
+    resolved_bandpasses = None
+
+    def prepare_spectral_source(source, distances):
+        nonlocal spectral_plan, resolved_bandpasses
+        if bandpasses is None:
+            return source
+        from .spectral_photometry import prepare_spectral_source as prepare
+
+        source, spectral_plan, resolved_bandpasses, _ = prepare(
+            source,
+            distances,
+            bandpasses,
+            spectral_model=spectral_model,
+            wavelength_samples=wavelength_samples,
+            spectrum_wavelengths=spectrum_wavelengths,
+            return_spectrum=return_spectrum,
+            host_lensing=host_lensing,
+        )
+        return source
+
+    def spectral_job_options(realization):
+        if spectral_plan is None:
+            return {}
+        from .system import _macro_magnification
+
+        return {
+            "spectral_plan": spectral_plan,
+            "spectral_model": spectral_model,
+            "spectral_redshift": float(realization.system.distances.source_redshift),
+            "spectral_luminosity_distance_m": (
+                1.0 + float(realization.system.distances.source_redshift)
+            )
+            ** 2
+            * realization.system.distances.source_m,
+            "spectral_macro_magnification": _macro_magnification(
+                realization.system.macro
+            ),
+            "spectral_return_spectrum": return_spectrum,
+            "spectral_host_lensing": host_lensing,
+            "spectral_bandpass_version": resolved_bandpasses.version,
+            "spectral_include_microlensing_only": include_microlensing_only,
+        }
 
     if isinstance(item, MultiImageSystem):
         if observer is not None:
@@ -904,6 +1003,13 @@ def _jobs_for_system(
                 raise ValueError(
                     f"map observers contain unknown macroimages: {sorted(unknown)}"
                 )
+        if bandpasses is not None:
+            base_source = item.source
+            if base_source is None:
+                base_source = next(iter(item.images.values())).source
+            item = item.with_source(
+                prepare_spectral_source(base_source, item._shared_distances())
+            )
         simulation, realizations = item._build_simulation(
             map_times_days, raw_options, include_labels=include_labels
         )
@@ -912,7 +1018,7 @@ def _jobs_for_system(
         if include_microlensing_only:
             _validate_source_driver(shared_source, True)
         if apply_driving_signal is False:
-            shared_source = realizations[0]._mean_source
+            shared_source = _source_at_driver_mean(shared_source)
         jobs = []
         for image_index, (config, realization) in enumerate(
             zip(simulation.images, realizations, strict=True)
@@ -946,7 +1052,8 @@ def _jobs_for_system(
                     config.diagnostic_grid,
                     config.include_distance_map,
                     True,
-                    include_microlensing_only,
+                    include_microlensing_only or spectral_model is not None,
+                    **spectral_job_options(realization),
                 )
             )
         metadata = {
@@ -977,9 +1084,19 @@ def _jobs_for_system(
     _validate_source_driver(item.source, apply_driving_signal)
     if include_microlensing_only:
         _validate_source_driver(item.source, True)
-    realization = (
-        item if hasattr(item, "simulation") else item._realize_for_times(map_times_days)
-    )
+    is_realization = hasattr(item, "simulation")
+    if bandpasses is not None and not is_realization:
+        item = item.with_source(
+            prepare_spectral_source(item.source, item.distances)
+        )
+    realization = item if is_realization else item._realize_for_times(map_times_days)
+    if bandpasses is not None and is_realization:
+        realization = replace(
+            realization,
+            source=prepare_spectral_source(
+                realization.source, realization.system.distances
+            ),
+        )
     if apply_driving_signal is False:
         realization = replace(realization, source=realization._mean_source)
     job = _CurveJob(
@@ -996,7 +1113,10 @@ def _jobs_for_system(
         single_options["schedule"],
         single_options.get("caustics"),
         observer,
-        include_microlensing_only=include_microlensing_only,
+        include_microlensing_only=(
+            include_microlensing_only or spectral_model is not None
+        ),
+        **spectral_job_options(realization),
     )
     return _ParentInfo(("image",), (0.0,), {}, False), (job,)
 
@@ -1041,6 +1161,13 @@ def batched_system_light_curves(
     apply_driving_signal: bool | None = None,
     include_microlensing_only: bool = False,
     band_batch_size: int | None = None,
+    bandpasses=None,
+    spectral_model=None,
+    wavelength_samples: int = 32,
+    wavelength_batch_size: int | None = None,
+    return_spectrum: bool = False,
+    spectrum_wavelengths=None,
+    host_lensing: str = "omit",
     method: IPMConfig | IRSConfig | None = None,
     schedule: DynamicConfig | None = None,
     caustics: CausticConfig | None = None,
@@ -1066,6 +1193,13 @@ def batched_system_light_curves(
     ``include_microlensing_only=True`` attaches a mean-driver comparison to
     every curve while sharing maps, labels, and static source brightness.
 
+    ``bandpasses="lsst"`` integrates a sparsely sampled disk continuum through
+    the bundled Rubin/LSST responses. ``spectral_model`` adds the empirical
+    dense-grid quasar spectrum without repeating map generation. It may be one
+    model shared by every system or a sequence aligned with ``systems``. Set
+    ``return_spectrum=True`` to retain that same calculation at
+    ``spectrum_wavelengths``.
+
     ``source_setup_batch_size`` separately pools compatible driven Kerr disks
     before stellar realization. A multi-image system contributes one shared
     disk rather than one disk per macroimage. The default of one preserves the
@@ -1083,6 +1217,12 @@ def batched_system_light_curves(
 
     from ._batch_storage import BatchOutputWriter
 
+    if wavelength_batch_size is not None and band_batch_size is not None:
+        raise ValueError("supply wavelength_batch_size or band_batch_size, not both")
+    if spectral_model is not None and bandpasses is None:
+        raise ValueError("spectral_model requires bandpasses")
+    if return_spectrum and bandpasses is None:
+        raise ValueError("return_spectrum requires bandpasses")
     if include_microlensing_only and apply_driving_signal is False:
         raise ValueError(
             "include_microlensing_only=True requires the driven light curves"
@@ -1109,6 +1249,61 @@ def batched_system_light_curves(
     systems = tuple(systems)
     if not systems:
         raise ValueError("at least one microlensing system is required")
+    from .spectra import QuasarSpectrum
+
+    if spectral_model is None or isinstance(spectral_model, QuasarSpectrum):
+        spectral_models = (spectral_model,) * len(systems)
+    else:
+        if isinstance(spectral_model, (str, bytes)):
+            raise TypeError(
+                "spectral_model must be a QuasarSpectrum or one model per system"
+            )
+        spectral_models = tuple(spectral_model)
+        if len(spectral_models) != len(systems):
+            raise ValueError(
+                "a spectral_model sequence must match the number of systems"
+            )
+        if not all(
+            model is None or isinstance(model, QuasarSpectrum)
+            for model in spectral_models
+        ):
+            raise TypeError(
+                "spectral_model sequences must contain QuasarSpectrum or None"
+            )
+    if bandpasses is not None:
+        from .multi_system import MultiImageSystem
+        from .spectral_photometry import prepare_spectral_source
+
+        prepared_systems = []
+        for item, item_spectral_model in zip(
+            systems, spectral_models, strict=True
+        ):
+            # A realized system already owns its fixed spatial grid. Physical
+            # system specifications are expanded before optional cross-disk
+            # pixelation so the reddest sparse continuum node sets the field.
+            if hasattr(item, "simulation"):
+                prepared_systems.append(item)
+                continue
+            if isinstance(item, MultiImageSystem):
+                base_source = item.source
+                if base_source is None:
+                    base_source = next(iter(item.images.values())).source
+                distances = item._shared_distances()
+            else:
+                base_source = item.source
+                distances = item.distances
+            prepared_source, _, _, _ = prepare_spectral_source(
+                base_source,
+                distances,
+                bandpasses,
+                spectral_model=item_spectral_model,
+                wavelength_samples=wavelength_samples,
+                spectrum_wavelengths=spectrum_wavelengths,
+                return_spectrum=return_spectrum,
+                host_lensing=host_lensing,
+            )
+            prepared_systems.append(item.with_source(prepared_source))
+        systems = tuple(prepared_systems)
     requested = int(curves_per_batch)
     if requested < 1:
         raise ValueError("curves_per_batch must be positive")
@@ -1253,8 +1448,8 @@ def batched_system_light_curves(
                     torch.cuda.empty_cache()
 
     try:
-        for parent_index, (item, observer) in enumerate(
-            zip(systems, observers, strict=True)
+        for parent_index, (item, observer, item_spectral_model) in enumerate(
+            zip(systems, observers, spectral_models, strict=True)
         ):
             info, jobs = _jobs_for_system(
                 item,
@@ -1264,7 +1459,17 @@ def batched_system_light_curves(
                 include_labels=include_labels,
                 apply_driving_signal=apply_driving_signal,
                 include_microlensing_only=include_microlensing_only,
-                band_batch_size=band_batch_size,
+                band_batch_size=(
+                    band_batch_size
+                    if wavelength_batch_size is None
+                    else wavelength_batch_size
+                ),
+                bandpasses=bandpasses,
+                spectral_model=item_spectral_model,
+                wavelength_samples=wavelength_samples,
+                return_spectrum=return_spectrum,
+                spectrum_wavelengths=spectrum_wavelengths,
+                host_lensing=host_lensing,
                 single_options=options,
                 raw_options=raw_options,
                 observer=observer,

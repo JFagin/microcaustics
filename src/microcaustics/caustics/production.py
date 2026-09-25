@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as functional
 
-from ..config import CausticConfig
+from ..config import Backend, CausticConfig
 from ..geometry import PlaneGrid, PlaneRegion
 from ..results import (
     CausticField,
@@ -1229,6 +1229,18 @@ def caustic_fields_from_far_fields(
         if sparse_marching_batch is None:
             runtime.synchronize()
             marching_seconds += perf_counter() - phase
+        if (
+            runtime.strict_backend
+            and runtime.backend is Backend.TRITON
+            and runtime.device.type == "cuda"
+            and runtime.dtype == torch.float32
+            and not rasterizer.startswith("triton_")
+            and rasterizer != "empty"
+        ):
+            raise RuntimeError(
+                f"strict Triton backend required for caustic extraction; "
+                f"executed {rasterizer!r}"
+            )
         rasterizers.append(rasterizer)
         phase = perf_counter()
         if ragged_caustics is not None:
@@ -1458,6 +1470,10 @@ def dynamic_labeled_caustics(
             previous_center_distance_uas=previous_center_distance,
             diagnostic_grid=diagnostic_grid,
             include_distance_map=include_distance_map,
+            strict_backend=(
+                simulation.runtime.strict_backend
+                and simulation.runtime.backend is Backend.TRITON
+            ),
         )
         outputs.extend(labeled)
         start = stop
@@ -1595,6 +1611,10 @@ def dynamic_labeled_maps(
                 previous_center_distance_uas=previous_center_distance,
                 diagnostic_grid=diagnostic_grid,
                 include_distance_map=include_distance_map,
+                strict_backend=(
+                    simulation.runtime.strict_backend
+                    and simulation.runtime.backend is Backend.TRITON
+                ),
             )
             if caustic_tuning_result is not None:
                 labeled = tuple(

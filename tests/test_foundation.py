@@ -266,6 +266,176 @@ class FoundationTests(unittest.TestCase):
         torch.testing.assert_close(source_y, expected_y, rtol=0.0, atol=1e-14)
         self.assertEqual(diagnostics.ray_chunks, 2)
 
+    def test_bulk_star_translation_matches_complete_lens_translation(self) -> None:
+        """The fixed-source representation translates the smooth term too."""
+
+        macro = MacroLens(
+            convergence=0.45,
+            shear=0.22,
+            shear_angle_deg=31.0,
+            smooth_matter_fraction=0.4,
+        )
+        x0 = torch.tensor([-0.7, 0.4, 1.1], dtype=torch.float64)
+        y0 = torch.tensor([0.2, -0.9, 0.6], dtype=torch.float64)
+        radii = torch.tensor([0.12, 0.09, 0.07], dtype=torch.float64)
+        bulk_velocity = (0.013, -0.008)
+        moving = MicrolensingSimulation.create(
+            macro,
+            PointMassField._from_einstein_radii(
+                x0,
+                y0,
+                radii,
+                velocity_x_uas_per_day=torch.full_like(x0, bulk_velocity[0]),
+                velocity_y_uas_per_day=torch.full_like(y0, bulk_velocity[1]),
+                bulk_velocity_uas_per_day=bulk_velocity,
+            ),
+            runtime=RuntimeConfig(
+                device="cpu",
+                backend=Backend.TORCH_EAGER,
+                dtype="float64",
+            ),
+        )
+        reference = MicrolensingSimulation.create(
+            macro,
+            PointMassField._from_einstein_radii(x0, y0, radii),
+            runtime=RuntimeConfig(
+                device="cpu",
+                backend=Backend.TORCH_EAGER,
+                dtype="float64",
+            ),
+        )
+        time_days = 17.0
+        displacement_x = time_days * bulk_velocity[0]
+        displacement_y = time_days * bulk_velocity[1]
+        query_x = torch.tensor([-0.3, 0.8, 1.5], dtype=torch.float64)
+        query_y = torch.tensor([0.7, -0.4, 0.1], dtype=torch.float64)
+        moving_x, moving_y, _ = moving.raytrace_direct(
+            query_x,
+            query_y,
+            time_days=time_days,
+        )
+        reference_x, reference_y, _ = reference.raytrace_direct(
+            query_x - displacement_x,
+            query_y - displacement_y,
+        )
+        torch.testing.assert_close(
+            moving_x,
+            reference_x + displacement_x,
+            rtol=0.0,
+            atol=1.0e-13,
+        )
+        torch.testing.assert_close(
+            moving_y,
+            reference_y + displacement_y,
+            rtol=0.0,
+            atol=1.0e-13,
+        )
+        moving_det, _ = moving.jacobian_determinant_direct(
+            query_x,
+            query_y,
+            time_days=time_days,
+        )
+        reference_det, _ = reference.jacobian_determinant_direct(
+            query_x - displacement_x,
+            query_y - displacement_y,
+        )
+        torch.testing.assert_close(moving_det, reference_det, rtol=0.0, atol=1e-13)
+
+    def test_circular_boundary_reflects_internal_motion_before_bulk_translation(
+        self,
+    ) -> None:
+        field = PointMassField._from_einstein_radii(
+            torch.tensor([0.9], dtype=torch.float64),
+            torch.tensor([0.0], dtype=torch.float64),
+            torch.tensor([0.1], dtype=torch.float64),
+            velocity_x_uas_per_day=torch.tensor([0.25], dtype=torch.float64),
+            velocity_y_uas_per_day=torch.tensor([0.0], dtype=torch.float64),
+            bulk_velocity_uas_per_day=(0.05, 0.0),
+            reflecting_boundary_center_uas=(0.0, 0.0),
+            reflecting_boundary_radius_uas=1.0,
+        )
+        first = field.at_time(1.0)
+        many = field.at_time(20.0)
+        torch.testing.assert_close(
+            first.x_uas,
+            torch.tensor([0.95], dtype=torch.float64),
+            rtol=0.0,
+            atol=1.0e-13,
+        )
+        torch.testing.assert_close(
+            many.x_uas,
+            torch.tensor([1.9], dtype=torch.float64),
+            rtol=0.0,
+            atol=1.0e-13,
+        )
+        torch.testing.assert_close(first.y_uas, torch.zeros_like(first.y_uas))
+        torch.testing.assert_close(many.y_uas, torch.zeros_like(many.y_uas))
+        self.assertLessEqual(abs(float(many.x_uas[0]) - 20.0 * 0.05), 1.0)
+
+    def test_closed_form_circular_reflection_matches_iterative_reference(self) -> None:
+        generator = torch.Generator().manual_seed(912)
+        count = 64
+        radius = 2.0
+        center_y, center_x = (0.3, -0.4)
+        radial = (
+            0.95
+            * radius
+            * torch.sqrt(torch.rand(count, generator=generator, dtype=torch.float64))
+        )
+        angle = (
+            2.0 * torch.pi * torch.rand(count, generator=generator, dtype=torch.float64)
+        )
+        x0 = center_x + radial * torch.cos(angle)
+        y0 = center_y + radial * torch.sin(angle)
+        internal_x = 0.08 * torch.randn(count, generator=generator, dtype=torch.float64)
+        internal_y = 0.08 * torch.randn(count, generator=generator, dtype=torch.float64)
+        bulk = (0.013, -0.009)
+        field = PointMassField._from_einstein_radii(
+            x0,
+            y0,
+            torch.full((count,), 0.05, dtype=torch.float64),
+            velocity_x_uas_per_day=internal_x + bulk[0],
+            velocity_y_uas_per_day=internal_y + bulk[1],
+            bulk_velocity_uas_per_day=bulk,
+            reflecting_boundary_center_uas=(center_y, center_x),
+            reflecting_boundary_radius_uas=radius,
+        )
+        time_days = 50.0
+        actual = field.at_time(time_days)
+
+        x = x0 - center_x
+        y = y0 - center_y
+        vx = internal_x.clone()
+        vy = internal_y.clone()
+        remaining = torch.full_like(x, time_days)
+        for _ in range(100):
+            speed2 = vx.square() + vy.square()
+            radial_velocity = 2.0 * (x * vx + y * vy)
+            radial_offset = x.square() + y.square() - radius**2
+            discriminant = (
+                radial_velocity.square() - 4.0 * speed2 * radial_offset
+            ).clamp_min(0.0)
+            hit_time = (-radial_velocity + torch.sqrt(discriminant)) / (
+                2.0 * speed2.clamp_min(torch.finfo(x.dtype).tiny)
+            )
+            collision = (speed2 > 0.0) & (hit_time < remaining)
+            step = torch.where(collision, hit_time, remaining)
+            x = x + vx * step
+            y = y + vy * step
+            remaining = remaining - step
+            normal_x = x / radius
+            normal_y = y / radius
+            normal_velocity = vx * normal_x + vy * normal_y
+            vx = torch.where(collision, vx - 2.0 * normal_velocity * normal_x, vx)
+            vy = torch.where(collision, vy - 2.0 * normal_velocity * normal_y, vy)
+            if not bool(torch.any(collision)):
+                break
+        self.assertLess(float(remaining.max()), 1.0e-12)
+        expected_x = x + center_x + time_days * bulk[0]
+        expected_y = y + center_y + time_days * bulk[1]
+        torch.testing.assert_close(actual.x_uas, expected_x, rtol=0.0, atol=2.0e-12)
+        torch.testing.assert_close(actual.y_uas, expected_y, rtol=0.0, atol=2.0e-12)
+
     def test_mass_functions_are_reproducible_and_bounded(self) -> None:
         generator_a = torch.Generator().manual_seed(7)
         generator_b = torch.Generator().manual_seed(7)
@@ -584,9 +754,7 @@ class FoundationTests(unittest.TestCase):
         )
         selected = primary.transfer.hit & (primary.radial_root_count == 4)
         spin = torch.full_like(primary.carter_eta[selected], 0.7)
-        inclination = torch.tensor(
-            math.radians(inclination_deg), dtype=torch.float64
-        )
+        inclination = torch.tensor(math.radians(inclination_deg), dtype=torch.float64)
         arguments = (
             spin,
             inclination,
@@ -596,12 +764,8 @@ class FoundationTests(unittest.TestCase):
             primary.mino_time[selected],
             primary.radial_root_real[selected],
         )
-        delay = _coordinate_delay_analytic(
-            *arguments, observer_radius_rg=3000.0
-        )
-        full = _coordinate_azimuth_analytic(
-            *arguments, observer_radius_rg=3000.0
-        )
+        delay = _coordinate_delay_analytic(*arguments, observer_radius_rg=3000.0)
+        full = _coordinate_azimuth_analytic(*arguments, observer_radius_rg=3000.0)
         self.assertTrue(torch.all(delay[3]))
         self.assertTrue(torch.all(full[4]))
         torch.testing.assert_close(delay[0], full[1], rtol=1.0e-13, atol=1.0e-13)
@@ -710,7 +874,9 @@ class FoundationTests(unittest.TestCase):
             )
         )
 
-    def test_float32_primary_preserves_requested_parameters_for_coordinates(self) -> None:
+    def test_float32_primary_preserves_requested_parameters_for_coordinates(
+        self,
+    ) -> None:
         from microcaustics.relativity import add_observer_coordinates
         from microcaustics.relativity.primary import trace_primary_equatorial
 
@@ -741,9 +907,7 @@ class FoundationTests(unittest.TestCase):
         )
         self.assertEqual(coordinates.transfer.shape, screen.shape)
         self.assertIsNone(coordinates.transfer.emission_azimuth_rad)
-        self.assertEqual(
-            coordinates.transfer.metadata["repair_quadrature_order"], 32
-        )
+        self.assertEqual(coordinates.transfer.metadata["repair_quadrature_order"], 32)
 
     def test_observer_coordinates_repair_rare_float32_rays(self) -> None:
         from microcaustics.relativity import add_observer_coordinates
@@ -2010,6 +2174,7 @@ class FoundationTests(unittest.TestCase):
             )
         )
         labels = outputs[0].labels
+        self.assertEqual(labels.metadata["label_backend"], "portable")
         self.assertEqual(labels.center_label, 1)
         self.assertEqual(labels.center_vote_count, 9)
         self.assertTrue(torch.equal(gauges, torch.zeros(9, dtype=torch.int8)))
@@ -2804,11 +2969,12 @@ class FoundationTests(unittest.TestCase):
             )
             for t in (0.0, 2.0)
         ]
+        distances = LensingDistances(1.0e25, 2.0e25, 1.0e25)
         result = light_curve_from_maps(
             maps,
             source,
             [0.0, 2.0],
-            LensingDistances(1.0e25, 2.0e25, 1.0e25),
+            distances,
             trajectory=LinearTrajectory(velocity_uas_per_day=(0.1, 0.0)),
         )
         torch.testing.assert_close(result.flux, result.unlensed_flux)
@@ -2818,7 +2984,7 @@ class FoundationTests(unittest.TestCase):
             maps,
             source,
             [0.0, 2.0],
-            LensingDistances(1.0e25, 2.0e25, 1.0e25),
+            distances,
             trajectory=LinearTrajectory(velocity_uas_per_day=(0.1, 0.0)),
             batch_size=1,
         )
@@ -2826,12 +2992,40 @@ class FoundationTests(unittest.TestCase):
         torch.testing.assert_close(batched.unlensed_flux, result.unlensed_flux)
         self.assertEqual(batched.metadata["source_batch_size"], 1)
 
+        radians_to_uas = 180.0 / math.pi * 3600.0 * 1.0e6
+        aligned_grid = PlaneGrid(
+            geometry.shape,
+            tuple(
+                scale * pixels / distances.source_m * radians_to_uas
+                for scale, pixels in zip(
+                    geometry.pixel_scale_m,
+                    geometry.shape,
+                    strict=True,
+                )
+            ),
+        )
+        aligned = light_curve_from_maps(
+            [
+                MagnificationMap(
+                    torch.ones(aligned_grid.shape, dtype=torch.float64),
+                    aligned_grid,
+                    time_days=t,
+                )
+                for t in (0.0, 2.0)
+            ],
+            source,
+            [0.0, 2.0],
+            distances,
+        )
+        torch.testing.assert_close(aligned.flux, aligned.unlensed_flux)
+        self.assertTrue(aligned.metadata["map_aligned_source_fast_path"])
+
         with self.assertRaisesRegex(ValueError, "batch_size"):
             light_curve_from_maps(
                 maps,
                 source,
                 [0.0, 2.0],
-                LensingDistances(1.0e25, 2.0e25, 1.0e25),
+                distances,
                 batch_size=0,
             )
 

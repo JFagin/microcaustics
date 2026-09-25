@@ -53,15 +53,24 @@ mass range, smooth-matter fraction, stellar positions, bulk motion, and
 velocity dispersion. Individual microlens masses, positions, and velocities
 can also be supplied directly. The required circular stellar field is normally
 determined automatically from the requested source region, light-loss
-tolerance, and safety scale.
+tolerance, and safety scale. Internal stellar motions reflect specularly at
+that boundary to preserve the finite population and its macro parameters;
+coherent bulk translation is applied afterward and consistently to the full
+local lens mapping.
 
-The package includes general-relativistic Novikov--Thorne accretion disks with
+The package includes general-relativistic Novikov–Thorne accretion disks with
 full Kerr ray tracing, relativistic redshifts, observer delays, lamp-post
 heating, multiband disk images, and intrinsic source evolution. It can
 calculate steady and microlensed transfer functions, continuum light curves,
 redshift maps, and delay maps. These calculations can also be used without
 lensing for general-relativistic disk modeling and continuum reverberation
 mapping.
+
+`ThinDiskModel` provides the matched non-GR calculation. With a driving
+signal it uses an analytic Euclidean observer and axial-lamppost transfer but
+retains the same batched surface-brightness, microlensed light-curve,
+response-delay, and transfer-function interfaces as `KerrDiskModel`.
+Both disk models use the same observer-screen position-angle convention.
 
 Supernovae, analytic profiles, pixelated sources, and custom evolving sources
 use the same simulation interface. Intrinsic variability may be evaluated at a
@@ -194,7 +203,7 @@ The complete notebook guide is organized into five tracks.
 |---|---|
 | Getting started | [Static maps and numerical methods](examples/notebooks/getting_started/00_static_maps_and_numerical_methods.ipynb), [Q2237 production light curves](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb), and [dynamic maps and light curves](examples/notebooks/getting_started/02_dynamic_maps_and_light_curves.ipynb) |
 | Methods | [Stellar populations and mass functions](examples/notebooks/methods/00_stellar_populations_and_mass_functions.ipynb), [far-field approximation](examples/notebooks/methods/01_far_field_approximation.ipynb), and [caustics and labels](examples/notebooks/methods/02_caustics_and_labels.ipynb) |
-| Source models | [Relativistic disks and reverberation](examples/notebooks/source_models/00_relativistic_disks_and_reverberation.ipynb), [expanding supernovae](examples/notebooks/source_models/01_expanding_supernovae.ipynb), [custom sources and variability](examples/notebooks/source_models/02_custom_sources_and_variability.ipynb), and [spectral microlensing](examples/notebooks/source_models/03_spectral_microlensing.ipynb) |
+| Source models | [Relativistic disks and reverberation](examples/notebooks/source_models/00_relativistic_disks_and_reverberation.ipynb), [expanding supernovae](examples/notebooks/source_models/01_expanding_supernovae.ipynb), [custom sources and variability](examples/notebooks/source_models/02_custom_sources_and_variability.ipynb), [spectral microlensing](examples/notebooks/source_models/03_spectral_microlensing.ipynb), and [quasar spectra and bandpass photometry](examples/notebooks/source_models/05_quasar_spectra_and_bandpass_photometry.ipynb) |
 | Workflows | [Multi-image light curves and observations](examples/notebooks/workflows/00_multi_image_light_curves_and_observations.ipynb), [realistic strong-lens images](examples/notebooks/workflows/01_realistic_strong_lens_image.ipynb), [end-to-end lensed quasars](examples/notebooks/workflows/02_end_to_end_lensed_quasar.ipynb), [streaming and export](examples/notebooks/workflows/03_streaming_and_exporting_results.ipynb), and [simulation datasets](examples/notebooks/workflows/04_simulation_datasets.ipynb) |
 | Validation | [Weisenbach IPM](examples/notebooks/validation/00_weisenbach_ipm_visual_validation.ipynb), [SIM5 GR](examples/notebooks/validation/01_sim5_gr_visual_validation.ipynb), [accuracy and performance](examples/notebooks/validation/02_accuracy_and_performance.ipynb), and [analytic single-point lens](examples/notebooks/validation/03_single_point_lens_validation.ipynb) |
 
@@ -587,234 +596,121 @@ delay. Out-of-range queries raise an error rather than hold an endpoint.
 Changing the generation grid can change the entire realization even with the
 same seed. A driver-specific `seed` overrides the inherited system seed.
 
-Dense continuum spectra use the same light-curve API: wavelength channels are
-simply bands in the returned `[time, band]` arrays. Use `band_batch_size` to
-bound source memory. A final partial batch is padded to the requested size to
-reuse the compiled shape, then trimmed before the result is returned.
-Configure the system source to include the reddest wavelength you will request
-so its automatically chosen spatial support encloses that emission.
+For bandpass-integrated Rubin/LSST magnitudes, combine the physical disk
+continuum with an empirical quasar spectrum and the bundled filter responses.
+The empirical spectral components are adapted from
+[Temple et al. (2021)](https://arxiv.org/abs/2109.04472).
+The source can still vary daily while the microlensing maps evolve every 25 days.
 
 ```python
-spectral_bands = {
-    f"lambda_{w:05d}": float(w) for w in range(3000, 11001, 20)
-}
-daily_lsst, spectra = system.light_curves(
-    duration_days=3650,
-    map_cadence_days=25,
-    requests=(
-        mc.LightCurveRequest(
-            bands_angstrom={"u": 3671, "g": 4827, "r": 6223,
-                             "i": 7546, "z": 8691, "y": 9712},
-            flux_cadence_days=1,
-        ),
-        mc.LightCurveRequest(bands_angstrom=spectral_bands),
-    ),
-    band_batch_size=32,
-)
-print(daily_lsst.flux.shape, spectra.flux.shape)  # [3651, 6], [147, 401]
-```
-
-Omitting `apply_driving_signal` uses the supplied driver automatically. Setting
-it to false holds the driver at its mean without removing lamp heating or
-freezing other source evolution, such as supernova expansion. Custom signals
-use unit baseline unless their metadata supplies `mean_amplitude`.
-
-To construct a source with no driving signal, omit `driving_signal` from the
-disk constructor. Light curves then work without an extra switch. Explicitly
-requesting `apply_driving_signal=True` for a source without a driver raises an
-error. Supernovae evolve through their own source model and need no driver.
-For a custom source, use `ModulatedSource` only when you intend additional
-multiplicative brightness modulation. Replacing a source replaces its driver
-too, without inheriting the previous source's driver.
-
-Set `include_microlensing_only=True` to return the driven curve and its
-constant-mean-driver comparison together. The comparison is available as
-`microlensing_only_flux` and `microlensing_only_magnitude`. Both use the same
-magnification maps and labels; the static source brightness is evaluated once.
-
-Only requested maps are retained. A request that is not an evaluated map epoch
-produces a warning and is omitted, without interpolation or extra ray tracing.
-Inspect `result.map_times_days` before indexing `result.maps`.
-
-For advanced use, the same calculation can expose refinement, additional scout
-controls, and far-field settings explicitly. You can leave these at their
-defaults when adjusting ray count, pixel resolution, temporal batch size, and
-the scout refresh interval.
-
-```python
-far_field = mc.FarFieldApproxConfig(
-    enabled=True,
-    cells_per_axis=16,           # far-field spatial partition
-    nodes_per_cell_axis=8,       # evaluation nodes per partition cell
-    exact_radius_cells=1.0,      # larger values trace more nearby stars exactly
-    taylor_order=4,              # higher values improve the far-star expansion
-    center_translation_order=10, # accuracy when translating cell expansions
-)
-
-method = mc.production_ipm_config(
-    rays=10_000_000,            # N
-    scout_ratio=2,               # k, lower values use a denser scout
-    refinement=2,                # r, true lens-equation refinement
-    virtual_refinement=4,        # v, interpolated polygon refinement
-    scout_halo_pixels=0.0,       # optional source-pixel coverage halo
-    scout_dilation_cells=1,      # conservative neighboring-cell expansion
-    dual_scout_scalar_correction=True,  # one-time k=1 to k=2 correction
-    cell_chunk_size=524_288,     # lower this to reduce peak memory
-    far_field_approx=far_field,
-)
-
-schedule = mc.production_dynamic_config(
-    temporal_batch_size=30,      # optimized for the combined LC + label path
-    light_curve_batch_size=None,  # optional sources sharing this map sequence
-    fused_temporal_ipm=True,     # disable only for implementation validation
-    scout_refresh_frames=10,     # lower for more frequent scout refreshes
-)
-
-labels = mc.CausticConfig(
-    far_field_approx=far_field,
-    # Labels inherit the shared 30-frame map batch. LC-only calls use the
-    # 49-frame production preset because they omit detA and marching squares.
-    discovery_downsample_ratio=16,  # 8192-pixel detA -> 512-pixel discovery
-    discovery_near_zero_quantile=0.05,  # retain low-|detA| coarse cells
-    discovery_dilation_cells=2,     # pad coarse critical-curve candidates
-    anchor_count=9,              # more points add alignment redundancy
-    gauge_count=9,
-    minimum_determinant_sign_pixels=4,  # remove unresolved sign islands
-    minimum_alignment_gauges=3, # minimum trusted temporal alignment set
-)
-
-explicit_result = system.light_curve(
+spectrum_model = mc.QuasarSpectrumPopulation().sample(seed=42)
+combined = system.light_curve(
     duration_days=3650,
     map_cadence_days=25,
     source_cadence_days=1,
-    method=method,
-    schedule=schedule,
-    caustics=labels,
-    include_labels=True,
-    keep_maps_at_days=(0.0,),
+    bandpasses="lsst",
+    spectral_model=spectrum_model,
+    include_microlensing_only=True,
 )
+print(combined.magnitude.shape)                     # [3651, 6]
+print(combined.microlensing_only_magnitude.shape)   # [3651, 6]
 ```
 
-The short labeled call uses a shared 30-frame map and label batch. An LC-only
-call uses the 49-frame production preset. The expanded example repeats the
-settings intentionally so every effective value is visible. Lower-level label
-query and Triton chunk controls remain available in `CausticConfig` for
-unusual workloads.
+See the [source guide](docs/sources.md) for the spectral assumptions, custom
+filters, and optional evolving-spectrum output; the [tuning guide](docs/tuning.md)
+for advanced performance controls; and the
+[Q2237 tutorial](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb)
+for the complete dynamic light-curve and GIF workflow.
 
-Only the requested day-zero map is retained. The other full-resolution maps
-are streamed through the finite-source photometry and label calculation rather
-than stored as a large cube. The first tutorial extends this same workflow to
-daily intrinsic variability, a 25-day microlensing cadence, and a fixed-scale
-GIF of all 147 maps.
+## Warmup and batching
 
-## Warmup, reuse, and profiling
-
-Compiled Torch and Triton kernels are cached by compatible execution shape.
-Reusing one `MicrolensingSystem` also reuses its seeded stellar realization.
-An explicit warmup can separate first-call compilation from production work.
+Compiled kernels are cached for compatible shapes. An optional warmup separates
+first-call compilation from production timing:
 
 ```python
-# Use a representative temporal batch so the production batch shape is warm.
 system.warmup_light_curve(include_labels=True, temporal_batch_size=30)
+```
 
-# Subsequent compatible calls reuse the realization and warmed kernels.
-next_result = system.light_curve(
+`system.light_curves(...)` batches sources sharing one map sequence, while
+`mc.batched_system_light_curves(...)` batches independent single- or multi-image
+systems. See the [dynamic guide](docs/dynamic.md) for batching and reuse, the
+[data-products guide](docs/data_products.md) for streaming and resume, and the
+[timing guide](docs/timing.md) for profiling and warmed measurements.
+
+## Multi-image light curves
+
+Resolved lensed systems use the same physical interface. This example reuses
+the source and stellar population defined above. Each macroimage has its own
+local lens parameters, while the intrinsic driver is shared.
+
+```python
+image_macros = {
+    # Each image has its own kappa, gamma, shear angle, and smooth fraction.
+    "A": mc.MacroLens(
+        convergence=0.396, shear=0.396,
+        shear_angle_deg=175.43, smooth_matter_fraction=0.0,
+    ),
+    "B": mc.MacroLens(
+        convergence=0.391, shear=0.391,
+        shear_angle_deg=141.73, smooth_matter_fraction=0.0,
+    ),
+    "C": mc.MacroLens(
+        convergence=0.715, shear=0.715,
+        shear_angle_deg=69.11, smooth_matter_fraction=0.0,
+    ),
+    "D": mc.MacroLens(
+        convergence=0.604, shear=0.604,
+        shear_angle_deg=62.54, smooth_matter_fraction=0.0,
+    ),
+}
+
+multi_image_system = mc.MultiImageSystem(
+    images=image_macros,
+    lens_redshift=0.0395,
+    source_redshift=1.695,
+    H0=70.0,
+    Om0=0.3,
+    source=source,  # its intrinsic driver realization is shared across all images
+    stellar_population=population,
+    arrival_time_delays_days={
+        "A": 0.0,
+        "B": 7.4,
+        "C": 2.1,
+        "D": 11.8,
+    },  # illustrative values in days; replace with measured or modeled delays
+    seed=0,
+)
+
+multi_image_microlensing = multi_image_system.light_curves(
     duration_days=3650,
     map_cadence_days=25,
-    rays=10_000_000,  # keep the numerical settings fixed to reuse warmed kernels
-    temporal_batch_size=30,
+    rays=10_000_000,  # sampling budget per image and map epoch
     include_labels=True,
+    apply_driving_signal=False,
 )
-```
 
-`system.light_curves(...)` batches multiple sources or trajectories through a
-shared map sequence. This is what `light_curve_batch_size` controls.
-`batched_system_maps(...)` batches unrelated static systems without sharing
-their stars. `batched_system_light_curves(...)` accepts any mixture of single,
-double, quad, or other multi-image systems. It flattens their independent
-macroimage calculations for execution and restores the original system
-grouping afterward. Compatible production Triton jobs also share one
-ownership-tagged cross-system map and label queue. Each realization keeps its
-own scout cells; incompatible images automatically retain private-stream
-execution. All three interfaces reuse compatible compiled kernels.
-
-Independent stellar realizations of the same macroimage can be generated
-together. Each seed produces a new star field. Compatible Triton or
-compiled-Torch kernels are reused.
-
-```python
-systems = [system.with_seed(seed) for seed in range(8)]
-maps = mc.batched_system_maps(
-    systems,
-    batch_size=8,  # automatically reduced if necessary to avoid an OOM
-)
-```
-
-The same systems can produce independent dynamic light curves. Each retains
-its own stars, source, trajectory, variability, maps, and labels.
-
-```python
-batch = mc.batched_system_light_curves(
-    systems,
+multi_image_combined = multi_image_system.light_curves(
     duration_days=3650,
     map_cadence_days=25,
     source_cadence_days=1,
     rays=10_000_000,
-    temporal_batch_size=30,
-    scout_refresh_frames=10,
-    curves_per_batch=3,  # individual macroimage curves, not systems
-    source_setup_batch_size=3,  # compatible Kerr disks prepared together
     include_labels=True,
-    include_microlensing_only=True,
+    apply_driving_signal=True,
 )
-curves = batch.light_curves
-print(curves[0].magnitude.shape, curves[0].microlensing_only_magnitude.shape)
 ```
 
-Large datasets can be streamed through a bounded background writer. A directory
-produces flat per-image files plus a manifest; a `.npz` path produces one
-combined archive. Neither mode retains all curves in accelerator memory.
+Each image receives an independent stellar realization. Arrival-time delays
+affect intrinsic source evolution, while lens motion remains in observer time.
+See the [multi-image guide](docs/multi_image.md) and
+[multi-image example](examples/multi_image_light_curves.py) for per-image
+settings, maps, labels, and transfer functions. The
+[resolved-quasar workflow](examples/multirate_lensed_quasar.py) also includes
+macro-image solving and Rubin OpSim sampling. The survey notebook uses a local
+OpSim SQLite database specified by `MICROCAUSTICS_LSST_OPSIM`; see Rubin's
+[`rubin_sim` data guide](https://rubin-sim.lsst.io/data-download.html) and the
+[observations guide](docs/observations.md) for cadence selection.
 
-```python
-saved = mc.batched_system_light_curves(
-    systems,
-    duration_days=3650,
-    map_cadence_days=25,
-    source_cadence_days=1,
-    curves_per_batch=3,
-    output_path="training_curves.npz",  # or a directory
-)
-first_system = saved.load_system(0)
-```
-
-Flat-directory jobs can pass `resume=True` after interruption; systems whose
-expected image files are complete are reused. `overwrite=True` starts a fresh
-logical output and replaces matching files. Combined archives are finalized
-atomically and do not support partial resume. Resume assumes the same ordered
-inputs and numerical configuration as the original call.
-
-Pass `profile=True` to collect batch wall time and `batch.seconds_per_curve`.
-They are unavailable by default, without timing-only device synchronization.
-
-CUDA memory exhaustion reduces only the active concurrency and retries the
-same numerical calculation. The best concurrency depends on the star count,
-map geometry, labels, and GPU. It can be measured explicitly with
-`mc.tune_system_light_curve_batch(..., candidates=(1, 2, 3, 4))`. Tuning is
-not run silently during production.
-
-Different convergence, shear, redshift, stellar, trajectory, variability, and
-disk parameter values also reuse an existing compatible kernel specialization.
-They do not need to share one stellar field and may be evaluated sequentially
-or through the applicable batching interface. Keep the numerical shapes and
-configuration fixed for maximum throughput. Changing source resolution, band
-count, temporal batch size, dtype, backend, or the IPM and far-field shape
-controls can require one new compiled specialization. A substantially
-different stellar count can also produce a new compiled-Torch shape variant.
-This compilation is cached and reused by later compatible realizations.
-
-Timing collection is off by default and does not add timing-only GPU
-synchronization. See the [timing guide](docs/timing.md) for optional profiling
-and first-call versus warmed performance measurements.
+## Further guides and examples
 
 `integration_domain="scout"` is the fast production path. It evaluates only
 cells that can map into the source field. `"full"` evaluates every cell in the
@@ -973,92 +869,6 @@ custom spatial and spectral Torch functions, and independently sampled source
 and map cadences. The paper's Type Ia-like prototype is only an explicit named
 reproducibility preset.
 
-Resolved lensed systems use the same physical interface. The following example
-continues from the single-image system above and reuses its redshifts, source,
-stellar population, and intrinsic driver. Define the local macro lens for each
-image and supply the measured arrival delays once.
-
-```python
-image_macros = {
-    # Each image has its own kappa, gamma, shear angle, and smooth fraction.
-    "A": mc.MacroLens(
-        convergence=0.396, shear=0.396,
-        shear_angle_deg=175.43, smooth_matter_fraction=0.0,
-    ),
-    "B": mc.MacroLens(
-        convergence=0.391, shear=0.391,
-        shear_angle_deg=141.73, smooth_matter_fraction=0.0,
-    ),
-    "C": mc.MacroLens(
-        convergence=0.715, shear=0.715,
-        shear_angle_deg=69.11, smooth_matter_fraction=0.0,
-    ),
-    "D": mc.MacroLens(
-        convergence=0.604, shear=0.604,
-        shear_angle_deg=62.54, smooth_matter_fraction=0.0,
-    ),
-}
-
-multi_image_system = mc.MultiImageSystem(
-    images=image_macros,
-    lens_redshift=0.0395,
-    source_redshift=1.695,
-    H0=70.0,
-    Om0=0.3,
-    source=source,  # its intrinsic driver realization is shared across all images
-    stellar_population=population,
-    arrival_time_delays_days={
-        "A": 0.0,
-        "B": 7.4,
-        "C": 2.1,
-        "D": 11.8,
-    },  # illustrative values in days; replace with measured or modeled delays
-    seed=0,
-)
-
-multi_image_microlensing = multi_image_system.light_curves(
-    duration_days=3650,
-    map_cadence_days=25,
-    rays=10_000_000,  # sampling budget per image and map epoch
-    include_labels=True,
-    apply_driving_signal=False,
-)
-
-multi_image_combined = multi_image_system.light_curves(
-    duration_days=3650,
-    map_cadence_days=25,
-    source_cadence_days=1,
-    rays=10_000_000,
-    include_labels=True,
-    apply_driving_signal=True,
-)
-
-multi_image_maps = multi_image_system.magnification_maps(rays=10_000_000)
-print(multi_image_maps["B"].values.shape)  # [1024, 1024], image B at day zero
-```
-
-Each image receives an independent stellar realization. Shared numerical
-settings may be replaced by per-image mappings when necessary. The high-level
-interface applies cosmological time delays only to intrinsic source evolution
-while keeping lens motion in observer time. Global macro-model results can be
-passed directly to `MultiImageSystem.from_macroimage_solutions`.
-The same object provides `dynamic_maps`, `caustics`, `labeled_caustics`,
-fine-cadence `light_curves`, and microlensing-weighted `transfer_functions`.
-See
-[`docs/multi_image.md`](docs/multi_image.md) and
-[`examples/multi_image_light_curves.py`](examples/multi_image_light_curves.py).
-The resolved-quasar workflow additionally supports optional EPL+shear macro
-image/delay solving, sparse dynamic maps with fine-cadence source evolution,
-microlensing-weighted transfer functions, and Rubin OpSim sampling. See
-[`examples/multirate_lensed_quasar.py`](examples/multirate_lensed_quasar.py).
-The survey notebook reads a local OpSim SQLite database from
-`MICROCAUSTICS_LSST_OPSIM`. Rubin's
-[`rubin_sim` data guide](https://rubin-sim.lsst.io/data-download.html) describes
-the baseline-database download. `RubinOpSimCadenceIndex` loads that database
-once per process and provides `sample(seed=..., survey="wfd" | "ddf")` plus
-coordinate-based selection with `at_sky_position`. A deterministic
-illustrative cadence is used when that variable is not set. See
-[`docs/observations.md`](docs/observations.md).
 Instrument-independent macro-image scenes can use `caustics.LensSource`. See
 [`docs/macro_image_rendering.md`](docs/macro_image_rendering.md).
 
@@ -1143,6 +953,8 @@ motivate.
   [*Null geodesics of the Kerr exterior*](https://doi.org/10.1103/PhysRevD.101.044032).
 ### Dynamic light curves, variability, and LSST-like workflows
 
+- Temple et al. (2021),
+  [*Modelling type 1 quasar colours in the era of Rubin and Euclid*](https://arxiv.org/abs/2109.04472).
 - Fagin et al. (2025),
   [*Predicting High-magnification Events in Microlensed Quasars in the Era of LSST using Recurrent Neural Networks*](https://doi.org/10.3847/1538-4357/adaebb).
 - Fagin et al. (2025),

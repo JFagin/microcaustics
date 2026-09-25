@@ -5,6 +5,7 @@ configuration objects. Specialized implementations remain organized in the
 source, caustic, lens, and relativity subpackages.
 """
 
+from .bandpasses import Bandpass, BandpassGrid, BandpassSet
 from .batching import (
     IndependentBatchTuningResult,
     IndependentBatchTuningTrial,
@@ -129,6 +130,7 @@ from .results import (
     MultiImageTransferFunctions,
     MultirateLabeledLightCurve,
     RenderedMacroImage,
+    TimeDependentSpectrum,
     TimingBreakdown,
     TransferFunction,
     TransferFunctionSeries,
@@ -176,6 +178,14 @@ from .sources import (
     thin_disk_flux_radius_rg,
     thin_disk_temperature4,
 )
+from .spectra import (
+    ClippedNormal,
+    LogNormal,
+    Normal,
+    QuasarSpectrum,
+    QuasarSpectrumComponents,
+    QuasarSpectrumPopulation,
+)
 from .strong_lensing import (
     CallableMacroModel,
     CausticsMacroModel,
@@ -219,6 +229,9 @@ from .validation import (
 __all__ = [
     "AutoTuningConfig",
     "Backend",
+    "Bandpass",
+    "BandpassGrid",
+    "BandpassSet",
     "AnchorGaugeLabels",
     "AxisLamppostProfile",
     "AxisLamppostRayTransfer",
@@ -330,10 +343,17 @@ __all__ = [
     "TransferredThinDiskSource",
     "ViscousFluxProfile",
     "TimingBreakdown",
+    "TimeDependentSpectrum",
     "TransferFunction",
     "TransferFunctionSeries",
     "MeanResponseDelaySource",
     "TransferFunctionSource",
+    "Normal",
+    "LogNormal",
+    "ClippedNormal",
+    "QuasarSpectrum",
+    "QuasarSpectrumComponents",
+    "QuasarSpectrumPopulation",
     "FarFieldApproxConfig",
     "TuningResult",
     "TuningTrial",

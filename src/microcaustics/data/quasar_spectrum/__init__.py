@@ -1,0 +1,1 @@
+"""Empirical quasar spectral templates."""

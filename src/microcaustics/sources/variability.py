@@ -78,6 +78,36 @@ class TimeShiftedSource:
             raise TypeError("the wrapped source does not support wavelength selection")
         return replace(self, source=with_bands(bands_angstrom))
 
+    @property
+    def _brightness_state(self):
+        """Expose fused thermal evaluation only when the wrapped source has it."""
+
+        if getattr(self.source, "_brightness_state", None) is None:
+            return None
+        return self._shifted_brightness_state
+
+    def _shifted_brightness_state(self, times_days, *, device=None, dtype=None):
+        times = _as_times(times_days)
+        resolved_dtype = dtype or (
+            times.dtype if times.is_floating_point() else torch.get_default_dtype()
+        )
+        times = times.to(
+            device=times.device if device is None else device, dtype=resolved_dtype
+        )
+        return self.source._brightness_state(
+            times - float(self.delay_days), device=device, dtype=dtype
+        )
+
+    @property
+    def _flux_from_brightness_state(self):
+        """Arrival delays affect the heating state, never the microlens epochs."""
+
+        return getattr(self.source, "_flux_from_brightness_state", None)
+
+    @property
+    def _brightness_from_state(self):
+        return getattr(self.source, "_brightness_from_state", None)
+
     def metadata(self) -> Mapping[str, object]:
         """Return the delay convention and wrapped source provenance."""
 
@@ -461,7 +491,12 @@ def driving_signal_from_psd(
         # ``.real`` aliases the complex destination. Newer PyTorch releases
         # reject the overlapping assignment even though the intended Nyquist
         # projection is unambiguous, so materialize the real component first.
-        positive_spectrum[:, -1] = positive_spectrum[:, -1].real.clone()
+        nyquist = positive_spectrum[:, -1].real.clone()
+        if fourier_sampling == "gaussian":
+            # The unpaired real Nyquist coefficient needs the full PSD
+            # variance, rather than half the variance of a complex pair.
+            nyquist = nyquist * math.sqrt(2.0)
+        positive_spectrum[:, -1] = nyquist
     zero = torch.zeros(
         (bands, 1),
         device=resolved_device,
@@ -577,7 +612,7 @@ class _FixedHorizonDrivingSignal:
             standard_deviation=self.standard_deviation,
             padding_factor=self.padding_factor,
             crop_start_samples=count if self.padding_factor >= 2 else 0,
-            fourier_sampling="random_phase",
+            fourier_sampling="gaussian",
             amplitude_transform="lognormal",
             seed=self.seed,
             dtype=self.dtype,
@@ -611,6 +646,8 @@ class _FixedHorizonDrivingSignal:
 
         return {
             "type": "fixed_horizon_broken_power_law",
+            "fourier_sampling": "gaussian",
+            "amplitude_transform": "lognormal",
             **self.psd.metadata(),
             "cadence_days": self.cadence_days,
             "max_duration_days": self.max_duration_days,
@@ -755,6 +792,10 @@ def broken_power_law_driving_signal(
 ) -> DrivingSignal:
     """Define a reproducible padded lognormal broken-power-law driver.
 
+    Gaussian real and imaginary Fourier coefficients randomize both phase
+    and amplitude. The PSD describes the latent sequence before the
+    lognormal transform, not the exact PSD of the positive driver.
+
     ``alpha_L`` and ``alpha_R`` are the positive low- and high-frequency PSD
     slopes on the two sides of the break. Without explicit times, the signal
     uses a fixed grid from ``-history_days`` to ``max_duration_days`` with
@@ -805,7 +846,7 @@ def broken_power_law_driving_signal(
         standard_deviation=standard_deviation,
         padding_factor=padding_factor,
         crop_start_samples=sample_count if padding_factor >= 2 else 0,
-        fourier_sampling="random_phase",
+        fourier_sampling="gaussian",
         amplitude_transform="lognormal",
         seed=seed,
         extrapolation=extrapolation,

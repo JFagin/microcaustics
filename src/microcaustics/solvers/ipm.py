@@ -366,6 +366,8 @@ def _source_scout_union_temporal(
     lens_region: PlaneRegion,
     source_grid: PlaneGrid,
     config: IPMConfig,
+    *,
+    _return_selected_masks: bool = False,
 ):
     """Select the union of several endpoint scouts in one CUDA query.
 
@@ -454,17 +456,16 @@ def _source_scout_union_temporal(
     local_y = local_y.reshape(1, -1)
     local_x = local_x.reshape(1, -1)
 
-    def expand_tiles(tiles: torch.Tensor) -> torch.Tensor:
+    def expand_mask(mask: torch.Tensor) -> torch.Tensor:
+        tiles = mask.nonzero(as_tuple=False)
         fine_rows = tiles[:, 0, None] * ratio + local_y
         fine_columns = tiles[:, 1, None] * ratio + local_x
         return (fine_rows * fine_nx + fine_columns).reshape(-1)
 
     component_fine_linear = tuple(
-        expand_tiles(frame_selected.nonzero(as_tuple=False))
-        for frame_selected in selected
+        expand_mask(frame_selected) for frame_selected in selected
     )
-    union_tiles = selected.any(dim=0).nonzero(as_tuple=False)
-    fine_linear = expand_tiles(union_tiles)
+    fine_linear = expand_mask(selected.any(dim=0))
     counts = torch.stack((selected_before, selected_after)).detach().cpu()
     metadata = [
         {
@@ -484,7 +485,8 @@ def _source_scout_union_temporal(
         }
         for frame in range(len(far_fields))
     ]
-    return fine_linear, fine_ny, fine_nx, metadata, component_fine_linear
+    result = (fine_linear, fine_ny, fine_nx, metadata, component_fine_linear)
+    return (*result, selected) if _return_selected_masks else result
 
 
 @torch.no_grad()

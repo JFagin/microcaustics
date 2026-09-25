@@ -131,12 +131,8 @@ if triton is not None:
             star_x = tl.load(star_x_ptr + star_offset, mask=active, other=0.0)
             star_y = tl.load(star_y_ptr + star_offset, mask=active, other=0.0)
             mass = tl.load(mass_ptr + star_offset, mask=active, other=0.0)
-            distance_x = tl.maximum(
-                tl.maximum(left_x - star_x, star_x - right_x), 0.0
-            )
-            distance_y = tl.maximum(
-                tl.maximum(left_y - star_y, star_y - right_y), 0.0
-            )
+            distance_x = tl.maximum(tl.maximum(left_x - star_x, star_x - right_x), 0.0)
+            distance_y = tl.maximum(tl.maximum(left_y - star_y, star_y - right_y), 0.0)
             local = active & (
                 distance_x * distance_x + distance_y * distance_y <= exact_radius2
             )
@@ -163,6 +159,7 @@ if triton is not None:
         local_mass_ptr,
         coefficient_real_ptr,
         coefficient_imag_ptr,
+        bulk_source_offset_ptr,
         output_x_ptr,
         output_y_ptr,
         n_rays,
@@ -261,9 +258,7 @@ if triton is not None:
         expansion_y = cell_left_y + (node_y + 0.5) * (cell_dy / NODES)
         delta_real = x - expansion_x
         delta_imag = -(y - expansion_y)
-        coefficient_base = (
-            ((packed_cell * NODES + node_y) * NODES + node_x) * 5
-        )
+        coefficient_base = ((packed_cell * NODES + node_y) * NODES + node_x) * 5
         if DO_JACOBIAN:
             value_real = 4.0 * tl.load(
                 coefficient_real_ptr + coefficient_base + 4,
@@ -320,6 +315,8 @@ if triton is not None:
                 mask=valid,
             )
         else:
+            bulk_offset_x = tl.load(bulk_source_offset_ptr + 2 * frame)
+            bulk_offset_y = tl.load(bulk_source_offset_ptr + 2 * frame + 1)
             value_real = tl.load(
                 coefficient_real_ptr + coefficient_base + 4,
                 mask=valid,
@@ -347,12 +344,12 @@ if triton is not None:
             alpha_y += value_imag
             tl.store(
                 output_x_ptr + ray,
-                beta_xx * x + beta_xy * y - alpha_x,
+                beta_xx * x + beta_xy * y - alpha_x + bulk_offset_x,
                 mask=valid,
             )
             tl.store(
                 output_y_ptr + ray,
-                beta_xy * x + beta_yy * y - alpha_y,
+                beta_xy * x + beta_yy * y - alpha_y + bulk_offset_y,
                 mask=valid,
             )
 
@@ -607,6 +604,7 @@ def evaluate_far_field_p4_triton(
         far_field.local_mass,
         far_field.coefficient_real,
         far_field.coefficient_imag,
+        far_field.bulk_source_offset_uas,
         output_x,
         output_y,
         x.numel(),
@@ -689,6 +687,7 @@ def evaluate_far_field_p4_regular_grid_jacobian_triton(
         far_field.local_mass,
         far_field.coefficient_real,
         far_field.coefficient_imag,
+        far_field.bulk_source_offset_uas,
         target,
         target,
         count,
@@ -763,6 +762,7 @@ def evaluate_far_field_p4_batch_triton(
         far_field_batch.local_mass,
         far_field_batch.coefficient_real,
         far_field_batch.coefficient_imag,
+        far_field_batch.bulk_source_offset_uas,
         output_x,
         output_y,
         total_rays,
@@ -822,7 +822,9 @@ def evaluate_far_field_p4_indexed_triton(
         raise ValueError("the fused Triton evaluator supports Taylor order four")
     x = x.contiguous().reshape(-1)
     y = y.contiguous().reshape(-1)
-    frame_index = frame_index.to(device=x.device, dtype=torch.int32).contiguous().reshape(-1)
+    frame_index = (
+        frame_index.to(device=x.device, dtype=torch.int32).contiguous().reshape(-1)
+    )
     if x.shape != y.shape or x.shape != frame_index.shape:
         raise ValueError("x, y, and frame_index must have matching shapes")
     output_x = torch.empty_like(x)
@@ -846,6 +848,7 @@ def evaluate_far_field_p4_indexed_triton(
         far_field_batch.local_mass,
         far_field_batch.coefficient_real,
         far_field_batch.coefficient_imag,
+        far_field_batch.bulk_source_offset_uas,
         output_x,
         output_y,
         x.numel(),

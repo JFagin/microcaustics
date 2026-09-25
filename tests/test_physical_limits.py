@@ -11,6 +11,20 @@ import microcaustics as mc
 
 
 class VariabilityLimitTests(unittest.TestCase):
+    def test_gaussian_fourier_power_has_ensemble_scatter_and_real_nyquist(self) -> None:
+        # A white latent PSD has exponentially distributed interior-bin power.
+        # An unpaired Nyquist bin must have the same mean power, not half.
+        count, bands = 256, 512
+        signal = mc.driving_signal_from_psd(
+            torch.arange(count, dtype=torch.float64),
+            lambda frequency: torch.ones((bands, frequency.numel()), dtype=frequency.dtype),
+            padding_factor=1, seed=87, dtype=torch.float64,
+        )
+        power = torch.fft.rfft(torch.log(signal.values), dim=0).abs().square()[1:]
+        interior = power[:-1]
+        self.assertAlmostEqual(float(interior.std() / interior.mean()), 1.0, delta=0.06)
+        self.assertAlmostEqual(float(power[-1].mean() / interior.mean()), 1.0, delta=0.18)
+
     def test_broken_power_law_psd_matches_formula_and_asymptotic_slopes(self) -> None:
         psd = mc.BrokenPowerLawPSD(
             break_timescale_days=100.0,

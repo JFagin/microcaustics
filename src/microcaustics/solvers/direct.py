@@ -39,9 +39,7 @@ def _deflection_block(
 
     dx = ray_x[:, None] - star_x[None]
     dy = ray_y[:, None] - star_y[None]
-    separation_squared = (dx.square() + dy.square()).clamp_min(
-        minimum_radius_squared
-    )
+    separation_squared = (dx.square() + dy.square()).clamp_min(minimum_radius_squared)
     weight = radius_squared[None] / separation_squared
     return (dx * weight).sum(dim=1), (dy * weight).sum(dim=1)
 
@@ -58,9 +56,7 @@ def _jacobian_block(
 
     dx = ray_x[:, None] - star_x[None]
     dy = ray_y[:, None] - star_y[None]
-    separation_squared = (dx.square() + dy.square()).clamp_min(
-        minimum_radius_squared
-    )
+    separation_squared = (dx.square() + dy.square()).clamp_min(minimum_radius_squared)
     weight = radius_squared[None] / separation_squared.square()
     return (
         ((dy.square() - dx.square()) * weight).sum(dim=1),
@@ -179,6 +175,7 @@ def raytrace_direct(
         dtype=runtime.dtype,
         device=runtime.device,
     )
+    bulk_offset_x, bulk_offset_y = simulation.bulk_source_offset_uas(time_days)
     minimum_radius_squared = torch.as_tensor(
         1.0e-30 if runtime.dtype == torch.float32 else 1.0e-300,
         device=runtime.device,
@@ -212,8 +209,8 @@ def raytrace_direct(
             compiled_complete = compiled_complete and used
         alpha_x.add_(kappa_sheet * ray_x + gamma1 * ray_x + gamma2 * ray_y)
         alpha_y.add_(kappa_sheet * ray_y + gamma2 * ray_x - gamma1 * ray_y)
-        source_x[ray_start:ray_stop] = ray_x - alpha_x
-        source_y[ray_start:ray_stop] = ray_y - alpha_y
+        source_x[ray_start:ray_stop] = ray_x - alpha_x + bulk_offset_x
+        source_y[ray_start:ray_stop] = ray_y - alpha_y + bulk_offset_y
 
     ray_chunks = (n_rays + ray_chunk - 1) // ray_chunk if n_rays else 0
     star_chunks = (n_stars + star_chunk - 1) // star_chunk if n_stars else 0
@@ -226,9 +223,7 @@ def raytrace_direct(
         star_chunks_per_ray_chunk=star_chunks,
         requested_backend=runtime.backend.value,
         effective_backend=(
-            "torch-compile"
-            if compiled_used and compiled_complete
-            else "torch-eager"
+            "torch-compile" if compiled_used and compiled_complete else "torch-eager"
         ),
     )
     return source_x.reshape(shape), source_y.reshape(shape), diagnostics
@@ -330,9 +325,9 @@ def jacobian_determinant_direct(
         alpha_xx = kappa_sheet + gamma1 + point_xx
         alpha_yy = kappa_sheet - gamma1 - point_xx
         alpha_xy = gamma2 + point_xy
-        determinant[ray_start:ray_stop] = (
-            (1.0 - alpha_xx) * (1.0 - alpha_yy) - alpha_xy.square()
-        )
+        determinant[ray_start:ray_stop] = (1.0 - alpha_xx) * (
+            1.0 - alpha_yy
+        ) - alpha_xy.square()
 
     ray_chunks = (n_rays + ray_chunk - 1) // ray_chunk if n_rays else 0
     star_chunks = (n_stars + star_chunk - 1) // star_chunk if n_stars else 0
@@ -345,9 +340,7 @@ def jacobian_determinant_direct(
         star_chunks_per_ray_chunk=star_chunks,
         requested_backend=runtime.backend.value,
         effective_backend=(
-            "torch-compile"
-            if compiled_used and compiled_complete
-            else "torch-eager"
+            "torch-compile" if compiled_used and compiled_complete else "torch-eager"
         ),
     )
     return determinant.reshape(shape), diagnostics

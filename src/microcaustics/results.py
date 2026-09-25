@@ -78,6 +78,53 @@ class _RetainedMaps(tuple):
 
 
 @dataclass(frozen=True)
+class TimeDependentSpectrum:
+    """Observed-frame spectral flux densities retained from one calculation.
+
+    Flux arrays have shape ``[time, wavelength]`` and use Jy. Components are
+    reduced spectra, never the much larger spatial source-image tensors.
+    """
+
+    times_days: torch.Tensor
+    wavelengths_angstrom: torch.Tensor
+    total_flux: torch.Tensor
+    continuum_flux: torch.Tensor
+    microlensing_only_continuum_flux: torch.Tensor | None = None
+    unlensed_continuum_flux: torch.Tensor | None = None
+    components: Mapping[str, torch.Tensor] = field(default_factory=dict)
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        times = torch.as_tensor(self.times_days)
+        wavelengths = torch.as_tensor(self.wavelengths_angstrom)
+        total = torch.as_tensor(self.total_flux)
+        continuum = torch.as_tensor(self.continuum_flux)
+        expected = (times.numel(), wavelengths.numel())
+        if times.ndim != 1 or wavelengths.ndim != 1:
+            raise ValueError("spectrum times and wavelengths must be one-dimensional")
+        if total.shape != expected or continuum.shape != expected:
+            raise ValueError(f"spectral flux arrays must have shape {expected}")
+        optional = {
+            "microlensing_only_continuum_flux": self.microlensing_only_continuum_flux,
+            "unlensed_continuum_flux": self.unlensed_continuum_flux,
+        }
+        for name, value in optional.items():
+            if value is not None:
+                tensor = torch.as_tensor(value)
+                if tensor.shape != expected:
+                    raise ValueError(f"{name} must have shape {expected}")
+                object.__setattr__(self, name, tensor)
+        components = {name: torch.as_tensor(value) for name, value in self.components.items()}
+        if any(value.shape != expected for value in components.values()):
+            raise ValueError(f"spectral components must have shape {expected}")
+        object.__setattr__(self, "times_days", times)
+        object.__setattr__(self, "wavelengths_angstrom", wavelengths)
+        object.__setattr__(self, "total_flux", total)
+        object.__setattr__(self, "continuum_flux", continuum)
+        object.__setattr__(self, "components", components)
+
+
+@dataclass(frozen=True)
 class LightCurve:
     """Physical multiband photometry and optional retained maps and labels.
 
@@ -99,6 +146,9 @@ class LightCurve:
     maps: tuple[MagnificationMap, ...] = ()
     labels: LightCurveLabels | None = None
     microlensing_only_flux: torch.Tensor | None = None
+    microlensing_only_unlensed_flux: torch.Tensor | None = None
+    spectrum: TimeDependentSpectrum | None = None
+    component_flux: Mapping[str, torch.Tensor] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         times = torch.as_tensor(self.times_days)
@@ -117,6 +167,25 @@ class LightCurve:
             if microlensing_only.shape != flux.shape:
                 raise ValueError("microlensing_only_flux must match flux shape")
             object.__setattr__(self, "microlensing_only_flux", microlensing_only)
+        if self.microlensing_only_unlensed_flux is not None:
+            microlensing_only_unlensed = torch.as_tensor(
+                self.microlensing_only_unlensed_flux
+            )
+            if microlensing_only_unlensed.shape != flux.shape:
+                raise ValueError(
+                    "microlensing_only_unlensed_flux must match flux shape"
+                )
+            object.__setattr__(
+                self,
+                "microlensing_only_unlensed_flux",
+                microlensing_only_unlensed,
+            )
+        components = {
+            name: torch.as_tensor(value) for name, value in self.component_flux.items()
+        }
+        if any(value.shape != flux.shape for value in components.values()):
+            raise ValueError("component_flux arrays must match flux shape")
+        object.__setattr__(self, "component_flux", components)
         object.__setattr__(self, "times_days", times)
         object.__setattr__(self, "flux", flux)
         maps = self.maps.values() if isinstance(self.maps, Mapping) else self.maps
@@ -162,6 +231,7 @@ class LightCurve:
         return replace(
             self,
             microlensing_only_flux=comparison.flux,
+            microlensing_only_unlensed_flux=comparison.unlensed_flux,
             metadata={**self.metadata, "microlensing_only_included": True},
         )
 

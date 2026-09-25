@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -491,6 +491,12 @@ class ThinDiskSource:
     relativity: str = "none"
     name: str = "thin_disk"
     is_time_static: bool = True
+    _brightness_cache: dict = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _validate_viscous_prescriptions(
@@ -556,7 +562,7 @@ class ThinDiskSource:
             **kwargs,
         )
 
-    def _frame(self, *, device, dtype) -> torch.Tensor:
+    def _uncached_frame(self, *, device, dtype) -> torch.Tensor:
         mass_solar = _scalar_tensor(
             self.black_hole_mass_solar,
             name="black_hole_mass_solar",
@@ -578,6 +584,8 @@ class ThinDiskSource:
                 dtype=dtype,
             )
         )
+        # Match the Kerr observer-screen convention: zero position angle puts
+        # the projected minor axis along screen y and the line of nodes along x.
         position_angle = torch.deg2rad(
             _scalar_tensor(
                 self.position_angle_deg,
@@ -585,7 +593,7 @@ class ThinDiskSource:
                 device=device,
                 dtype=dtype,
             )
-        )
+        ) + 0.5 * math.pi
         redshift = _scalar_tensor(
             self.source_redshift,
             name="source_redshift",
@@ -694,6 +702,25 @@ class ThinDiskSource:
             intensity_nu * (1.0 + redshift) / scaled_distance.square() * 1.0e-14
         )
         return torch.where(masked[..., None], 0.0, brightness)
+
+    def _frame(self, *, device, dtype) -> torch.Tensor:
+        device = torch.device(device)
+        key = (device.type, device.index, dtype)
+        if not torch.is_grad_enabled():
+            entry = self._brightness_cache.get(key)
+            if entry is not None:
+                frame, ready = entry
+                if ready is not None:
+                    torch.cuda.current_stream(device).wait_event(ready)
+                return frame
+        frame = self._uncached_frame(device=device, dtype=dtype)
+        if not torch.is_grad_enabled():
+            ready = None
+            if device.type == "cuda":
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(device))
+            self._brightness_cache[key] = (frame, ready)
+        return frame
 
     def brightness(
         self,

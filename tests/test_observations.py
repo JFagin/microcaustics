@@ -264,7 +264,9 @@ class ObservationTests(unittest.TestCase):
         self.assertTrue(bool(torch.all(first.values > 0)))
         metadata = first.metadata()
         self.assertEqual(metadata["psd"], "smooth_broken_power_law")
-        self.assertEqual(metadata["fourier_sampling"], "random_phase")
+        self.assertEqual(metadata["fourier_sampling"], "gaussian")
+        self.assertEqual(metadata["padding_factor"], 5)
+        self.assertEqual(metadata["crop_start_samples"], times.numel())
         self.assertEqual(metadata["break_timescale_days"], 200.0)
 
     def test_broken_psd_driver_supports_even_fft_length(self) -> None:
@@ -277,6 +279,23 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(tuple(signal.values.shape), (400, 1))
         self.assertTrue(bool(torch.all(torch.isfinite(signal.values))))
         self.assertTrue(bool(torch.all(signal.values > 0)))
+
+    def test_fixed_horizon_driver_matches_explicit_gaussian_interior_crop(self) -> None:
+        times = torch.arange(-20., 101., dtype=torch.float64)
+        fixed = mc.broken_power_law_driving_signal(
+            cadence_days=1., history_days=20., max_duration_days=100.,
+            seed=17, dtype=torch.float64,
+        )
+        explicit = mc.driving_signal_from_psd(
+            times, mc.BrokenPowerLawPSD(), seed=17, padding_factor=5,
+            crop_start_samples=len(times), fourier_sampling="gaussian",
+            dtype=torch.float64,
+        )
+        actual = fixed.amplitudes(times, bands=1, dtype=torch.float64, device="cpu")
+        torch.testing.assert_close(actual, explicit.values)
+        # Querying only part of the same fixed horizon must not redraw it.
+        subset = fixed.amplitudes(times[30:60], bands=1, dtype=torch.float64, device="cpu")
+        torch.testing.assert_close(subset, actual[30:60])
 
     def test_arbitrary_multiband_psd_callable_is_supported(self) -> None:
         def psd(frequency: torch.Tensor) -> torch.Tensor:

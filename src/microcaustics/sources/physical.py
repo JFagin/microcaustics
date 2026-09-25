@@ -15,19 +15,27 @@ from ..lens import LensingDistances
 from ..lens.models import _source_distances_from_redshift
 from ..relativity import (
     ObserverScreen,
+    ObserverTransfer,
     add_observer_coordinates,
+    approximate_circular_disk_gfactor,
     axis_lamppost_profile,
+    kerr_isco_radius,
+    lamppost_source_height_rg,
     trace_primary_equatorial,
 )
 from ..relativity.coordinates import add_observer_coordinates_batch
 from ..runtime import ResolvedRuntime, RuntimeConfig, resolve_runtime
 from .analytic import GaussianSource
 from .base import PixelatedSource, SourceGeometry
-from .reprocessing import ThermalReprocessingSource
+from .reprocessing import (
+    ThermalReprocessingSource,
+    lamppost_irradiation_efficiency,
+)
 from .thin_disk import (
     RadiativeEfficiency,
     ThinDiskSource,
     ViscousFluxProfile,
+    _thin_disk_temperature4_coefficient,
     _validate_viscous_prescriptions,
     thin_disk_flux_radius_rg,
 )
@@ -219,11 +227,13 @@ def _resolve_source_distances(
 
 @dataclass(frozen=True)
 class ThinDiskModel:
-    """A physical thin accretion disk without a predetermined pixel grid.
+    """A straight-screen thin disk without a predetermined pixel grid.
 
     The reddest requested band sets the common source support because it has
     the largest thermal-emission radius. ``SourceGridConfig`` controls the
-    enclosed-flux fraction, numerical margin, and output resolution.
+    enclosed-flux fraction, numerical margin, and output resolution. Supplying
+    ``driving_signal`` adds an analytic Euclidean axial-lamppost response and
+    returns the same thermal-reprocessing interface as ``KerrDiskModel``.
     """
 
     black_hole_mass_solar: float
@@ -239,8 +249,9 @@ class ThinDiskModel:
     temperature_slope_beta: float = 0.75
     viscous_flux_profile: ViscousFluxProfile = "novikov-thorne"
     radiative_efficiency: RadiativeEfficiency = None
-    support_lamp_fraction: float = 0.0
-    support_corona_height_above_isco_rg: float = 20.0
+    driving_signal: DrivingSignal | None = None
+    lamp_fraction: float = 0.0
+    corona_height_above_isco_rg: float = 20.0
     relativity: str = "none"
     grid: SourceGridConfig = SourceGridConfig()
     source_grid_shape: int | tuple[int, int] | None = None
@@ -249,6 +260,9 @@ class ThinDiskModel:
     name: str = "thin_disk"
 
     def __post_init__(self) -> None:
+        from .variability import _validate_source_driver
+
+        _validate_source_driver(self)
         _validate_viscous_prescriptions(
             self.viscous_flux_profile,
             self.radiative_efficiency,
@@ -284,10 +298,10 @@ class ThinDiskModel:
             raise ValueError("band names must be unique")
         if self.source_redshift is not None and self.source_redshift < 0.0:
             raise ValueError("source_redshift must be non-negative")
-        if self.support_lamp_fraction < 0.0:
-            raise ValueError("support_lamp_fraction must be non-negative")
-        if self.support_corona_height_above_isco_rg < 0.0:
-            raise ValueError("support_corona_height_above_isco_rg must be non-negative")
+        if self.lamp_fraction < 0.0:
+            raise ValueError("lamp_fraction must be non-negative")
+        if self.corona_height_above_isco_rg < 0.0:
+            raise ValueError("corona_height_above_isco_rg must be non-negative")
         if self.relativity not in {"none", "approximate"}:
             raise ValueError("relativity must be 'none' or 'approximate'")
 
@@ -314,6 +328,11 @@ class ThinDiskModel:
             bands_angstrom=bands_angstrom,
         )
 
+    def with_driving_signal(self, signal: DrivingSignal | None) -> ThinDiskModel:
+        """Return the same disk with a different variability driver."""
+
+        return replace(self, driving_signal=signal)
+
     def support_radius_m(
         self,
         distances: LensingDistances,
@@ -332,8 +351,8 @@ class ThinDiskModel:
             viscous_flux_profile=self.viscous_flux_profile,
             radiative_efficiency=self.radiative_efficiency,
             color_correction=self.color_correction,
-            lamp_fraction=self.support_lamp_fraction,
-            corona_height_above_isco_rg=(self.support_corona_height_above_isco_rg),
+            lamp_fraction=self.lamp_fraction,
+            corona_height_above_isco_rg=self.corona_height_above_isco_rg,
             flux_fraction=resolved.enclosed_flux_fraction,
             safety_factor=resolved.margin,
             radial_samples=resolved.radial_samples,
@@ -365,7 +384,7 @@ class ThinDiskModel:
         grid: PlaneGrid | None = None,
         policy: SourceGridConfig | None = None,
         runtime: RuntimeConfig | ResolvedRuntime | None = None,
-    ) -> ThinDiskSource:
+    ) -> ThinDiskSource | ThermalReprocessingSource:
         """Materialize the disk using the validated source calculation.
 
         Standalone callers supply ``source_redshift``, ``H0`` and ``Om0``.
@@ -396,6 +415,13 @@ class ThinDiskModel:
             wavelengths_angstrom=tuple(float(v) for v in self.wavelengths_angstrom),
             band_names=tuple(self.band_names),
         )
+        if self.driving_signal is not None:
+            return _newtonian_lamppost_source(
+                self,
+                geometry,
+                distances,
+                runtime=runtime,
+            )
         return ThinDiskSource.from_lensing_distances(
             geometry,
             self.black_hole_mass_solar,
@@ -412,6 +438,142 @@ class ThinDiskModel:
             relativity=self.relativity,
             name=self.name,
         )
+
+
+def _newtonian_lamppost_source(
+    model: ThinDiskModel,
+    geometry: SourceGeometry,
+    distances: LensingDistances,
+    *,
+    runtime: RuntimeConfig | ResolvedRuntime | None,
+) -> ThermalReprocessingSource:
+    """Materialize the Euclidean counterpart of the Kerr lamppost source."""
+
+    if model.driving_signal is None:
+        raise ValueError("a Newtonian lamppost source requires a driving signal")
+    resolved = runtime if isinstance(runtime, ResolvedRuntime) else resolve_runtime(runtime)
+    device, dtype = resolved.device, resolved.dtype
+    source_redshift = model._redshift(distances)
+    ny, nx = geometry.shape
+    dy, dx = geometry.pixel_scale_m
+    x = (torch.arange(nx, device=device, dtype=dtype) + 0.5 - 0.5 * nx) * dx
+    y = (torch.arange(ny, device=device, dtype=dtype) + 0.5 - 0.5 * ny) * dy
+    projected_y, projected_x = torch.meshgrid(y, x, indexing="ij")
+    inclination = torch.deg2rad(
+        torch.as_tensor(model.inclination_deg, device=device, dtype=dtype)
+    )
+    # Use the same observer-screen position-angle convention as KerrDiskModel.
+    position_angle = torch.deg2rad(
+        torch.as_tensor(model.position_angle_deg, device=device, dtype=dtype)
+    ) + 0.5 * math.pi
+    cosine, sine = torch.cos(position_angle), torch.sin(position_angle)
+    disk_x = (cosine * projected_x + sine * projected_y) / torch.cos(
+        inclination
+    ).clamp_min(torch.finfo(dtype).tiny)
+    disk_y = -sine * projected_x + cosine * projected_y
+    gravitational_radius_m = (
+        _G * _M_SUN / _C**2 * float(model.black_hole_mass_solar)
+    )
+    disk_x_rg = disk_x / gravitational_radius_m
+    disk_y_rg = disk_y / gravitational_radius_m
+    radius_rg = torch.sqrt(disk_x_rg.square() + disk_y_rg.square())
+    spin = torch.as_tensor(model.spin, device=device, dtype=dtype)
+    isco_rg = kerr_isco_radius(spin)
+    height_rg = lamppost_source_height_rg(
+        spin, model.corona_height_above_isco_rg
+    ).to(device=device, dtype=dtype)
+    lamp_distance_rg = torch.sqrt(radius_rg.square() + height_rg.square())
+    illumination = (4.0 / 3.0) * height_rg / lamp_distance_rg.pow(3)
+
+    radius_m = torch.sqrt(disk_x.square() + disk_y.square())
+    outer_radius_m = 0.5 * min(ny * dy, nx * dx)
+    hit = (radius_rg >= isco_rg) & (radius_m <= outer_radius_m)
+    if not bool(torch.any(hit)):
+        raise RuntimeError("Newtonian lamppost source has no emitting pixels")
+    # The projected source grid is the observer screen. This far-field path
+    # correction gives the standard inclined-disk Euclidean echo delay.
+    observer_path_rg = height_rg * torch.cos(inclination) - disk_x_rg * torch.sin(
+        inclination
+    )
+    delay_rg = lamp_distance_rg + observer_path_rg
+    delay_days = (
+        delay_rg
+        * gravitational_radius_m
+        / _C
+        / 86_400.0
+        * (1.0 + source_redshift)
+    )
+    delay_days = torch.where(
+        hit,
+        delay_days - delay_days[hit].min(),
+        torch.full_like(delay_days, float("nan")),
+    )
+    solid_angle = torch.full_like(
+        radius_rg,
+        dx * dy / float(distances.source_m) ** 2,
+    )
+    gfactor = (
+        torch.ones_like(radius_rg)
+        if model.relativity == "none"
+        else approximate_circular_disk_gfactor(
+            radius_rg,
+            torch.atan2(disk_y_rg, disk_x_rg),
+            inclination,
+            spin,
+        )
+    )
+    transfer = ObserverTransfer(
+        radius_rg,
+        gfactor,
+        solid_angle,
+        hit,
+        relative_delay_days=delay_days,
+        emission_azimuth_rad=torch.atan2(disk_y_rg, disk_x_rg),
+        metadata={
+            "backend": "analytic_newtonian_lamppost",
+            "source_redshift": source_redshift,
+            "source_height_rg": float(height_rg.detach().cpu()),
+        },
+    )
+    coefficient, _ = _thin_disk_temperature4_coefficient(
+        model.black_hole_mass_solar,
+        model.eddington_ratio,
+        model.spin,
+        viscous_flux_profile=model.viscous_flux_profile,
+        radiative_efficiency=model.radiative_efficiency,
+        device=device,
+        dtype=dtype,
+    )
+    efficiency = lamppost_irradiation_efficiency(
+        model.lamp_fraction,
+        model.eddington_ratio,
+        model.spin,
+        viscous_flux_profile=model.viscous_flux_profile,
+        radiative_efficiency=model.radiative_efficiency,
+    ).to(device=device, dtype=dtype)
+    return ThermalReprocessingSource(
+        geometry,
+        transfer,
+        model.driving_signal,
+        efficiency * coefficient * illumination,
+        delay_days,
+        model.black_hole_mass_solar,
+        model.eddington_ratio,
+        model.spin,
+        source_redshift,
+        color_correction=model.color_correction,
+        temperature_slope_beta=model.temperature_slope_beta,
+        viscous_flux_profile=model.viscous_flux_profile,
+        radiative_efficiency=model.radiative_efficiency,
+        name=model.name,
+        heating_metadata={
+            "model": "axis_newtonian_lamppost",
+            "source_height_rg": float(height_rg.detach().cpu()),
+            "lamp_fraction": float(model.lamp_fraction),
+            "irradiation_efficiency": float(efficiency.detach().cpu()),
+        },
+        _runtime=resolved,
+    )
 
 
 @dataclass(frozen=True)
@@ -500,8 +662,8 @@ class KerrDiskModel:
             temperature_slope_beta=self.temperature_slope_beta,
             viscous_flux_profile=self.viscous_flux_profile,
             radiative_efficiency=self.radiative_efficiency,
-            support_lamp_fraction=self.lamp_fraction,
-            support_corona_height_above_isco_rg=(self.corona_height_above_isco_rg),
+            lamp_fraction=self.lamp_fraction,
+            corona_height_above_isco_rg=self.corona_height_above_isco_rg,
             grid=self.grid,
         )
         del support
@@ -553,8 +715,8 @@ class KerrDiskModel:
             temperature_slope_beta=self.temperature_slope_beta,
             viscous_flux_profile=self.viscous_flux_profile,
             radiative_efficiency=self.radiative_efficiency,
-            support_lamp_fraction=self.lamp_fraction,
-            support_corona_height_above_isco_rg=(self.corona_height_above_isco_rg),
+            lamp_fraction=self.lamp_fraction,
+            corona_height_above_isco_rg=self.corona_height_above_isco_rg,
             grid=self.grid,
         )
 
@@ -634,6 +796,13 @@ class _KerrPixelationPlan:
     screen: ObserverScreen
     primary: object
     geometry: SourceGeometry
+
+
+def _observer_radius_rg(half_width_rg: float) -> float:
+    """Keep the coordinate observer beyond the emitting disk with few compile shapes."""
+
+    required = 2.0 * half_width_rg
+    return 3000.0 if required <= 3000.0 else float(2 ** math.ceil(math.log2(required)))
 
 
 def _prepare_kerr_pixelation(
@@ -751,6 +920,7 @@ def _finish_kerr_pixelation(
             spin=model.spin,
             inclination_deg=model.inclination_deg,
             source_redshift=plan.redshift,
+            observer_radius_rg=_observer_radius_rg(plan.half_width_rg),
             coordinate_dtype=plan.runtime.dtype,
             compute_emission_azimuth=model.compute_emission_azimuth,
             chunk_size=model.observer_coordinate_chunk_size,
@@ -787,6 +957,7 @@ def _finish_kerr_pixelation(
         viscous_flux_profile=model.viscous_flux_profile,
         radiative_efficiency=model.radiative_efficiency,
         name=model.name,
+        _runtime=plan.runtime,
     )
 
 
@@ -858,6 +1029,7 @@ def batched_pixelate_sources(
                     plan.runtime.dtype,
                     model.observer_coordinate_chunk_size,
                     model.observer_coordinate_repair_device,
+                    _observer_radius_rg(plan.half_width_rg),
                     plan.runtime.torch_compile_mode,
                     model.compile_solver,
                 )
@@ -885,6 +1057,7 @@ def batched_pixelate_sources(
                             plan.model.inclination_deg for plan in member_plans
                         ),
                         source_redshifts=tuple(plan.redshift for plan in member_plans),
+                        observer_radius_rg=_observer_radius_rg(first.half_width_rg),
                         chunk_size=first.model.observer_coordinate_chunk_size,
                         compile_solver=(
                             first.model.compile_solver

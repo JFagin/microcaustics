@@ -16,6 +16,8 @@ import torch
 from .config import Backend, ProfilingLevel, RuntimeConfig
 
 _WARNED_BACKEND_FALLBACKS: set[tuple[str, type[BaseException], str]] = set()
+_WARNED_RUNTIME_DOWNGRADES: set[tuple[Backend, Backend]] = set()
+_RUNTIME_DOWNGRADE_LOCK = threading.Lock()
 _WINDOWS_TOOLCHAIN_LOCK = threading.Lock()
 _WINDOWS_TOOLCHAIN_PROBED = False
 _COMPILATION_WARNING_LOCK = threading.Lock()
@@ -216,6 +218,8 @@ class ResolvedRuntime:
     strict_backend: bool
     torch_compile_mode: str | None
     warn_on_compile: bool
+    thermal_flux_block_pixels: int | None
+    static_response_projection: bool
     profiling: ProfilingLevel
     capabilities: RuntimeCapabilities
     fallback_reason: str | None = None
@@ -369,6 +373,20 @@ def resolve_runtime(
     else:
         backend = Backend.TORCH_EAGER
 
+    if reason is not None:
+        key = (requested, backend)
+        with _RUNTIME_DOWNGRADE_LOCK:
+            first_warning = key not in _WARNED_RUNTIME_DOWNGRADES
+            if first_warning:
+                _WARNED_RUNTIME_DOWNGRADES.add(key)
+        if first_warning:
+            warnings.warn(
+                f"Requested backend {requested.value!r} is unavailable: {reason}. "
+                f"Using {backend.value!r}; set strict_backend=True to raise instead.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     return ResolvedRuntime(
         device=device,
         backend=backend,
@@ -377,6 +395,8 @@ def resolve_runtime(
         strict_backend=bool(config.strict_backend),
         torch_compile_mode=config.torch_compile_mode,
         warn_on_compile=bool(config.warn_on_compile),
+        thermal_flux_block_pixels=config.thermal_flux_block_pixels,
+        static_response_projection=config.static_response_projection,
         profiling=config.profiling,
         capabilities=capabilities,
         fallback_reason=reason,

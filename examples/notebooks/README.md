@@ -13,11 +13,11 @@ It uses `macro` for the strong-lens renderer and therefore requires Python
 3.11 or newer. Install only `[notebooks,science]` on Python 3.10 and skip the
 macro-rendering tutorials.
 
-The distributed notebooks are intentionally output-free. Each
-performance-sensitive notebook prints the runtime that produced its results
-when executed. Generated figures, animations, and numerical products are
-written to ignored local output directories rather than committed to the
-repository. The README includes one representative documentation animation.
+The distributed notebooks include their executed cell outputs so figures and
+animations are visible on GitHub. Each performance-sensitive notebook prints
+the runtime that produced its results. Larger standalone figures, animations,
+and numerical products are written to local output directories; these do not
+all need to be committed because the notebooks embed their display outputs.
 
 The current tutorial code uses seed 0, with subsequent integer seeds for
 independent realizations. Changing the seed changes the physical realization,
@@ -50,6 +50,11 @@ comparisons, configure the products with `MICROCAUSTICS_WEISENBACH_NPZ`,
 explain what is being compared and stop cleanly when those files are absent.
 
 ## Suggested order
+
+The source-model notebook `05_quasar_spectra_and_bandpass_photometry` includes
+an unlensed spectrum baseline and a Q2237 image-B caustic-crossing GIF. It adds
+static emission-line templates, intrinsic dust and intergalactic absorption to
+the variable, microlensed Kerr continuum and integrates all six LSST responses.
 
 The collection is grouped by purpose rather than presented as one long
 sequence shown below.

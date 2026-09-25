@@ -38,9 +38,7 @@ def _boundary_probes(
     edge = torch.floor(perimeter_coordinate).to(torch.int64)
     tangent = -1.0 + 2.0 * (perimeter_coordinate - torch.floor(perimeter_coordinate))
     golden = 0.6180339887498949
-    tangent *= 0.84 + 0.08 * torch.sin(
-        2.0 * torch.pi * ((index + 1.0) * golden + 0.11)
-    )
+    tangent *= 0.84 + 0.08 * torch.sin(2.0 * torch.pi * ((index + 1.0) * golden + 0.11))
     tangent = tangent.clamp(-0.98, 0.98)
     radial = (1.0 - float(inset_fraction)) * (
         1.0
@@ -55,12 +53,16 @@ def _boundary_probes(
     x = torch.where(
         edge == 0,
         -boundary_x,
-        torch.where(edge == 1, tangent_x, torch.where(edge == 2, boundary_x, -tangent_x)),
+        torch.where(
+            edge == 1, tangent_x, torch.where(edge == 2, boundary_x, -tangent_x)
+        ),
     )
     y = torch.where(
         edge == 0,
         tangent_y,
-        torch.where(edge == 1, boundary_y, torch.where(edge == 2, -tangent_y, -boundary_y)),
+        torch.where(
+            edge == 1, boundary_y, torch.where(edge == 2, -tangent_y, -boundary_y)
+        ),
     )
     center_y, center_x = region.center_uas
     points = torch.stack((x + center_x, y + center_y), dim=-1)
@@ -140,7 +142,9 @@ def _crossing_counts_and_distances_portable(
         point_b = block[:, :, 1]
         segment_delta = point_b - point_a
         for point_start in range(0, crossing_points.shape[0], effective_point_chunk):
-            point_stop = min(crossing_points.shape[0], point_start + effective_point_chunk)
+            point_stop = min(
+                crossing_points.shape[0], point_start + effective_point_chunk
+            )
             query = crossing_points[point_start:point_stop]
             path = query[None, :, None, :] - anchors[None, None, :, :]
             anchor_to_a = point_a[:, None, None] - anchors[None, None, :, None]
@@ -153,8 +157,7 @@ def _crossing_counts_and_distances_portable(
             non_parallel = denominator.abs() > epsilon
             safe = torch.where(non_parallel, denominator, torch.ones_like(denominator))
             fraction = (
-                anchor_to_a[..., 0] * segment_y
-                - anchor_to_a[..., 1] * segment_x
+                anchor_to_a[..., 0] * segment_y - anchor_to_a[..., 1] * segment_x
             ) / safe
             side_a = path_x * anchor_to_a[..., 1] - path_y * anchor_to_a[..., 0]
             side_b = path_x * anchor_to_b[..., 1] - path_y * anchor_to_b[..., 0]
@@ -174,12 +177,12 @@ def _crossing_counts_and_distances_portable(
             point_stop = min(distance_points.shape[0], point_start + distance_chunk)
             query = distance_points[point_start:point_stop]
             relative = query[None, :, None] - point_a[:, None]
-            length_squared = segment_delta.square().sum(dim=-1).clamp_min(
-                distance_epsilon
+            length_squared = (
+                segment_delta.square().sum(dim=-1).clamp_min(distance_epsilon)
             )
-            projection = (
-                relative * segment_delta[:, None]
-            ).sum(dim=-1) / length_squared[:, None]
+            projection = (relative * segment_delta[:, None]).sum(
+                dim=-1
+            ) / length_squared[:, None]
             closest = (
                 point_a[:, None]
                 + projection.clamp(0.0, 1.0)[..., None] * segment_delta[:, None]
@@ -253,9 +256,9 @@ def _reference_offsets_batched(
     frames, count, _ = parity.shape
     diagonal = torch.arange(count)
     parity[:, diagonal, diagonal] = 0
-    pair_mask = (~torch.eye(count, dtype=torch.bool))[None].expand(
-        frames, -1, -1
-    ).clone()
+    pair_mask = (
+        (~torch.eye(count, dtype=torch.bool))[None].expand(frames, -1, -1).clone()
+    )
     if invalid_pair_counts is not None:
         pair_mask &= (
             invalid_pair_counts.detach().cpu().reshape(frames, count, count) == 0
@@ -325,6 +328,7 @@ def label_caustic_fields(
     previous_center_distance_uas: float | None = None,
     diagnostic_grid: PlaneGrid | None = None,
     include_distance_map: bool = False,
+    strict_backend: bool = False,
 ) -> tuple[
     tuple[LabeledCausticFrame, ...],
     torch.Tensor,
@@ -358,39 +362,118 @@ def label_caustic_fields(
     center = torch.tensor([[center_x, center_y]], device=device, dtype=dtype)
     query_points = torch.cat((center, gauges), dim=0)
     crossing_points = torch.cat((anchors, query_points), dim=0)
-    maximum_segments = max(field.segment_count for field in fields)
-    segments = torch.zeros(
-        (len(fields), maximum_segments, 2, 2),
-        device=device,
-        dtype=dtype,
-    )
-    valid = torch.zeros(
-        (len(fields), maximum_segments),
-        device=device,
-        dtype=torch.bool,
-    )
-    invalid_segments = torch.zeros_like(valid)
-    for frame, field in enumerate(fields):
-        count = field.segment_count
-        if count:
-            segments[frame, :count] = field.caustic_segments_uas
-            valid[frame, :count] = True
-            invalid = field.invalid_segment_mask
-            if invalid is not None:
-                invalid_segments[frame, :count] = invalid.to(
-                    device=device,
-                    dtype=torch.bool,
-                )
+    segment_counts = [field.segment_count for field in fields]
+    maximum_segments = max(segment_counts)
+    frame_segments = [
+        field.caustic_segments_uas.to(device=device, dtype=dtype) for field in fields
+    ]
+    frame_invalid_masks = []
+    for field, count in zip(fields, segment_counts, strict=True):
+        invalid = field.invalid_segment_mask
+        if invalid is None:
+            frame_invalid_masks.append(
+                torch.zeros(count, device=device, dtype=torch.bool)
+            )
+        else:
+            frame_invalid_masks.append(invalid.to(device=device, dtype=torch.bool))
+
+    def packed(values):
+        counts_per_frame = [int(value.shape[0]) for value in values]
+        offsets = [0]
+        for count in counts_per_frame:
+            offsets.append(offsets[-1] + count)
+        combined = (
+            torch.cat(values, dim=0)
+            if offsets[-1]
+            else torch.empty((0, 2, 2), device=device, dtype=dtype)
+        )
+        return combined, torch.tensor(offsets, device=device, dtype=torch.int64)
+
+    dense_inputs = None
+
+    def dense():
+        nonlocal dense_inputs
+        if dense_inputs is None:
+            segments = torch.zeros(
+                (len(fields), maximum_segments, 2, 2),
+                device=device,
+                dtype=dtype,
+            )
+            valid = torch.zeros(
+                (len(fields), maximum_segments),
+                device=device,
+                dtype=torch.bool,
+            )
+            invalid_segments = torch.zeros_like(valid)
+            for frame, (values, count) in enumerate(
+                zip(frame_segments, segment_counts, strict=True)
+            ):
+                if count:
+                    segments[frame, :count] = values
+                    valid[frame, :count] = True
+                    invalid = fields[frame].invalid_segment_mask
+                    if invalid is not None:
+                        invalid_segments[frame, :count] = invalid.to(
+                            device=device,
+                            dtype=torch.bool,
+                        )
+            dense_inputs = segments, valid, invalid_segments
+        return dense_inputs
+
     started = perf_counter()
-    use_triton = False
+    label_backend = "portable"
+    invalid_counts = None
+    packed_invalid_mask = torch.cat(frame_invalid_masks)
+    has_invalid_segments = bool(packed_invalid_mask.any().item())
     if device.type == "cuda" and dtype == torch.float32:
+        packed_segments, frame_offsets = packed(frame_segments)
         try:
             from .triton_caustics import (
                 batched_caustic_crossings_distances_triton,
+                packed_caustic_crossings_distances_triton,
                 triton_caustics_available,
             )
 
             if triton_caustics_available():
+                counts, distances = packed_caustic_crossings_distances_triton(
+                    packed_segments,
+                    frame_offsets,
+                    anchors,
+                    crossing_points,
+                    query_points,
+                    maximum_segments=maximum_segments,
+                    block_segments=config.triton_segment_block,
+                )
+                if has_invalid_segments:
+                    invalid_segment_counts = (
+                        torch.stack([mask.sum() for mask in frame_invalid_masks])
+                        .cpu()
+                        .tolist()
+                    )
+                    invalid_offsets = [0]
+                    for count in invalid_segment_counts:
+                        invalid_offsets.append(invalid_offsets[-1] + int(count))
+                    packed_invalid = packed_segments[packed_invalid_mask]
+                    invalid_counts, _ = packed_caustic_crossings_distances_triton(
+                        packed_invalid,
+                        torch.tensor(
+                            invalid_offsets,
+                            device=device,
+                            dtype=torch.int64,
+                        ),
+                        anchors,
+                        crossing_points,
+                        query_points[:0],
+                        maximum_segments=max(map(int, invalid_segment_counts)),
+                        compute_distances=False,
+                        block_segments=config.triton_segment_block,
+                    )
+                label_backend = "triton_packed"
+        except Exception:
+            # The dense implementation is still Triton; report a backend
+            # fallback only if it also fails and portable Torch is used.
+            try:
+                segments, valid, invalid_segments = dense()
                 counts, distances = batched_caustic_crossings_distances_triton(
                     segments,
                     valid,
@@ -399,11 +482,32 @@ def label_caustic_fields(
                     query_points,
                     block_segments=config.triton_segment_block,
                 )
-                use_triton = True
-        except Exception as error:
-            warn_backend_fallback("Triton anchor/gauge labeling", error)
-            use_triton = False
-    if not use_triton:
+                if has_invalid_segments:
+                    invalid_counts, _ = batched_caustic_crossings_distances_triton(
+                        segments,
+                        invalid_segments,
+                        anchors,
+                        crossing_points,
+                        query_points[:0],
+                        block_segments=config.triton_segment_block,
+                    )
+                label_backend = "triton_dense"
+            except Exception as dense_error:
+                if strict_backend:
+                    raise RuntimeError(
+                        "strict Triton backend required for anchor/gauge labeling"
+                    ) from dense_error
+                warn_backend_fallback(
+                    "dense Triton anchor/gauge labeling",
+                    dense_error,
+                )
+                label_backend = "portable"
+    if label_backend == "portable":
+        if strict_backend and device.type == "cuda" and dtype == torch.float32:
+            raise RuntimeError(
+                "strict Triton backend required for anchor/gauge labeling"
+            )
+        segments, valid, invalid_segments = dense()
         counts, distances = _crossing_counts_and_distances_portable(
             segments,
             valid,
@@ -413,18 +517,7 @@ def label_caustic_fields(
             point_chunk_size=config.point_chunk_size,
             segment_chunk_size=config.segment_chunk_size,
         )
-    invalid_counts = None
-    if bool(invalid_segments.any().detach().cpu()):
-        if use_triton:
-            invalid_counts, _ = batched_caustic_crossings_distances_triton(
-                segments,
-                invalid_segments,
-                anchors,
-                crossing_points,
-                query_points,
-                block_segments=config.triton_segment_block,
-            )
-        else:
+        if has_invalid_segments:
             invalid_counts, _ = _crossing_counts_and_distances_portable(
                 segments,
                 invalid_segments,
@@ -539,7 +632,8 @@ def label_caustic_fields(
                 "source_center_uas": (float(center_x), float(center_y)),
                 "center_distance_cap_uas": center_distance_cap_uas,
                 "half_open_vertex_rule": True,
-                "triton_fused_crossing_distance": use_triton,
+                "triton_fused_crossing_distance": label_backend.startswith("triton_"),
+                "label_backend": label_backend,
                 "caustic_segments": field.segment_count,
             },
             timing=TimingBreakdown(
@@ -557,6 +651,7 @@ def label_caustic_fields(
                 offsets,
                 frame_xor=frame_xor,
                 config=config,
+                strict_backend=strict_backend,
             )
             if include_distance_map:
                 distance_map = field.distance_map(
@@ -592,6 +687,7 @@ def anchor_gauge_label_map(
     *,
     frame_xor: int,
     config: CausticConfig,
+    strict_backend: bool = False,
 ) -> LabelMap:
     """Materialize the production majority label on a diagnostic grid."""
 
@@ -646,15 +742,13 @@ def anchor_gauge_label_map(
                     if invalid is None:
                         mask = torch.ones_like(parity, dtype=torch.bool)
                     else:
-                        invalid_counts, _ = (
-                            batched_caustic_crossings_distances_triton(
-                                segments,
-                                invalid,
-                                anchors,
-                                query,
-                                empty,
-                                block_segments=config.triton_segment_block,
-                            )
+                        invalid_counts, _ = batched_caustic_crossings_distances_triton(
+                            segments,
+                            invalid,
+                            anchors,
+                            query,
+                            empty,
+                            block_segments=config.triton_segment_block,
                         )
                         mask = invalid_counts[0] == 0
                     ones = (parity * mask.to(parity.dtype)).sum(dim=-1)
@@ -672,7 +766,15 @@ def anchor_gauge_label_map(
                     },
                 )
         except Exception as error:
+            if strict_backend:
+                raise RuntimeError(
+                    "strict Triton backend required for diagnostic label map"
+                ) from error
             warn_backend_fallback("Triton diagnostic label map", error)
+        if strict_backend:
+            raise RuntimeError(
+                "strict Triton backend required for diagnostic label map"
+            )
     counts, _ = _crossing_counts_and_distances_portable(
         segments,
         valid,
@@ -683,7 +785,9 @@ def anchor_gauge_label_map(
         segment_chunk_size=config.segment_chunk_size,
     )
     query_valid = None
-    if field.invalid_segment_mask is not None and bool(field.invalid_segment_mask.any()):
+    if field.invalid_segment_mask is not None and bool(
+        field.invalid_segment_mask.any()
+    ):
         invalid = field.invalid_segment_mask.to(device=segments.device)[None]
         invalid_counts, _ = _crossing_counts_and_distances_portable(
             segments,

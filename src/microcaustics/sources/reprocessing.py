@@ -8,8 +8,10 @@ from dataclasses import dataclass, field, replace
 
 import torch
 
+from ..compile import run_tensor_kernel
 from ..relativity import ObserverTransfer, kerr_isco_radius
 from ..relativity.lamppost import AxisLamppostProfile
+from ..runtime import ResolvedRuntime
 from .base import SourceGeometry, _as_times
 from .thin_disk import (
     _C,
@@ -27,8 +29,80 @@ from .thin_disk import (
     _validate_viscous_prescriptions,
     thin_disk_temperature4,
 )
-from .transferred_disk import _transferred_brightness_from_temperature4
-from .variability import DrivingSignal
+from .transferred_disk import (
+    _transferred_brightness_from_temperature4,
+    _transferred_flux_from_temperature4,
+)
+from .variability import (
+    DrivingSignal,
+    TabulatedDrivingSignal,
+    _FixedHorizonDrivingSignal,
+)
+
+
+def _tabulated_temperature_kernel(times, delay, static, response, knots, values):
+    """Interpolate the retarded driver and assemble heating in one compiled graph."""
+
+    query = (times[:, None, None] - delay[None]).clamp(knots[0], knots[-1])
+    if knots.numel() == 1:
+        driving = values[0, 0]
+    else:
+        right = torch.searchsorted(knots, query.contiguous(), right=True).clamp(
+            1, knots.numel() - 1
+        )
+        left = right - 1
+        fraction = (query - knots[left]) / (knots[right] - knots[left])
+        driving = values[left, 0] + fraction * (values[right, 0] - values[left, 0])
+    return static[None] + response[None] * driving
+
+
+def _quadratic_response_weight_kernel(
+    static,
+    response,
+    gfactor,
+    solid_angle,
+    hit,
+    wavelength,
+    redshift,
+    color,
+    pixel_area,
+    driver_amplitude,
+):
+    """Share the temperature and Planck evaluation between both derivatives."""
+
+    total4 = (static + driver_amplitude * response).clamp_min(1.0e-30)
+    temperature = total4.pow(0.25)
+    exponent = (
+        _H
+        * _C
+        / (wavelength * gfactor[..., None] * _K_B * color * temperature[..., None])
+    ).clamp(max=85.0)
+    exponential = torch.exp(exponent)
+    excess = torch.expm1(exponent)
+    prefactor = 2.0 * _H * _C / wavelength.pow(3) / color.pow(4)
+    derivative_intensity = (
+        prefactor
+        * exponential
+        * exponent
+        / temperature[..., None]
+        / excess.square().clamp_min(1.0e-30)
+    )
+    first = (
+        derivative_intensity
+        * (response / (4.0 * temperature.pow(3)))[..., None]
+        * solid_angle[..., None]
+        / (1.0 + redshift).pow(3)
+        * 1.0e26
+        / pixel_area
+    )
+    first = torch.where(hit[..., None] & torch.isfinite(first), first, 0.0)
+    second = (
+        first
+        * (response / (4.0 * total4))[..., None]
+        * (exponent * (1.0 + 2.0 / excess) - 5.0)
+    )
+    second = torch.where(hit[..., None] & torch.isfinite(second), second, 0.0)
+    return first, second
 
 
 def lamppost_irradiation_efficiency(
@@ -95,6 +169,23 @@ class ThermalReprocessingSource:
     _linear_response_cache: dict = field(
         default_factory=dict,
         init=False,
+        repr=False,
+        compare=False,
+    )
+    _evaluation_cache: dict = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _spectral_cache: dict = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _runtime: ResolvedRuntime | None = field(
+        default=None,
         repr=False,
         compare=False,
     )
@@ -316,6 +407,39 @@ class ThermalReprocessingSource:
         )
         return temperature4
 
+    def _evaluation_tensors(self, *, device, dtype):
+        """Reuse immutable disk tensors across temporal source batches."""
+
+        device = torch.device(device)
+        key = (device.type, device.index, dtype)
+        if not torch.is_grad_enabled():
+            entry = self._evaluation_cache.get(key)
+            if entry is not None:
+                tensors, ready = entry
+                if ready is not None:
+                    torch.cuda.current_stream(device).wait_event(ready)
+                return tensors
+
+        transfer = self.transfer.to(device=device, dtype=dtype)
+        delay = self.delay_days.to(device=device, dtype=dtype)
+        safe_delay = torch.where(transfer.hit, delay, torch.zeros_like(delay))
+        if not bool(torch.isfinite(safe_delay).all()):
+            raise ValueError("driving-signal query times must be finite")
+        tensors = (
+            transfer,
+            safe_delay,
+            self._static_temperature4(device=device, dtype=dtype),
+            self.response_temperature4.to(device=device, dtype=dtype),
+            (safe_delay.min(), safe_delay.max()),
+        )
+        if not torch.is_grad_enabled():
+            ready = None
+            if device.type == "cuda":
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(device))
+            self._evaluation_cache[key] = (tensors, ready)
+        return tensors
+
     def with_bands(
         self, bands_angstrom: Mapping[str, float]
     ) -> ThermalReprocessingSource:
@@ -339,15 +463,100 @@ class ThermalReprocessingSource:
     ) -> torch.Tensor:
         """Evaluate the nonlinear thermal response at retarded source times."""
 
+        state = self._brightness_state(times_days, device=device, dtype=dtype)
+        return self._brightness_from_state(state)
+
+    def _brightness_from_state(self, state):
+        """Materialize a single cached static frame, or explicitly requested images."""
+
+        temperature4, transfer, output_count = state
+        brightness = _transferred_brightness_from_temperature4(
+            temperature4,
+            geometry=self.geometry,
+            transfer=transfer,
+            source_redshift=self.source_redshift,
+            color_correction=self.color_correction,
+            runtime=self._runtime,
+            spectral_cache=self._spectral_cache,
+        )
+        if self.is_time_static and output_count > 1:
+            brightness = brightness.expand(output_count, *brightness.shape[1:])
+        return brightness
+
+    def _brightness_state(self, times_days, *, device=None, dtype=None):
+        """Compute the achromatic heating once per time batch, not per band.
+
+        The state is owned by the current photometry call rather than cached
+        on the source, so different drivers, times and CUDA streams cannot
+        accidentally reuse a previous realization's evolving temperature.
+        """
+
         times = _as_times(times_days)
         device = times.device if device is None else device
         dtype = torch.get_default_dtype() if dtype is None else dtype
         times = times.to(device=device, dtype=dtype)
         output_count = times.numel()
         evaluation_times = times[:1] if self.is_time_static else times
-        transfer = self.transfer.to(device=device, dtype=dtype)
-        delay = self.delay_days.to(device=device, dtype=dtype)
-        safe_delay = torch.where(transfer.hit, delay, torch.zeros_like(delay))
+        (
+            transfer,
+            safe_delay,
+            static_temperature4,
+            response_temperature4,
+            delay_bounds,
+        ) = self._evaluation_tensors(device=device, dtype=dtype)
+        if isinstance(
+            self.signal, (TabulatedDrivingSignal, _FixedHorizonDrivingSignal)
+        ):
+            # Check the extremal retarded queries against the driver's limits.
+            # A valid batch needs the table but not interpolated endpoint values.
+            if not bool(torch.isfinite(evaluation_times).all()):
+                raise ValueError("driving-signal query times must be finite")
+            bounds = torch.stack(
+                (
+                    evaluation_times.min() - delay_bounds[1],
+                    evaluation_times.max() - delay_bounds[0],
+                )
+            )
+            if isinstance(self.signal, _FixedHorizonDrivingSignal):
+                valid = torch.isfinite(bounds).all() & (
+                    (bounds[0] >= -self.signal.history_days)
+                    & (bounds[1] <= self.signal.max_duration_days)
+                )
+                if not bool(valid):
+                    self.signal.amplitudes(bounds, bands=1, dtype=dtype, device=device)
+                table = self.signal._samples
+            else:
+                table = self.signal
+            knots, values = table._table_for(evaluation_times)
+            if values.shape[1] != 1:
+                raise ValueError(
+                    "tabulated signal band count does not match the source"
+                )
+            if isinstance(self.signal, TabulatedDrivingSignal):
+                valid = torch.isfinite(bounds).all()
+                if self.signal.extrapolation == "error":
+                    valid = valid & (bounds[0] >= knots[0]) & (bounds[1] <= knots[-1])
+                if not bool(valid):
+                    # Preserve the public driver's established error messages.
+                    self.signal.amplitudes(bounds, bands=1, dtype=dtype, device=device)
+            arguments = (
+                evaluation_times,
+                safe_delay,
+                static_temperature4,
+                response_temperature4,
+                knots,
+                values,
+            )
+            if self._runtime is None:
+                temperature4 = _tabulated_temperature_kernel(*arguments)
+            else:
+                temperature4, _ = run_tensor_kernel(
+                    self._runtime,
+                    "retarded thermal driving",
+                    _tabulated_temperature_kernel,
+                    *arguments,
+                )
+            return temperature4, transfer, output_count
         query = evaluation_times[:, None, None] - safe_delay[None]
         driving = self.signal.amplitudes(
             query.reshape(-1),
@@ -355,25 +564,25 @@ class ThermalReprocessingSource:
             dtype=dtype,
             device=device,
         ).reshape(evaluation_times.numel(), *self.geometry.shape)
-        static_temperature4 = self._static_temperature4(
-            device=device,
-            dtype=dtype,
-        )
-        response_temperature4 = self.response_temperature4.to(
-            device=device,
-            dtype=dtype,
-        )
         temperature4 = static_temperature4[None] + response_temperature4[None] * driving
-        brightness = _transferred_brightness_from_temperature4(
+        return temperature4, transfer, output_count
+
+    def _flux_from_brightness_state(self, state, left, right, fraction):
+        """Reuse the parent's heating state for this wavelength chunk."""
+
+        temperature4, transfer, _ = state
+        return _transferred_flux_from_temperature4(
             temperature4,
+            left,
+            right,
+            fraction,
             geometry=self.geometry,
             transfer=transfer,
             source_redshift=self.source_redshift,
             color_correction=self.color_correction,
+            runtime=self._runtime,
+            spectral_cache=self._spectral_cache,
         )
-        if self.is_time_static and output_count > 1:
-            brightness = brightness.expand(output_count, *brightness.shape[1:])
-        return brightness
 
     def linear_response_weights(
         self,
@@ -397,7 +606,9 @@ class ThermalReprocessingSource:
                 dtype=dtype,
                 device=device,
             )
-            return weights / weights.sum(dim=(0, 1), keepdim=True).clamp_min(1.0e-30)
+            return weights / weights.sum(dim=(0, 1), keepdim=True).clamp_min(
+                torch.finfo(weights.dtype).tiny
+            )
         cache_key = (float(driver_amplitude), device, dtype)
         if not torch.is_grad_enabled():
             entry = self._linear_response_cache.get(cache_key)
@@ -474,6 +685,106 @@ class ThermalReprocessingSource:
             self._linear_response_cache[cache_key] = (weights, ready)
         return weights
 
+    def quadratic_response_weights(
+        self,
+        *,
+        driver_amplitude: float = 1.0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Return ``d²(brightness)/d(driver)²`` at a fixed driver amplitude.
+
+        This is the next Taylor coefficient of the exact Planck response, not
+        a change to the heating prescription or to the observer transfer.
+        """
+
+        return self._quadratic_response_weight_pair(
+            driver_amplitude=driver_amplitude, dtype=dtype, device=device
+        )[1]
+
+    def _quadratic_response_weight_pair(
+        self,
+        *,
+        driver_amplitude: float = 1.0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+        runtime: ResolvedRuntime | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute and, in inference mode, cache both Taylor weights together."""
+
+        if not math.isfinite(driver_amplitude) or driver_amplitude < 0.0:
+            raise ValueError("driver_amplitude must be finite and non-negative")
+        device = torch.device(
+            self.transfer.radius_rg.device if device is None else device
+        )
+        dtype = self.transfer.radius_rg.dtype if dtype is None else dtype
+        first_key = (float(driver_amplitude), device, dtype)
+        second_key = ("quadratic", float(driver_amplitude), device, dtype)
+        if not torch.is_grad_enabled():
+            first_entry = self._linear_response_cache.get(first_key)
+            second_entry = self._linear_response_cache.get(second_key)
+            if first_entry is not None and second_entry is not None:
+                for _, ready in (first_entry, second_entry):
+                    if ready is not None:
+                        torch.cuda.current_stream(device).wait_event(ready)
+                return first_entry[0], second_entry[0]
+
+        transfer = self.transfer.to(device=device, dtype=dtype)
+        redshift = torch.as_tensor(self.source_redshift, device=device, dtype=dtype)
+        color = torch.as_tensor(self.color_correction, device=device, dtype=dtype)
+        wavelength = (
+            torch.as_tensor(
+                self.geometry.wavelengths_angstrom, device=device, dtype=dtype
+            )
+            * 1.0e-10
+            / (1.0 + redshift)
+        )
+        arguments = (
+            self._static_temperature4(device=device, dtype=dtype),
+            self.response_temperature4.to(device=device, dtype=dtype),
+            transfer.gfactor,
+            transfer.solid_angle_sr,
+            transfer.hit,
+            wavelength,
+            redshift,
+            color,
+            self.geometry.pixel_scale_m[0] * self.geometry.pixel_scale_m[1],
+            float(driver_amplitude),
+        )
+        selected_runtime = self._runtime if runtime is None else runtime
+        if (
+            selected_runtime is None
+            or selected_runtime.device.type != device.type
+            or (
+                selected_runtime.device.index is not None
+                and selected_runtime.device.index != device.index
+            )
+            or selected_runtime.dtype != dtype
+            or (
+                torch.is_grad_enabled()
+                and any(
+                    isinstance(value, torch.Tensor) and value.requires_grad
+                    for value in arguments
+                )
+            )
+        ):
+            first, second = _quadratic_response_weight_kernel(*arguments)
+        else:
+            (first, second), _ = run_tensor_kernel(
+                selected_runtime,
+                "quadratic thermal response weights",
+                _quadratic_response_weight_kernel,
+                *arguments,
+            )
+        if not torch.is_grad_enabled():
+            ready = None
+            if device.type == "cuda":
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(device))
+            self._linear_response_cache[first_key] = (first, ready)
+            self._linear_response_cache[second_key] = (second, ready)
+        return first, second
+
     def mean_response_delays(
         self,
         *,
@@ -504,7 +815,7 @@ class ThermalReprocessingSource:
         valid = self.transfer.hit.to(weights.device) & torch.isfinite(delay)
         safe_delay = torch.where(valid, delay, torch.zeros_like(delay))
         weights = torch.where(valid[..., None], weights, torch.zeros_like(weights))
-        normalizer = weights.sum(dim=(0, 1)).clamp_min(1.0e-30)
+        normalizer = weights.sum(dim=(0, 1)).clamp_min(torch.finfo(weights.dtype).tiny)
         return (weights * safe_delay[..., None]).sum(dim=(0, 1)) / normalizer
 
     def batched_mean_response_delays(
@@ -543,13 +854,17 @@ class ThermalReprocessingSource:
         denominator = torch.zeros_like(numerator)
         for start in range(0, positions.numel(), spatial_chunk_size):
             stop = min(positions.numel(), start + spatial_chunk_size)
-            contribution = (
-                magnification[:, positions[start:stop], None]
-                * weights[None, start:stop]
+            magnification_chunk = magnification[:, positions[start:stop]]
+            weights_chunk = weights[start:stop]
+            # These are two matrix products, not a materialized
+            # [batch, pixel, band] contribution.  The latter can exceed
+            # hundreds of MiB for production source grids and adds avoidable
+            # memory traffic when only the zeroth and first moments are needed.
+            denominator.add_(magnification_chunk @ weights_chunk)
+            numerator.add_(
+                magnification_chunk @ (weights_chunk * delay[start:stop, None])
             )
-            denominator.add_(contribution.sum(dim=1))
-            numerator.add_((contribution * delay[None, start:stop, None]).sum(dim=1))
-        return numerator / denominator.clamp_min(1.0e-30)
+        return numerator / denominator.clamp_min(torch.finfo(denominator.dtype).tiny)
 
     def transfer_function(
         self,
@@ -596,7 +911,9 @@ class ThermalReprocessingSource:
         )
         output.index_add_(0, indices[in_range], weights[valid][in_range])
         if normalize:
-            output = output / output.sum(dim=0, keepdim=True).clamp_min(1.0e-30)
+            output = output / output.sum(dim=0, keepdim=True).clamp_min(
+                torch.finfo(output.dtype).tiny
+            )
         return output
 
     def batched_transfer_function(
@@ -666,7 +983,9 @@ class ThermalReprocessingSource:
             )
             output.scatter_add_(1, scatter_indices, contribution)
         if normalize:
-            output = output / output.sum(dim=1, keepdim=True).clamp_min(1.0e-30)
+            output = output / output.sum(dim=1, keepdim=True).clamp_min(
+                torch.finfo(output.dtype).tiny
+            )
         return output
 
     def metadata(self) -> Mapping[str, object]:

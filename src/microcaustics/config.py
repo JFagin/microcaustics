@@ -136,8 +136,9 @@ class RuntimeConfig:
         Compute dtype. Float32 is the production default. Float64 is available
         for validation and precision-sensitive calculations.
     strict_backend:
-        If true, an unavailable requested backend raises an exception. If
-        false, the resolver selects the best safe fallback and records why.
+        If true, an unavailable requested backend or failed accelerated
+        kernel raises instead of silently using a portable fallback. If
+        false, fallback warnings identify the change in execution backend.
     memory_fraction:
         Maximum fraction of visible device memory available to package-managed
         batches and temporary workspaces.
@@ -147,6 +148,15 @@ class RuntimeConfig:
     warn_on_compile:
         Emit a warning before a package-managed kernel specialization is
         compiled or loaded from the compiler cache. Enabled by default.
+    thermal_flux_block_pixels:
+        Pixels per Triton thermal-spectrum block on NVIDIA CUDA float32.
+        ``None`` retains the measured 256/512-pixel selection. Advanced users
+        may choose 128, 256, 512, or 1024 for their GPU; other backends ignore
+        this setting. Changing it can trigger a new kernel compilation.
+    static_response_projection:
+        Compile the delay-response map projection for fixed tensor shapes.
+        Enabled by default. New valid-pixel counts or delay-bin counts can
+        recompile; set false for heterogeneous source populations.
     profiling:
         ``"off"`` avoids timing-only accelerator barriers. ``"total"``
         synchronizes only around complete public calculations.
@@ -160,6 +170,8 @@ class RuntimeConfig:
     memory_fraction: float = 0.95
     torch_compile_mode: str | None = None
     warn_on_compile: bool = True
+    thermal_flux_block_pixels: int | None = None
+    static_response_projection: bool = True
     profiling: ProfilingLevel | str = ProfilingLevel.OFF
 
     def __post_init__(self) -> None:
@@ -172,6 +184,17 @@ class RuntimeConfig:
             self.torch_compile_mode
         ).strip():
             raise ValueError("torch_compile_mode must be non-empty or None")
+        if self.thermal_flux_block_pixels is not None and (
+            isinstance(self.thermal_flux_block_pixels, bool)
+            or not isinstance(self.thermal_flux_block_pixels, int)
+            or self.thermal_flux_block_pixels not in (128, 256, 512, 1024)
+        ):
+            raise ValueError(
+                "thermal_flux_block_pixels must be one of 128, 256, 512, "
+                "1024, or None"
+            )
+        if not isinstance(self.static_response_projection, bool):
+            raise ValueError("static_response_projection must be a boolean")
         object.__setattr__(self, "backend", backend)
         object.__setattr__(self, "dtype", dtype)
         object.__setattr__(self, "profiling", profiling)

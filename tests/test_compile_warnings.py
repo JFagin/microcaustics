@@ -66,6 +66,50 @@ def test_compile_warning_can_be_disabled() -> None:
     )
 
 
+def test_fixed_and_dynamic_shape_kernels_have_separate_compiled_wrappers() -> None:
+    clear_compiled_kernel_cache()
+    runtime = _compiled_runtime(warn_on_compile=False)
+
+    def kernel(value):
+        return value + 1
+
+    with patch(
+        "microcaustics.compile.torch.compile", side_effect=lambda fn, **_: fn
+    ) as compile_mock:
+        for dynamic in (True, False, False, True):
+            result, compiled = run_tensor_kernel(
+                runtime, "shape test", kernel, torch.tensor(1.0), dynamic=dynamic
+            )
+            assert compiled
+            assert result == 2
+    assert compile_mock.call_count == 2
+    assert [call.kwargs["dynamic"] for call in compile_mock.call_args_list] == [
+        True,
+        False,
+    ]
+
+
+def test_fixed_shape_compilation_warns_on_new_shapes() -> None:
+    clear_compiled_kernel_cache()
+    runtime = _compiled_runtime()
+
+    def kernel(value):
+        return value + 1
+
+    with (
+        patch("microcaustics.compile.torch.compile", side_effect=lambda fn, **_: fn),
+        warnings.catch_warnings(record=True) as caught,
+    ):
+        warnings.simplefilter("always")
+        for length in (2, 2, 3):
+            run_tensor_kernel(
+                runtime, "fixed shape test", kernel, torch.ones(length), dynamic=False
+            )
+    assert sum(
+        issubclass(item.category, mc.CompilationWarning) for item in caught
+    ) == 2
+
+
 def test_compilation_warning_category_supports_standard_filters() -> None:
     clear_compiled_kernel_cache()
     runtime = _compiled_runtime()

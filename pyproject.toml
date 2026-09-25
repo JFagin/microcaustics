@@ -62,6 +62,7 @@ test = [
   "pytest>=8",
   "pytest-cov>=5",
   "scipy>=1.10",
+  "speclite>=0.18",
   "tomli>=2; python_version < '3.11'",
 ]
 validation = [
@@ -89,6 +90,16 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+microcaustics = [
+  "data/*.md",
+  "data/*.rst",
+  "data/bandpasses/*.ecsv",
+  "data/quasar_spectrum/*.dat",
+  "data/quasar_spectrum/*.sed",
+  "data/quasar_spectrum/*.sph",
+]
 
 [tool.ruff]
 line-length = 88

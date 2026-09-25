@@ -62,6 +62,12 @@ conventional rectangular launch region. Scout, full-field, and rectangular
 integration domains all retain this same population. They differ only in
 which lens-plane cells or rays are evaluated.
 
+Internal stellar trajectories reflect specularly at the circular aperture.
+This keeps the finite population stationary instead of allowing stars to
+diffuse out and change its center of mass and effective macro parameters. The
+boundary lies outside the protected source-reaching region, and the coherent
+bulk displacement is applied after the reflected internal motion.
+
 The lower-level builders below remain useful when a study needs an explicit
 region or directly controlled star arrays.
 
@@ -75,6 +81,13 @@ catalog = mc.PointMassField(
     mass_solar=[0.3, 1e-3, 30.0],
 )
 ```
+
+For a dynamic explicit catalog, the velocity arrays contain the total
+observer-frame velocities. If they include a coherent translation, also pass
+that common component as `bulk_velocity_uas_per_day=(vx, vy)`. The simulator
+then translates the smooth macro term consistently with the stars. Circular
+populations created by the high-level API set this value and their reflecting
+boundary automatically.
 
 The containing `MicrolensingSystem` derives each angular Einstein radius from
 its lens and source distances. Use `einstein_units_to_uas` and

@@ -118,7 +118,78 @@ def _small_caustic_config():
 
 @unittest.skipUnless(triton_taylor_available(), "CUDA Triton is unavailable")
 class TritonTaylorTests(unittest.TestCase):
+    def test_compiled_circular_reflection_matches_eager_tensor_path(self) -> None:
+        generator = torch.Generator(device="cuda").manual_seed(619)
+        count = 257
+        radius = 3.0
+        radial = (
+            0.98
+            * radius
+            * torch.sqrt(torch.rand(count, generator=generator, device="cuda"))
+        )
+        angle = 2.0 * torch.pi * torch.rand(count, generator=generator, device="cuda")
+        x = radial * torch.cos(angle)
+        y = radial * torch.sin(angle)
+        bulk = (0.004, -0.003)
+        field = mc.PointMassField._from_einstein_radii(
+            x,
+            y,
+            torch.full((count,), 0.03, device="cuda"),
+            velocity_x_uas_per_day=(
+                0.05 * torch.randn(count, generator=generator, device="cuda") + bulk[0]
+            ),
+            velocity_y_uas_per_day=(
+                0.05 * torch.randn(count, generator=generator, device="cuda") + bulk[1]
+            ),
+            bulk_velocity_uas_per_day=bulk,
+            reflecting_boundary_center_uas=(0.0, 0.0),
+            reflecting_boundary_radius_uas=radius,
+        )
+        expected = field.at_time(80.0)
+        simulation = mc.MicrolensingSimulation.create(
+            mc.MacroLens(0.2, 0.1),
+            field,
+            runtime=mc.RuntimeConfig(
+                device="cuda",
+                backend="triton",
+                strict_backend=True,
+                warn_on_compile=False,
+            ),
+        )
+        actual = simulation.lens_state(80.0)
+        torch.testing.assert_close(actual.x_uas, expected.x_uas, rtol=3e-6, atol=3e-6)
+        torch.testing.assert_close(actual.y_uas, expected.y_uas, rtol=3e-6, atol=3e-6)
+
     """Compare fused float32 kernels with the readable eager implementation."""
+
+    def test_compiled_reprocessing_brightness_matches_eager(self):
+        runtime = mc.RuntimeConfig(
+            device="cuda",
+            backend="triton",
+            strict_backend=True,
+            warn_on_compile=False,
+        )
+        model = mc.ThinDiskModel(
+            black_hole_mass_solar=1e8,
+            eddington_ratio=0.1,
+            source_grid_shape=32,
+            bands_angstrom={"g": 4800, "r": 6200, "i": 7500},
+            driving_signal=mc.TabulatedDrivingSignal(
+                [-1000.0, 1000.0],
+                [0.9, 1.1],
+            ),
+        )
+        source = model.pixelate(
+            source_redshift=1.5,
+            H0=70,
+            Om0=0.3,
+            runtime=runtime,
+        )
+        times = torch.tensor([-1.0, 0.0, 1.0], device="cuda")
+        with torch.no_grad():
+            actual = source.brightness(times)
+            expected = replace(source, _runtime=None).brightness(times)
+        torch.testing.assert_close(actual, expected, rtol=3e-5, atol=0.0)
 
     def test_cross_disk_kerr_setup_matches_serial(self):
         runtime = mc.RuntimeConfig(
@@ -243,6 +314,7 @@ class TritonTaylorTests(unittest.TestCase):
             batched_caustic_crossings_distances_triton,
             batched_sparse_marching_squares_zero_triton,
             marching_squares_zero_triton,
+            packed_caustic_crossings_distances_triton,
             ragged_sparse_marching_squares_zero_triton,
             sparse_marching_squares_zero_triton,
         )
@@ -416,6 +488,50 @@ class TritonTaylorTests(unittest.TestCase):
         torch.testing.assert_close(fused_counts, portable_counts)
         torch.testing.assert_close(fused_distances, portable_distances)
 
+        # The production path stores temporal segment rows contiguously rather
+        # than padding every frame to the largest row.  Include an empty frame
+        # and a shorter final frame to exercise the ragged offset contract.
+        dense_segments = torch.zeros((3, 4, 2, 2), device="cuda")
+        dense_valid = torch.zeros((3, 4), device="cuda", dtype=torch.bool)
+        dense_segments[0] = segments[0]
+        dense_valid[0] = True
+        dense_segments[2, :2] = segments[0, :2]
+        dense_valid[2, :2] = True
+        packed_segments = torch.cat((segments[0], segments[0, :2]), dim=0)
+        frame_offsets = torch.tensor([0, 4, 4, 6], device="cuda")
+        dense_counts, dense_distances = batched_caustic_crossings_distances_triton(
+            dense_segments,
+            dense_valid,
+            anchors,
+            points,
+            points,
+            block_segments=64,
+        )
+        packed_counts, packed_distances = packed_caustic_crossings_distances_triton(
+            packed_segments,
+            frame_offsets,
+            anchors,
+            points,
+            points,
+            maximum_segments=4,
+            block_segments=64,
+        )
+        torch.testing.assert_close(packed_counts, dense_counts)
+        torch.testing.assert_close(packed_distances, dense_distances)
+
+        counts_only, skipped_distances = packed_caustic_crossings_distances_triton(
+            packed_segments,
+            frame_offsets,
+            anchors,
+            points,
+            points,
+            maximum_segments=4,
+            compute_distances=False,
+            block_segments=64,
+        )
+        torch.testing.assert_close(counts_only, dense_counts)
+        self.assertTrue(bool(torch.isinf(skipped_distances).all()))
+
     def test_diagnostic_maps_match_portable_float32_results(self) -> None:
         """Exercise full-grid winding, anchor/gauge, and distance products."""
 
@@ -486,6 +602,7 @@ class TritonTaylorTests(unittest.TestCase):
             diagnostic_grid=grid,
             include_distance_map=True,
         )[0][0]
+        self.assertEqual(gpu_labeled.labels.metadata["label_backend"], "triton_packed")
         self.assertTrue(gpu_labeled.label_map.metadata["triton_grid_query"])
         torch.testing.assert_close(
             gpu_labeled.label_map.values.cpu(),
@@ -497,6 +614,81 @@ class TritonTaylorTests(unittest.TestCase):
             rtol=2.0e-6,
             atol=2.0e-6,
         )
+
+        invalid_mask = torch.zeros(len(cpu_segments), dtype=torch.bool)
+        invalid_mask[:7] = True
+        invalid_cpu_field = CausticField(
+            cpu_segments,
+            cpu_segments,
+            grid,
+            invalid_segment_mask=invalid_mask,
+        )
+        invalid_gpu_field = CausticField(
+            cpu_segments.cuda(),
+            cpu_segments.cuda(),
+            grid,
+            invalid_segment_mask=invalid_mask.cuda(),
+        )
+        invalid_cpu = label_caustic_fields(
+            (invalid_cpu_field,),
+            grid.region,
+            config,
+        )[0][0].labels
+        invalid_gpu = label_caustic_fields(
+            (invalid_gpu_field,),
+            grid.region,
+            config,
+        )[0][0].labels
+        self.assertEqual(invalid_gpu.metadata["label_backend"], "triton_packed")
+        self.assertEqual(invalid_gpu.center_label, invalid_cpu.center_label)
+        self.assertEqual(invalid_gpu.center_vote_count, invalid_cpu.center_vote_count)
+        self.assertEqual(invalid_gpu.center_valid_count, invalid_cpu.center_valid_count)
+        torch.testing.assert_close(
+            invalid_gpu.gauge_valid_counts,
+            invalid_cpu.gauge_valid_counts,
+        )
+
+    def test_dense_triton_label_fallback_matches_packed_backend(self) -> None:
+        """A packed-kernel failure retains the established CUDA fallback."""
+
+        import warnings
+        from unittest.mock import patch
+
+        from microcaustics.caustics import label_caustic_fields
+        from microcaustics.results import CausticField
+
+        segments = torch.tensor(
+            [
+                [[-1.0, -1.0], [1.0, -1.0]],
+                [[1.0, -1.0], [1.0, 1.0]],
+                [[1.0, 1.0], [-1.0, 1.0]],
+                [[-1.0, 1.0], [-1.0, -1.0]],
+            ],
+            device="cuda",
+        )
+        grid = mc.PlaneGrid((17, 17), (4.0, 4.0))
+        field = CausticField(segments, segments, grid)
+        config = mc.CausticConfig(
+            anchor_count=3,
+            gauge_count=3,
+            minimum_alignment_gauges=1,
+            triton_segment_block=64,
+        )
+        with (
+            patch(
+                "microcaustics.caustics.triton_caustics."
+                "packed_caustic_crossings_distances_triton",
+                side_effect=RuntimeError("forced packed-kernel failure"),
+            ),
+            warnings.catch_warnings(),
+        ):
+            warnings.simplefilter("ignore")
+            labeled = label_caustic_fields(
+                (field,),
+                grid.region,
+                config,
+            )[0][0]
+        self.assertEqual(labeled.labels.metadata["label_backend"], "triton_dense")
 
     def test_complete_far_field_caustics_are_chunk_invariant(self) -> None:
         """Complete winding fields retain their geometry across query chunks."""
@@ -593,7 +785,15 @@ class TritonTaylorTests(unittest.TestCase):
         x = torch.cat((far_x, local_x))
         y = torch.cat((far_y, local_y))
         radii = torch.rand(51, generator=generator, device="cuda") * 0.03 + 0.02
-        field = mc.PointMassField._from_einstein_radii(x, y, einstein_radius_uas=radii)
+        bulk_velocity = (0.003, -0.002)
+        field = mc.PointMassField._from_einstein_radii(
+            x,
+            y,
+            einstein_radius_uas=radii,
+            velocity_x_uas_per_day=torch.full_like(x, bulk_velocity[0]),
+            velocity_y_uas_per_day=torch.full_like(y, bulk_velocity[1]),
+            bulk_velocity_uas_per_day=bulk_velocity,
+        )
         macro = mc.MacroLens(
             0.32,
             0.17,
@@ -615,6 +815,7 @@ class TritonTaylorTests(unittest.TestCase):
             ),
             mc.PlaneRegion((4.0, 4.0)),
             config,
+            time_days=5.0,
         )
         fused = TaylorFarFieldApproximation(
             mc.MicrolensingSimulation.create(
@@ -628,6 +829,7 @@ class TritonTaylorTests(unittest.TestCase):
             ),
             mc.PlaneRegion((4.0, 4.0)),
             config,
+            time_days=5.0,
         )
         torch.testing.assert_close(
             fused.coefficient_real,
@@ -664,11 +866,14 @@ class TritonTaylorTests(unittest.TestCase):
             torch.tensor([0.8, -1.1, 0.3, -0.5], device="cuda"),
             velocity_x_uas_per_day=torch.tensor(
                 [0.002, -0.001, 0.0015, -0.002], device="cuda"
-            ),
+            )
+            + 0.003,
             velocity_y_uas_per_day=torch.tensor(
                 [-0.001, 0.002, -0.0015, 0.001], device="cuda"
-            ),
+            )
+            - 0.002,
             einstein_radius_uas=torch.tensor([0.12, 0.08, 0.1, 0.07], device="cuda"),
+            bulk_velocity_uas_per_day=(0.003, -0.002),
         )
         simulation = mc.MicrolensingSimulation.create(
             mc.MacroLens(
@@ -1447,9 +1652,7 @@ class TritonTaylorTests(unittest.TestCase):
         )
         common = dict(
             include_labels=True,
-            method=replace(
-                _small_production_method(), scout_trace_centers=False
-            ),
+            method=replace(_small_production_method(), scout_trace_centers=False),
             schedule=_small_dynamic_schedule(),
             caustics=_small_caustic_config(),
         )

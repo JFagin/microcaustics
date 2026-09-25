@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as functional
 
+from .compile import run_tensor_kernel
 from .config import DynamicConfig, IPMConfig, IRSConfig
 from .geometry import PlaneGrid, PlaneRegion
 from .lens import LensingDistances
@@ -76,6 +77,8 @@ class LightCurveRequest:
     apply_driving_signal: bool | None = None
     flux_cadence_days: float | None = None
     flux_times_days: Sequence[float] | torch.Tensor | None = None
+    source_evolution: str = "exact"
+    response_delay_bin_days: float = 0.25
 
     def __post_init__(self) -> None:
         if self.flux_cadence_days is not None and self.flux_times_days is not None:
@@ -91,6 +94,18 @@ class LightCurveRequest:
             self.apply_driving_signal, bool
         ):
             raise TypeError("apply_driving_signal must be True, False, or None")
+        if self.source_evolution not in {
+            "exact", "linear_response", "quadratic_response"
+        }:
+            raise ValueError(
+                "source_evolution must be 'exact', 'linear_response', "
+                "or 'quadratic_response'"
+            )
+        if (
+            not math.isfinite(self.response_delay_bin_days)
+            or self.response_delay_bin_days <= 0
+        ):
+            raise ValueError("response_delay_bin_days must be finite and positive")
 
 
 def _source_offsets_uas(
@@ -305,11 +320,18 @@ def light_curve_from_maps(
     centers = trajectory.position_uas(times, device=device, dtype=dtype)
     if centers.shape != (times.numel(), 2):
         raise ValueError("trajectory positions must have shape [time, 2]")
-    offset_x, offset_y = _source_offsets_uas(
-        source,
-        distances,
-        device=device,
-        dtype=dtype,
+    aligned = all(item.grid == maps[0].grid for item in maps) and (
+        _source_is_map_aligned(source, distances, trajectory, maps[0].grid)
+    )
+    offsets = (
+        None
+        if aligned
+        else _source_offsets_uas(
+            source,
+            distances,
+            device=device,
+            dtype=dtype,
+        )
     )
     pixel_area_m2 = float(
         source.geometry.pixel_scale_m[0] * source.geometry.pixel_scale_m[1]
@@ -317,22 +339,41 @@ def light_curve_from_maps(
     lensed_chunks = []
     unlensed_chunks = []
     source_chunks = _source_band_chunks(source, band_batch_size)
+    prepare = getattr(source, "_brightness_state", None)
     for start in range(0, len(maps), batch_size):
         stop = min(start + batch_size, len(maps))
-        samples = [
-            _sample_map(
-                magnification_map,
-                offset_x + centers[index, 0],
-                offset_y + centers[index, 1],
-                strict_coverage=strict_coverage,
-            )
-            for index, magnification_map in enumerate(
-                maps[start:stop], start=start
-            )
-        ]
+        if aligned:
+            samples = [item.values for item in maps[start:stop]]
+        else:
+            assert offsets is not None
+            offset_x, offset_y = offsets
+            samples = [
+                _sample_map(
+                    magnification_map,
+                    offset_x + centers[index, 0],
+                    offset_y + centers[index, 1],
+                    strict_coverage=strict_coverage,
+                )
+                for index, magnification_map in enumerate(maps[start:stop], start=start)
+            ]
         lensed_parts = []
         unlensed_parts = []
+        state = (
+            None
+            if prepare is None
+            else prepare(times[start:stop], device=device, dtype=dtype)
+        )
+        sample_batch = None if state is None else torch.stack(samples)
         for chunk_source, valid_count in source_chunks:
+            if state is not None:
+                lensed, unlensed = chunk_source._flux_from_brightness_state(
+                    state, sample_batch, sample_batch, times.new_zeros(stop - start)
+                )
+                lensed_parts.append(lensed[:, :valid_count])
+                unlensed_parts.append(
+                    unlensed[:, :valid_count].expand(stop - start, -1)
+                )
+                continue
             brightness = chunk_source.brightness(
                 times[start:stop], device=device, dtype=dtype
             )
@@ -356,6 +397,7 @@ def light_curve_from_maps(
             "method": "finite_source_map_sampling",
             "map_methods": sorted({item.method for item in maps}),
             "strict_coverage": bool(strict_coverage),
+            "map_aligned_source_fast_path": aligned,
             "source_batch_size": batch_size,
             "band_batch_size": band_batch_size,
             "source": dict(source.metadata()),
@@ -412,14 +454,43 @@ def source_light_curve(
     )
     rows = []
     source_chunks = _source_band_chunks(source, band_batch_size)
+    prepare = getattr(source, "_brightness_state", None)
+    static_state = (
+        prepare(times[:1], device=resolved_device, dtype=resolved_dtype)
+        if prepare is not None and getattr(source, "is_time_static", False)
+        else None
+    )
+    # A scalar unity map broadcasts inside the compiled intrinsic contraction.
+    # No image-sized dummy magnification map or time-dependent map is allocated.
+    unity = times.new_ones((1, 1, 1))
+    static_flux = None
     for chunk in times.split(int(batch_size)):
+        if static_flux is not None:
+            rows.append(static_flux.expand(chunk.numel(), -1))
+            continue
         parts = []
+        padded = (
+            _pad_source_times(chunk, int(batch_size)) if prepare is not None else chunk
+        )
+        state = static_state
+        if state is None and prepare is not None:
+            state = prepare(padded, device=resolved_device, dtype=resolved_dtype)
         for chunk_source, valid_count in source_chunks:
+            if state is not None:
+                _, intrinsic = chunk_source._flux_from_brightness_state(
+                    state, unity, unity, times.new_zeros(1)
+                )
+                parts.append(intrinsic[: chunk.numel(), :valid_count])
+                continue
             brightness = chunk_source.brightness(
                 chunk, device=resolved_device, dtype=resolved_dtype
             )
             parts.append(brightness.sum(dim=(1, 2))[:, :valid_count])
-        rows.append(torch.cat(parts, dim=1) * pixel_area_m2)
+        flux_chunk = torch.cat(parts, dim=1) * pixel_area_m2
+        if getattr(source, "is_time_static", False):
+            static_flux = flux_chunk[:1]
+            flux_chunk = static_flux.expand(chunk.numel(), -1)
+        rows.append(flux_chunk)
     flux = torch.cat(rows, dim=0)
     return LightCurve(
         times_days=times,
@@ -530,6 +601,20 @@ def multirate_streaming_light_curve(
     One map is treated as a static field. With multiple maps, all flux epochs
     must lie inside the map-time interval.
     """
+
+    if getattr(source, "_brightness_state", None) is not None:
+        return streaming_light_curves(
+            simulation,
+            lens_region,
+            source_grid,
+            map_times_days,
+            (LightCurveRequest(source, distances, trajectory, strict_coverage),),
+            method=method,
+            schedule=schedule,
+            map_observer=map_observer,
+            flux_times_days=flux_times_days,
+            _map_iterator=_map_iterator,
+        )[0]
 
     # Plan interpolation brackets on the CPU once. This avoids synchronizing
     # CUDA for every map interval merely to recover Python output indices.
@@ -781,6 +866,26 @@ def _source_band_chunks(source, band_batch_size):
     return tuple(chunks)
 
 
+def _flux_reduction(brightness, left, right, fraction):
+    """Fuse map interpolation and the lensed/unlensed spatial contractions."""
+
+    sampled = left + fraction[:, None, None] * (right - left)
+    return (
+        (brightness * sampled[..., None]).sum(dim=(1, 2)),
+        brightness.sum(dim=(1, 2)),
+    )
+
+
+def _pad_source_times(values, size):
+    """Keep temporal tail shapes fixed without querying outside driver bounds."""
+
+    if values.shape[0] == size:
+        return values
+    return torch.cat(
+        (values, values[-1:].expand(size - values.shape[0], *values.shape[1:]))
+    )
+
+
 @torch.no_grad()
 def _flexible_streaming_light_curves(
     simulation,
@@ -797,6 +902,8 @@ def _flexible_streaming_light_curves(
     map_iterator,
 ):
     """Share dynamic maps across request-specific time and wavelength batches."""
+
+    from .sources.linear_response import LinearResponsePlan
 
     runtime = simulation.runtime
     device, dtype = runtime.device, runtime.dtype
@@ -829,6 +936,18 @@ def _flexible_streaming_light_curves(
     centers = []
     offsets = []
     chunks = []
+    aligned = []
+    stationary = []
+    static_states = []
+    static_matrices = []
+    source_temporal_batches = []
+    response_plans = []
+    # Bound the combined static cache across requests. This is at most 1/32
+    # of the configured device budget (and never more than 512 MiB). Larger
+    # spectra keep streaming wavelength chunks through the fused thermal path.
+    static_cache_remaining = min(
+        512 * 2**20, (runtime.available_memory_bytes or 512 * 2**20) // 32
+    )
     right_indices = []
     fractions = []
     for request, times, local_times in zip(
@@ -841,8 +960,18 @@ def _flexible_streaming_light_curves(
         if position.shape != (times.numel(), 2):
             raise ValueError("trajectory positions must have shape [time, 2]")
         centers.append(position)
+        is_aligned = _source_is_map_aligned(
+            request.source, request.distances, request.trajectory, source_grid
+        )
+        aligned.append(is_aligned)
+        stationary.append(
+            isinstance(trajectory, LinearTrajectory)
+            and tuple(trajectory.velocity_uas_per_day) == (0.0, 0.0)
+        )
         offsets.append(
-            _source_offsets_uas(
+            None
+            if is_aligned
+            else _source_offsets_uas(
                 request.source,
                 request.distances,
                 device=device,
@@ -850,6 +979,56 @@ def _flexible_streaming_light_curves(
             )
         )
         chunks.append(_source_band_chunks(request.source, band_batch_size))
+        if request.source_evolution != "exact":
+            if not (
+                isinstance(trajectory, LinearTrajectory)
+                and tuple(trajectory.velocity_uas_per_day) == (0.0, 0.0)
+            ):
+                raise ValueError(
+                    "linear_response currently requires a stationary source trajectory"
+                )
+            response_plans.append(
+                LinearResponsePlan(
+                    request.source,
+                    chunks[-1],
+                    local_times,
+                    delay_bin_days=request.response_delay_bin_days,
+                    response_order=(
+                        2 if request.source_evolution == "quadratic_response" else 1
+                    ),
+                    runtime=runtime,
+                )
+            )
+        else:
+            response_plans.append(None)
+        is_static = bool(getattr(request.source, "is_time_static", False))
+        prepare = getattr(request.source, "_brightness_state", None)
+        static_states.append(
+            prepare(local_times[:1], device=device, dtype=dtype)
+            if is_static and prepare is not None
+            else None
+        )
+        band_count = len(request.source.geometry.band_names)
+        pixel_count = math.prod(request.source.geometry.shape)
+        cache_bytes = pixel_count * band_count * local_times.element_size()
+        matrix = None
+        if is_static and cache_bytes <= static_cache_remaining:
+            matrix = torch.empty((pixel_count, band_count), device=device, dtype=dtype)
+            column = 0
+            for chunk, valid in chunks[-1]:
+                frame = (
+                    chunk._brightness_from_state(static_states[-1])
+                    if static_states[-1] is not None
+                    else chunk.brightness(local_times[:1], device=device, dtype=dtype)
+                )
+                matrix[:, column : column + valid] = frame[0, ..., :valid].reshape(
+                    pixel_count, valid
+                )
+                column += valid
+            static_cache_remaining -= cache_bytes
+        static_matrices.append(
+            None if matrix is None else (matrix, matrix.sum(dim=0)[None])
+        )
         if map_times.numel() == 1:
             right_indices.append(torch.zeros(times.numel(), dtype=torch.long))
             fractions.append(torch.zeros(times.numel(), dtype=dtype, device=device))
@@ -860,6 +1039,12 @@ def _flexible_streaming_light_curves(
                 map_times[right] - map_times[right - 1]
             )
             fractions.append(fraction.to(device=device, dtype=dtype))
+        # A sparse request can have far fewer source epochs per map interval
+        # than the map/label batch size. Keep one compiled source shape for
+        # this request without padding every interval to the map batch size.
+        source_temporal_batches.append(
+            min(temporal_batch, int(torch.bincount(right_indices[-1]).max()))
+        )
 
     iterator = iter(
         simulation.dynamic_maps(
@@ -874,8 +1059,18 @@ def _flexible_streaming_light_curves(
     )
     runtime.synchronize(detailed=False)
     started = perf_counter()
-    outputs = [[None] * int(times.numel()) for times in request_times]
-    unlensed_outputs = [[None] * int(times.numel()) for times in request_times]
+    outputs = [
+        torch.empty(
+            (times.numel(), len(request.source.geometry.band_names)),
+            device=device,
+            dtype=dtype,
+        )
+        for request, times in zip(requests, request_times, strict=True)
+    ]
+    unlensed_outputs = [torch.empty_like(value) for value in outputs]
+    written = [0] * len(requests)
+    static_map_flux = [None] * len(requests)
+    response_map_flux = [None] * len(requests)
     map_methods = set()
     dynamic_metadata = {}
 
@@ -893,6 +1088,76 @@ def _flexible_streaming_light_curves(
             map_observer(index, frame)
         return frame
 
+    def sample(frame, request_index, positions):
+        if aligned[request_index]:
+            return frame.values[None]
+        x_offset, y_offset = offsets[request_index]
+        return _sample_map_batch(
+            frame,
+            x_offset[None] + positions[:, 0, None, None],
+            y_offset[None] + positions[:, 1, None, None],
+            strict_coverage=requests[request_index].strict_coverage,
+        )
+
+    def contract(request_index, times, left, right, fraction):
+        cached_matrix = static_matrices[request_index]
+        if cached_matrix is not None:
+            matrix, intrinsic = cached_matrix
+            # These are BLAS matrix products against a disk evaluated once.
+            # Interpolate the small flux vectors, never daily static images.
+            left_flux = left.flatten(1) @ matrix
+            right_flux = left_flux if right is left else right.flatten(1) @ matrix
+            return left_flux + fraction[:, None] * (right_flux - left_flux), intrinsic
+        source = requests[request_index].source
+        state = static_states[request_index]
+        prepare = getattr(source, "_brightness_state", None)
+        if state is None and prepare is not None:
+            state = prepare(times, device=device, dtype=dtype)
+        lensed, unlensed = [], []
+        for chunk, valid in chunks[request_index]:
+            if state is not None:
+                flux, intrinsic = chunk._flux_from_brightness_state(
+                    state, left, right, fraction
+                )
+            else:
+                brightness = chunk.brightness(times, device=device, dtype=dtype)
+                (flux, intrinsic), _ = run_tensor_kernel(
+                    runtime,
+                    "source photometry reduction",
+                    _flux_reduction,
+                    brightness,
+                    left,
+                    right,
+                    fraction,
+                )
+            lensed.append(flux[:, :valid])
+            unlensed.append(intrinsic[:, :valid])
+        return torch.cat(lensed, dim=1), torch.cat(unlensed, dim=1)
+
+    def static_contract(request_index, frame):
+        cached = static_map_flux[request_index]
+        if cached is not None and cached[0] is frame:
+            return cached[1]
+        values = sample(frame, request_index, centers[request_index][:1])
+        result = contract(
+            request_index,
+            times_device[request_index][:1],
+            values,
+            values,
+            torch.zeros(1, device=device, dtype=dtype),
+        )
+        static_map_flux[request_index] = (frame, result)
+        return result
+
+    def response_contract(request_index, frame):
+        cached = response_map_flux[request_index]
+        if cached is not None and cached[0] is frame:
+            return cached[1]
+        values = sample(frame, request_index, centers[request_index][:1])
+        result = response_plans[request_index].project_map(values[0])
+        response_map_flux[request_index] = (frame, result)
+        return result
+
     left_map = take_map(0)
     interval_values = (0,) if map_times.numel() == 1 else range(1, map_times.numel())
     for right_index in interval_values:
@@ -901,43 +1166,65 @@ def _flexible_streaming_light_curves(
             selected = torch.nonzero(
                 right_indices[request_index] == right_index
             ).reshape(-1)
-            for start in range(0, selected.numel(), temporal_batch):
-                local = selected[start : start + temporal_batch]
-                if local.numel() == 0:
-                    continue
-                x_offset, y_offset = offsets[request_index]
-                x = x_offset[None] + centers[request_index][local, 0, None, None]
-                y = y_offset[None] + centers[request_index][local, 1, None, None]
-                left_values = _sample_map_batch(
-                    left_map, x, y, strict_coverage=request.strict_coverage
+            if selected.numel() == 0:
+                continue
+            if response_plans[request_index] is not None:
+                plan = response_plans[request_index]
+                left_projection = response_contract(request_index, left_map)
+                right_projection = response_contract(request_index, right_map)
+                lo, hi = int(selected[0]), int(selected[-1]) + 1
+                left_flux = plan.flux(left_projection, lo, hi)
+                right_flux = plan.flux(right_projection, lo, hi)
+                weight = fractions[request_index][lo:hi, None]
+                outputs[request_index][lo:hi] = left_flux + weight * (
+                    right_flux - left_flux
                 )
-                if right_map is left_map:
-                    sampled = left_values
-                else:
-                    right_values = _sample_map_batch(
-                        right_map, x, y, strict_coverage=request.strict_coverage
-                    )
-                    weight = fractions[request_index][local, None, None]
-                    sampled = left_values + weight * (right_values - left_values)
-                lensed_parts = []
-                unlensed_parts = []
-                for chunk_source, valid_count in chunks[request_index]:
-                    brightness = chunk_source.brightness(
-                        times_device[request_index][local],
-                        device=device,
-                        dtype=dtype,
-                    )
-                    lensed_parts.append(
-                        (brightness * sampled[..., None]).sum(dim=(1, 2))[
-                            :, :valid_count
-                        ]
-                    )
-                    unlensed_parts.append(brightness.sum(dim=(1, 2))[:, :valid_count])
-                lensed = torch.cat(lensed_parts, dim=1)
-                unlensed = torch.cat(unlensed_parts, dim=1)
-                for row, output_index in enumerate(local.tolist()):
-                    outputs[request_index][output_index] = lensed[row]
-                    unlensed_outputs[request_index][output_index] = unlensed[row]
+                unlensed_outputs[request_index][lo:hi] = plan.unlensed_flux(lo, hi)
+                written[request_index] += hi - lo
+                continue
+            is_static = bool(getattr(request.source, "is_time_static", False))
+            if is_static and stationary[request_index]:
+                # For a fixed disk, flux is linear in the map. Contract each
+                # bracketing map once and interpolate tiny band vectors, not
+                # daily maps/brightness cubes. This is exact, not a variability
+                # or reverberation approximation.
+                left_flux, intrinsic = static_contract(request_index, left_map)
+                right_flux, _ = static_contract(request_index, right_map)
+                lo, hi = int(selected[0]), int(selected[-1]) + 1
+                weight = fractions[request_index][lo:hi, None]
+                outputs[request_index][lo:hi] = left_flux + weight * (
+                    right_flux - left_flux
+                )
+                unlensed_outputs[request_index][lo:hi] = intrinsic
+                written[request_index] += hi - lo
+                continue
+            source_batch = source_temporal_batches[request_index]
+            for start in range(0, selected.numel(), source_batch):
+                local = selected[start : start + source_batch]
+                lo, hi = int(local[0]), int(local[-1]) + 1
+                times = _pad_source_times(
+                    times_device[request_index][lo:hi], source_batch
+                )
+                weight = _pad_source_times(
+                    fractions[request_index][lo:hi], source_batch
+                )
+                positions = (
+                    centers[request_index][:1]
+                    if stationary[request_index]
+                    else _pad_source_times(centers[request_index][lo:hi], source_batch)
+                )
+                left_values = sample(left_map, request_index, positions)
+                right_values = (
+                    left_values
+                    if right_map is left_map
+                    else sample(right_map, request_index, positions)
+                )
+                lensed, unlensed = contract(
+                    request_index, times, left_values, right_values, weight
+                )
+                outputs[request_index][lo:hi] = lensed[: hi - lo]
+                unlensed_outputs[request_index][lo:hi] = unlensed[: hi - lo]
+                written[request_index] += hi - lo
         left_map = right_map
 
     try:
@@ -950,7 +1237,7 @@ def _flexible_streaming_light_curves(
     elapsed = perf_counter() - started
     results = []
     for index, request in enumerate(requests):
-        if any(value is None for value in outputs[index]):
+        if written[index] != request_times[index].numel():
             raise RuntimeError("not every request flux epoch was evaluated")
         pixel_area = float(
             request.source.geometry.pixel_scale_m[0]
@@ -959,9 +1246,9 @@ def _flexible_streaming_light_curves(
         results.append(
             LightCurve(
                 times_days=times_device[index],
-                flux=torch.stack(outputs[index]) * pixel_area,
+                flux=outputs[index] * pixel_area,
                 band_names=request.source.geometry.band_names,
-                unlensed_flux=torch.stack(unlensed_outputs[index]) * pixel_area,
+                unlensed_flux=unlensed_outputs[index] * pixel_area,
                 metadata={
                     "method": "streaming_finite_source_map_sampling",
                     "request_name": request.name,
@@ -969,8 +1256,18 @@ def _flexible_streaming_light_curves(
                     "strict_coverage": bool(request.strict_coverage),
                     "source": dict(request.source.metadata()),
                     "maps_retained": False,
-                    "source_batch_size": temporal_batch,
+                    "source_batch_size": source_temporal_batches[index],
+                    "source_evolution": request.source_evolution,
+                    "response_delay_bin_days": (
+                        request.response_delay_bin_days
+                        if response_plans[index] is not None
+                        else None
+                    ),
                     "band_batch_size": band_batch_size,
+                    "map_aligned_source_fast_path": aligned[index],
+                    "coherent_source_factorized": bool(
+                        getattr(request.source, "is_time_static", False)
+                    ),
                     "shared_map_request_count": len(requests),
                     "map_epochs": int(map_times.numel()),
                     "flux_epochs": int(request_times[index].numel()),
@@ -1050,7 +1347,10 @@ def streaming_light_curves(
             band_batch_size=band_batch_size,
             map_iterator=_map_iterator,
         )
-    if band_batch_size is not None:
+    if band_batch_size is not None or any(
+        getattr(request.source, "_brightness_state", None) is not None
+        for request in requests
+    ):
         shared_times = times_days if flux_times_days is None else flux_times_days
         return _flexible_streaming_light_curves(
             simulation,

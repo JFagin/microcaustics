@@ -1,7 +1,7 @@
 # Thin disks and relativistic source calculations
 
-`ThinDiskModel` specifies a physical, static continuum disk implementing the same
-signed-spin ISCO, Novikov--Thorne radial dissipation, color correction, and
+`ThinDiskModel` specifies a physical continuum disk implementing the same
+signed-spin ISCO, Novikov–Thorne radial dissipation, color correction, and
 observed-frequency convention as the validated paper implementation. It is an
 object that chooses its own pixel grid. Its resolved source can be used with
 IRS, IPM, external maps, or without microlensing.
@@ -16,12 +16,36 @@ model = mc.ThinDiskModel(
 disk = model.pixelate(source_redshift=1.7, H0=70, Om0=0.3)
 ```
 
+Attach a driver, lamp fraction, and lamp height to obtain the analytic
+Euclidean counterpart of the Kerr reprocessing source:
+
+```python
+newtonian = mc.ThinDiskModel(
+    black_hole_mass_solar=1e9,
+    eddington_ratio=0.1,
+    bands_angstrom={"g": 4800, "i": 7500},
+    source_grid_shape=256,
+    lamp_fraction=0.1,
+    corona_height_above_isco_rg=20.0,
+    driving_signal=driver,
+)
+source = newtonian.pixelate(source_redshift=1.7, H0=70, Om0=0.3)
+```
+
+The resulting `ThermalReprocessingSource` supports the same temporally and
+wavelength-batched brightness evaluation, microlensed light curves, response
+delays, and transfer functions as a driven `KerrDiskModel`. Only the observer
+and axial-lamppost transfer physics differ.
+
 Pixels use package-standard array order `(y, x)` and represent the projected
 source plane. Brightness is in `Jy m^-2` of projected source plane, so the
 ordinary finite-source integrator supplies the pixel area exactly once and
 returns Jy. This scaling also avoids float32 underflow that would result from
 storing cgs flux per physical square meter. Wavelengths in `SourceGeometry` are
 observer-frame angstroms and may describe any filters.
+`position_angle_deg` follows the same observer-screen convention in
+`ThinDiskModel` and `KerrDiskModel`: zero places the projected minor axis along
+screen y, and positive angles rotate the disk counterclockwise.
 
 The two currently published modes are explicit:
 
@@ -63,8 +87,8 @@ source = disk.pixelate(source_redshift=1.695, H0=70.0, Om0=0.3)
 
 ## Viscous flux profiles and radiative efficiency
 
-`ThinDiskModel` and `KerrDiskModel` use the relativistic Novikov--Thorne
-profile by default. The Shakura--Sunyaev profile is also built in:
+`ThinDiskModel` and `KerrDiskModel` use the relativistic Novikov–Thorne
+profile by default. The Shakura–Sunyaev profile is also built in:
 
 ```python
 disk = mc.KerrDiskModel(

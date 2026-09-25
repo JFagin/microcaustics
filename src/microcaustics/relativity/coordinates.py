@@ -1822,6 +1822,12 @@ def add_observer_coordinates_batch(
                 )
                 compile_enabled = False
                 compile_fallback_used = True
+                warnings.warn(
+                    "compiled pooled Kerr observer coordinates failed; retrying "
+                    f"with eager Torch ({type(caught).__name__}: {caught})",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
                 continue
             raise
 

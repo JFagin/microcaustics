@@ -79,6 +79,103 @@ if TYPE_CHECKING:
     from .trajectories import SourceTrajectory
 
 
+def _macro_magnification(macro: MacroLens) -> float:
+    """Return the absolute point-source magnification of the local macro model."""
+
+    determinant = (1.0 - macro.convergence) ** 2 - macro.shear**2
+    if determinant == 0.0:
+        raise ValueError("the macro model is exactly critical")
+    return abs(1.0 / determinant)
+
+
+def _spectral_light_curve(
+    realization,
+    map_times,
+    flux_times,
+    *,
+    source,
+    trajectory,
+    strict_coverage,
+    method,
+    schedule,
+    map_observer,
+    keep_maps_at_days,
+    bandpasses,
+    spectral_model,
+    wavelength_samples,
+    wavelength_batch_size,
+    include_microlensing_only,
+    return_spectrum,
+    spectrum_wavelengths,
+    host_lensing,
+    source_evolution,
+    response_delay_bin_days,
+):
+    """Evaluate continuum nodes once, then derive photometry and spectra."""
+
+    from .spectral_photometry import (
+        finish_spectral_light_curve,
+        prepare_spectral_source,
+    )
+
+    base_source = realization.source if source is None else source
+    if base_source is None:
+        raise ValueError("spectral photometry requires a physical source")
+    base_source, plan, resolved_bandpasses, redshift = prepare_spectral_source(
+        base_source,
+        realization.system.distances,
+        bandpasses,
+        spectral_model=spectral_model,
+        wavelength_samples=wavelength_samples,
+        spectrum_wavelengths=spectrum_wavelengths,
+        return_spectrum=return_spectrum,
+        host_lensing=host_lensing,
+    )
+    request = LightCurveRequest(
+        source=base_source,
+        distances=realization.system.distances,
+        trajectory=trajectory,
+        strict_coverage=strict_coverage,
+        bands_angstrom=plan.bands_angstrom,
+        source_evolution=source_evolution,
+        response_delay_bin_days=response_delay_bin_days,
+    )
+    requests = [request]
+    need_mean = spectral_model is not None or include_microlensing_only
+    if need_mean:
+        requests.append(
+            replace(
+                request,
+                source=_source_at_driver_mean(base_source),
+                source_evolution="exact",
+            )
+        )
+    curves = realization.light_curves(
+        map_times,
+        tuple(requests),
+        method=method,
+        schedule=schedule,
+        map_observer=map_observer,
+        keep_maps_at_days=keep_maps_at_days,
+        flux_times_days=flux_times,
+        band_batch_size=wavelength_batch_size,
+    )
+    return finish_spectral_light_curve(
+        curves[0],
+        curves[1] if need_mean else None,
+        plan,
+        spectral_model=spectral_model,
+        source_redshift=float(redshift),
+        luminosity_distance_m=(1.0 + float(redshift)) ** 2
+        * realization.system.distances.source_m,
+        macro_magnification=_macro_magnification(realization.system.macro),
+        include_microlensing_only=include_microlensing_only,
+        return_spectrum=return_spectrum,
+        host_lensing=host_lensing,
+        bandpass_version=resolved_bandpasses.version,
+    )
+
+
 class IntegrationDomain(str, Enum):
     """Lens-plane region evaluated by a map construction method."""
 
@@ -268,6 +365,8 @@ class MicrolensingRealization:
         include_distance_map=False,
         include_microlensing_only=False,
         band_batch_size=None,
+        source_evolution="exact",
+        response_delay_bin_days=0.25,
     ):
         """Resolve geometry and observers once for all four photometry schedulers."""
 
@@ -304,6 +403,8 @@ class MicrolensingRealization:
             map_observer=observer,
             microlensing_only_source=microlensing_only_source,
             band_batch_size=band_batch_size,
+            source_evolution=source_evolution,
+            response_delay_bin_days=response_delay_bin_days,
         )
         if include_labels:
             kwargs.update(
@@ -345,8 +446,53 @@ class MicrolensingRealization:
         bands_angstrom: Mapping[str, float] | None = None,
         band_batch_size: int | None = None,
         include_microlensing_only: bool = False,
+        bandpasses=None,
+        spectral_model=None,
+        wavelength_samples: int = 32,
+        wavelength_batch_size: int | None = None,
+        return_spectrum: bool = False,
+        spectrum_wavelengths=None,
+        host_lensing: str = "omit",
+        source_evolution: str = "exact",
+        response_delay_bin_days: float = 0.25,
     ) -> LightCurve:
         """Generate a finite-source light curve for this realization."""
+
+        if wavelength_batch_size is not None and band_batch_size is not None:
+            raise ValueError(
+                "supply wavelength_batch_size or band_batch_size, not both"
+            )
+        if spectral_model is not None and bandpasses is None:
+            raise ValueError("spectral_model requires bandpasses")
+        if return_spectrum and bandpasses is None:
+            raise ValueError("return_spectrum requires bandpasses")
+        if bandpasses is not None:
+            return _spectral_light_curve(
+                self,
+                times_days,
+                None,
+                source=source,
+                trajectory=trajectory,
+                strict_coverage=strict_coverage,
+                method=production_ipm_config() if method is None else method,
+                schedule=schedule,
+                map_observer=map_observer,
+                keep_maps_at_days=keep_maps_at_days,
+                bandpasses=bandpasses,
+                spectral_model=spectral_model,
+                wavelength_samples=wavelength_samples,
+                wavelength_batch_size=(
+                    band_batch_size
+                    if wavelength_batch_size is None
+                    else wavelength_batch_size
+                ),
+                include_microlensing_only=include_microlensing_only,
+                return_spectrum=return_spectrum,
+                spectrum_wavelengths=spectrum_wavelengths,
+                host_lensing=host_lensing,
+                source_evolution=source_evolution,
+                response_delay_bin_days=response_delay_bin_days,
+            )
 
         if band_batch_size is not None or bands_angstrom is not None:
             request = LightCurveRequest(
@@ -355,13 +501,21 @@ class MicrolensingRealization:
                 trajectory=trajectory,
                 strict_coverage=strict_coverage,
                 bands_angstrom=bands_angstrom,
+                source_evolution=source_evolution,
+                response_delay_bin_days=response_delay_bin_days,
             )
             curves = self.light_curves(
                 times_days,
                 (
                     request,
                     *(
-                        (replace(request, source=_source_at_driver_mean(request.source)),)
+                        (
+                            replace(
+                                request,
+                                source=_source_at_driver_mean(request.source),
+                                source_evolution="exact",
+                            ),
+                        )
                         if include_microlensing_only
                         else ()
                     ),
@@ -389,6 +543,8 @@ class MicrolensingRealization:
             keep_maps_at_days=keep_maps_at_days,
             include_microlensing_only=include_microlensing_only,
             band_batch_size=band_batch_size,
+            source_evolution=source_evolution,
+            response_delay_bin_days=response_delay_bin_days,
         )
 
     def source_light_curve(
@@ -399,15 +555,66 @@ class MicrolensingRealization:
         apply_driving_signal: bool | None = None,
         batch_size: int = 16,
         band_batch_size: int | None = None,
+        include_microlensing_only: bool = False,
+        bandpasses=None,
+        spectral_model=None,
+        wavelength_samples: int = 32,
+        wavelength_batch_size: int | None = None,
+        return_spectrum: bool = False,
+        spectrum_wavelengths=None,
     ) -> LightCurve:
-        """Integrate the source without generating magnification maps."""
+        """Integrate the source without generating magnification maps.
+
+        With ``bandpasses``, the disk continuum is evaluated on sparse
+        wavelength nodes before the empirical spectrum and filter integrals
+        are evaluated on a dense one-dimensional grid. ``return_spectrum``
+        retains the spectrum produced by that same calculation.
+        """
 
         from .photometry import source_light_curve
 
+        if wavelength_batch_size is not None and band_batch_size is not None:
+            raise ValueError(
+                "supply wavelength_batch_size or band_batch_size, not both"
+            )
+        if spectral_model is not None and bandpasses is None:
+            raise ValueError("spectral_model requires bandpasses")
+        if return_spectrum and bandpasses is None:
+            raise ValueError("return_spectrum requires bandpasses")
         source = self.source
         if source is None:
             raise ValueError("source_light_curve requires a system source")
+        plan = None
+        resolved_bandpasses = None
+        redshift = self.system.distances.source_redshift
+        if bandpasses is not None:
+            from .bandpasses import resolve_bandpasses
+            from .spectral_photometry import spectral_sampling_plan
+
+            if redshift is None:
+                raise ValueError(
+                    "spectral photometry requires distances with a source_redshift"
+                )
+            resolved_bandpasses = resolve_bandpasses(bandpasses)
+            required = (
+                ()
+                if spectral_model is None
+                else spectral_model.required_wavelengths(float(redshift))
+            )
+            plan = spectral_sampling_plan(
+                resolved_bandpasses,
+                continuum_samples=wavelength_samples,
+                spectrum_wavelengths=spectrum_wavelengths,
+                return_spectrum=return_spectrum,
+                required_wavelengths=required,
+            )
+            with_bands = getattr(source, "with_bands", None)
+            if with_bands is None:
+                raise TypeError("bandpasses require a source that supports with_bands")
+            source = with_bands(plan.bands_angstrom)
         if bands_angstrom is not None:
+            if bandpasses is not None:
+                raise ValueError("supply bands_angstrom or bandpasses, not both")
             with_bands = getattr(source, "with_bands", None)
             if with_bands is None:
                 raise TypeError("bands_angstrom requires a source with with_bands")
@@ -416,13 +623,55 @@ class MicrolensingRealization:
         if apply_driving_signal is False:
             source = _source_at_driver_mean(source)
         runtime = self.simulation.runtime
-        return source_light_curve(
+        curve = source_light_curve(
             source,
             times_days,
             batch_size=batch_size,
-            band_batch_size=band_batch_size,
+            band_batch_size=(
+                band_batch_size
+                if wavelength_batch_size is None
+                else wavelength_batch_size
+            ),
             device=runtime.device,
             dtype=runtime.dtype,
+        )
+        if plan is None:
+            return curve
+        mean_curve = None
+        if spectral_model is not None or include_microlensing_only:
+            mean_single = source_light_curve(
+                _source_at_driver_mean(source),
+                curve.times_days[:1],
+                batch_size=batch_size,
+                band_batch_size=(
+                    band_batch_size
+                    if wavelength_batch_size is None
+                    else wavelength_batch_size
+                ),
+                device=runtime.device,
+                dtype=runtime.dtype,
+            )
+            mean_curve = replace(
+                mean_single,
+                times_days=curve.times_days,
+                flux=mean_single.flux.expand(curve.flux.shape),
+                unlensed_flux=mean_single.unlensed_flux.expand(curve.flux.shape),
+            )
+        from .spectral_photometry import finish_spectral_light_curve
+
+        return finish_spectral_light_curve(
+            curve,
+            mean_curve,
+            plan,
+            spectral_model=spectral_model,
+            source_redshift=float(redshift),
+            luminosity_distance_m=(1.0 + float(redshift)) ** 2
+            * self.system.distances.source_m,
+            macro_magnification=1.0,
+            include_microlensing_only=include_microlensing_only,
+            return_spectrum=return_spectrum,
+            host_lensing="unlensed",
+            bandpass_version=resolved_bandpasses.version,
         )
 
     def light_curves(
@@ -510,8 +759,53 @@ class MicrolensingRealization:
         keep_maps_at_days: Sequence[float] | None = None,
         band_batch_size: int | None = None,
         include_microlensing_only: bool = False,
+        bandpasses=None,
+        spectral_model=None,
+        wavelength_samples: int = 32,
+        wavelength_batch_size: int | None = None,
+        return_spectrum: bool = False,
+        spectrum_wavelengths=None,
+        host_lensing: str = "omit",
+        source_evolution: str = "exact",
+        response_delay_bin_days: float = 0.25,
     ) -> LightCurve:
         """Use sparse dynamic maps with independently sampled source evolution."""
+
+        if wavelength_batch_size is not None and band_batch_size is not None:
+            raise ValueError(
+                "supply wavelength_batch_size or band_batch_size, not both"
+            )
+        if spectral_model is not None and bandpasses is None:
+            raise ValueError("spectral_model requires bandpasses")
+        if return_spectrum and bandpasses is None:
+            raise ValueError("return_spectrum requires bandpasses")
+        if bandpasses is not None:
+            return _spectral_light_curve(
+                self,
+                map_times_days,
+                flux_times_days,
+                source=source,
+                trajectory=trajectory,
+                strict_coverage=strict_coverage,
+                method=production_ipm_config() if method is None else method,
+                schedule=schedule,
+                map_observer=map_observer,
+                keep_maps_at_days=keep_maps_at_days,
+                bandpasses=bandpasses,
+                spectral_model=spectral_model,
+                wavelength_samples=wavelength_samples,
+                wavelength_batch_size=(
+                    band_batch_size
+                    if wavelength_batch_size is None
+                    else wavelength_batch_size
+                ),
+                include_microlensing_only=include_microlensing_only,
+                return_spectrum=return_spectrum,
+                spectrum_wavelengths=spectrum_wavelengths,
+                host_lensing=host_lensing,
+                source_evolution=source_evolution,
+                response_delay_bin_days=response_delay_bin_days,
+            )
 
         if band_batch_size is not None:
             request = LightCurveRequest(
@@ -519,13 +813,21 @@ class MicrolensingRealization:
                 distances=self.system.distances,
                 trajectory=trajectory,
                 strict_coverage=strict_coverage,
+                source_evolution=source_evolution,
+                response_delay_bin_days=response_delay_bin_days,
             )
             curves = self.light_curves(
                 map_times_days,
                 (
                     request,
                     *(
-                        (replace(request, source=_source_at_driver_mean(request.source)),)
+                        (
+                            replace(
+                                request,
+                                source=_source_at_driver_mean(request.source),
+                                source_evolution="exact",
+                            ),
+                        )
                         if include_microlensing_only
                         else ()
                     ),
@@ -554,6 +856,8 @@ class MicrolensingRealization:
             keep_maps_at_days=keep_maps_at_days,
             include_microlensing_only=include_microlensing_only,
             band_batch_size=band_batch_size,
+            source_evolution=source_evolution,
+            response_delay_bin_days=response_delay_bin_days,
         )
 
     def multirate_light_curve_with_labels(
@@ -573,6 +877,8 @@ class MicrolensingRealization:
         keep_maps_at_days: Sequence[float] | None = None,
         include_microlensing_only: bool = False,
         band_batch_size: int | None = None,
+        source_evolution: str = "exact",
+        response_delay_bin_days: float = 0.25,
     ):
         """Return fine-cadence flux and labels at the sparse map epochs."""
 
@@ -592,6 +898,8 @@ class MicrolensingRealization:
             include_distance_map=include_distance_map,
             include_microlensing_only=include_microlensing_only,
             band_batch_size=band_batch_size,
+            source_evolution=source_evolution,
+            response_delay_bin_days=response_delay_bin_days,
         )
 
     def light_curve_with_labels(
@@ -610,6 +918,8 @@ class MicrolensingRealization:
         keep_maps_at_days: Sequence[float] | None = None,
         include_microlensing_only: bool = False,
         band_batch_size: int | None = None,
+        source_evolution: str = "exact",
+        response_delay_bin_days: float = 0.25,
     ):
         """Generate a light curve with aligned source-center caustic labels."""
 
@@ -629,6 +939,8 @@ class MicrolensingRealization:
             include_distance_map=include_distance_map,
             include_microlensing_only=include_microlensing_only,
             band_batch_size=band_batch_size,
+            source_evolution=source_evolution,
+            response_delay_bin_days=response_delay_bin_days,
         )
 
     def caustics(
@@ -780,7 +1092,10 @@ class MicrolensingSystem:
     lens plane is inferred automatically unless ``lens_plane_uas`` or an
     advanced ``lens_region`` is supplied. The seeded realization is cached
     and reused across maps, light curves, labels, and future transfer-function
-    calculations.
+    calculations. Advanced batched workflows may supply a complete
+    ``stellar_aperture_override`` shared by several systems to enable fused
+    map generation. The override may enlarge, but never truncate, the
+    automatically required circular aperture.
 
     The rectangular integration strategy uses the shear eigenframe
     internally when the source is a built-in physical model. Point-lens
@@ -813,6 +1128,7 @@ class MicrolensingSystem:
     stellar_motion_sigma_margin: float = 5.0
     rectangle_light_loss: float | None = None
     source_support_radius_uas: float | None = None
+    stellar_aperture_override: StellarAperture | None = None
     seed: int | Mapping[str, int] | None = None
     runtime: RuntimeConfig | ResolvedRuntime | None = None
     lens_plane_uas: str | float | tuple[float, float] = "auto"
@@ -1157,7 +1473,7 @@ class MicrolensingSystem:
             # Aperture sizing includes the requested duration and source
             # support. Its physical key intentionally excludes cadence and
             # variability seeds, which must not change the stellar draw.
-            aperture = circular_stellar_aperture(
+            required_aperture = circular_stellar_aperture(
                 numerical_macro,
                 source_grid.region,
                 self.distances,
@@ -1168,6 +1484,22 @@ class MicrolensingSystem:
                 motion_sigma_margin=self.stellar_motion_sigma_margin,
                 source_support_radius_uas=source_support_radius_uas,
             )
+            aperture = (
+                required_aperture
+                if self.stellar_aperture_override is None
+                else self.stellar_aperture_override
+            )
+            if self.stellar_aperture_override is not None:
+                if aperture.center_uas != required_aperture.center_uas:
+                    raise ValueError(
+                        "stellar_aperture center must match the automatically "
+                        "required aperture center"
+                    )
+                if aperture.radius_uas < required_aperture.radius_uas:
+                    raise ValueError(
+                        "stellar_aperture is smaller than the complete aperture "
+                        "required by the source, lens, duration, and kinematics"
+                    )
             sampling_aperture = aperture
             if align_rectangle:
                 # Sampling happens in the sky frame so a frame rotation cannot
@@ -1757,6 +2089,15 @@ class MicrolensingSystem:
         include_microlensing_only: bool = False,
         bands_angstrom: Mapping[str, float] | None = None,
         band_batch_size: int | None = None,
+        bandpasses=None,
+        spectral_model=None,
+        wavelength_samples: int = 32,
+        wavelength_batch_size: int | None = None,
+        return_spectrum: bool = False,
+        spectrum_wavelengths=None,
+        host_lensing: str = "omit",
+        source_evolution: str = "exact",
+        response_delay_bin_days: float = 0.25,
         start_day: float = 0.0,
         **kwargs,
     ) -> LightCurve:
@@ -1791,6 +2132,15 @@ class MicrolensingSystem:
             raise ValueError(
                 "include_microlensing_only=True requires the driven light curve"
             )
+        if source_evolution not in {
+            "exact", "linear_response", "quadratic_response"
+        }:
+            raise ValueError(
+                "source_evolution must be 'exact', 'linear_response', "
+                "or 'quadratic_response'"
+            )
+        if not math.isfinite(response_delay_bin_days) or response_delay_bin_days <= 0:
+            raise ValueError("response_delay_bin_days must be finite and positive")
 
         map_times, flux_times = _light_curve_times(
             times_days,
@@ -1800,6 +2150,93 @@ class MicrolensingSystem:
             flux_times_days=flux_times_days,
             start_day=start_day,
         )
+        if wavelength_batch_size is not None and band_batch_size is not None:
+            raise ValueError(
+                "supply wavelength_batch_size or band_batch_size, not both"
+            )
+        if spectral_model is not None and bandpasses is None:
+            raise ValueError("spectral_model requires bandpasses")
+        if return_spectrum and bandpasses is None:
+            raise ValueError("return_spectrum requires bandpasses")
+        if bandpasses is not None:
+            call_kwargs = _light_curve_options(
+                kwargs,
+                include_labels=include_labels,
+                allowed_options=_LIGHT_CURVE_CALL_OPTIONS
+                | (_LABELED_CURVE_CALL_OPTIONS if include_labels else frozenset()),
+            )
+            observer, retained = _retaining_map_observer(
+                map_times,
+                call_kwargs.pop("keep_maps_at_days", None),
+                call_kwargs.get("map_observer"),
+            )
+            call_kwargs["map_observer"] = observer
+            source_override = call_kwargs.pop("source", None)
+            system = self if source_override is None else self.with_source(source_override)
+            _validate_source_driver(system.source, apply_driving_signal)
+            from .spectral_photometry import (
+                finish_spectral_light_curve,
+                prepare_spectral_source,
+            )
+
+            prepared_source, plan, resolved_bandpasses, redshift = (
+                prepare_spectral_source(
+                system.source,
+                system.distances,
+                bandpasses,
+                spectral_model=spectral_model,
+                wavelength_samples=wavelength_samples,
+                spectrum_wavelengths=spectrum_wavelengths,
+                return_spectrum=return_spectrum,
+                host_lensing=host_lensing,
+                )
+            )
+            system = system.with_source(prepared_source)
+            resolved = system._realize_for_times(map_times)
+            selected_source = resolved.source
+            if apply_driving_signal is False:
+                selected_source = resolved._mean_source
+            need_mean = spectral_model is not None or include_microlensing_only
+            result = _evaluate_light_curve(
+                resolved,
+                map_times,
+                flux_times,
+                include_labels=include_labels,
+                include_microlensing_only=need_mean,
+                source=selected_source,
+                band_batch_size=(
+                    band_batch_size
+                    if wavelength_batch_size is None
+                    else wavelength_batch_size
+                ),
+                source_evolution=source_evolution,
+                response_delay_bin_days=response_delay_bin_days,
+                **call_kwargs,
+            )
+            mean_curve = None
+            if result.microlensing_only_flux is not None:
+                mean_curve = replace(
+                    result,
+                    flux=result.microlensing_only_flux,
+                    unlensed_flux=result.microlensing_only_unlensed_flux,
+                    microlensing_only_flux=None,
+                    microlensing_only_unlensed_flux=None,
+                )
+            result = finish_spectral_light_curve(
+                result,
+                mean_curve,
+                plan,
+                spectral_model=spectral_model,
+                source_redshift=float(redshift),
+                luminosity_distance_m=(1.0 + float(redshift)) ** 2
+                * system.distances.source_m,
+                macro_magnification=_macro_magnification(system.macro),
+                include_microlensing_only=include_microlensing_only,
+                return_spectrum=return_spectrum,
+                host_lensing=host_lensing,
+                bandpass_version=resolved_bandpasses.version,
+            )
+            return replace(result, maps=retained)
         if band_batch_size is not None or bands_angstrom is not None:
             if include_labels:
                 raise ValueError(
@@ -1814,10 +2251,18 @@ class MicrolensingSystem:
                 strict_coverage=strict_coverage,
                 bands_angstrom=bands_angstrom,
                 apply_driving_signal=apply_driving_signal,
+                source_evolution=source_evolution,
+                response_delay_bin_days=response_delay_bin_days,
             )
             requests = [request]
             if include_microlensing_only:
-                requests.append(replace(request, apply_driving_signal=False))
+                requests.append(
+                    replace(
+                        request,
+                        apply_driving_signal=False,
+                        source_evolution="exact",
+                    )
+                )
             curves = self.light_curves(
                 map_times,
                 requests=tuple(requests),
@@ -1852,6 +2297,8 @@ class MicrolensingSystem:
             flux_times,
             include_labels=include_labels,
             include_microlensing_only=include_microlensing_only,
+            source_evolution=source_evolution,
+            response_delay_bin_days=response_delay_bin_days,
             **call_kwargs,
         )
         return replace(result, maps=retained)
@@ -1859,7 +2306,22 @@ class MicrolensingSystem:
     def source_light_curve(self, times_days, **kwargs) -> LightCurve:
         """Integrate the physical source without generating lensing maps."""
 
-        return self.realize().source_light_curve(times_days, **kwargs)
+        system = self
+        if kwargs.get("bandpasses") is not None:
+            from .spectral_photometry import prepare_spectral_source
+
+            source, _, _, _ = prepare_spectral_source(
+                self.source,
+                self.distances,
+                kwargs["bandpasses"],
+                spectral_model=kwargs.get("spectral_model"),
+                wavelength_samples=kwargs.get("wavelength_samples", 32),
+                spectrum_wavelengths=kwargs.get("spectrum_wavelengths"),
+                return_spectrum=kwargs.get("return_spectrum", False),
+                host_lensing="unlensed",
+            )
+            system = self.with_source(source)
+        return system.realize().source_light_curve(times_days, **kwargs)
 
     def light_curves(
         self,
