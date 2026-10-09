@@ -12,12 +12,18 @@ import torch
 from ..compile import run_tensor_kernel
 from ..config import FarFieldApproxConfig
 from ..geometry import PlaneRegion
-from ..runtime import warn_backend_fallback
+from ..runtime import portable_accelerator, warn_backend_fallback
 from .taylor import (
     complex_taylor_coefficients,
     evaluate_complex_taylor,
+    masked_complex_taylor_coefficients,
     translate_complex_taylor,
 )
+
+
+# Temporary-memory budget for one gathered far-field query chunk on
+# accelerators without Triton, whose fused kernels never gather.
+_PORTABLE_QUERY_BYTES = 256 * 1024**2
 
 
 def _evaluate_far_field_deflection(
@@ -319,7 +325,20 @@ class TaylorFarFieldApproximation:
                         error,
                     )
                     self._triton_disabled_reason = f"{type(error).__name__}: {error}"
-            if not triton_coefficients:
+            if not triton_coefficients and portable_accelerator(runtime.device):
+                # Without Triton, accelerators batch every cell instead of
+                # paying a host synchronization per cell in the loop below.
+                center_real_all, center_imag_all = masked_complex_taylor_coefficients(
+                    0.5 * (self.x_edges[cell_i] + self.x_edges[cell_i + 1]),
+                    0.5 * (self.y_edges[cell_j] + self.y_edges[cell_j + 1]),
+                    field.x_uas,
+                    field.y_uas,
+                    mass,
+                    mask_grid,
+                    order=self.config.center_translation_order,
+                    star_chunk_size=self.star_chunk_size,
+                )
+            elif not triton_coefficients:
                 for cell in range(n_cells):
                     ix = int(cell_i[cell])
                     iy = int(cell_j[cell])
@@ -471,6 +490,53 @@ class TaylorFarFieldApproximation:
         )
         return ix, iy, node_x, node_y, expansion_x, expansion_y
 
+    def _local_query_kernel(self, name, kernel, per_query, flat_cell, minimum):
+        """Run a compiled query kernel on gathered ``[query, local star]`` packs.
+
+        On accelerators without Triton the gather is split into fixed-size
+        query chunks (the last one padded) so its temporaries stay within a
+        bounded budget instead of scaling with every query at once. Fixed
+        chunk shapes avoid recompiling the kernel.
+        """
+
+        runtime = self.simulation.runtime
+        count = int(flat_cell.numel())
+        width = max(1, int(self.local_x.shape[-1]))
+        element = self.local_x.element_size()
+        # Gathered packs plus the kernel's dx, dy and weight temporaries.
+        rows = max(1024, _PORTABLE_QUERY_BYTES // (6 * element * width))
+        if not portable_accelerator(runtime.device) or count <= rows:
+            return run_tensor_kernel(
+                runtime,
+                name,
+                kernel,
+                *per_query,
+                self.local_x[flat_cell],
+                self.local_y[flat_cell],
+                self.local_mass[flat_cell],
+                minimum,
+            )
+        parts = []
+        compiled = False
+        for start in range(0, count, rows):
+            index = torch.arange(
+                start, start + rows, device=flat_cell.device
+            ).clamp_max(count - 1)
+            cell = flat_cell[index]
+            outputs, chunk_compiled = run_tensor_kernel(
+                runtime,
+                name,
+                kernel,
+                *(value[index] for value in per_query),
+                self.local_x[cell],
+                self.local_y[cell],
+                self.local_mass[cell],
+                minimum,
+            )
+            compiled = compiled or chunk_compiled
+            parts.append(tuple(value[: min(rows, count - start)] for value in outputs))
+        return tuple(torch.cat(values) for values in zip(*parts, strict=True)), compiled
+
     def deflection(self, x_uas, y_uas) -> tuple[torch.Tensor, torch.Tensor]:
         """Evaluate point-mass deflection with exact local-star corrections."""
 
@@ -490,19 +556,18 @@ class TaylorFarFieldApproximation:
             dtype=runtime.dtype,
         )
         if runtime.backend.value == "torch-compile":
-            (alpha_x, alpha_y), compiled = run_tensor_kernel(
-                runtime,
+            (alpha_x, alpha_y), compiled = self._local_query_kernel(
                 "far-field approximation deflection query",
                 _evaluate_far_field_deflection,
-                coefficients_real,
-                coefficients_imag,
-                flat_x - expansion_x,
-                flat_y - expansion_y,
-                flat_x,
-                flat_y,
-                self.local_x[flat_cell],
-                self.local_y[flat_cell],
-                self.local_mass[flat_cell],
+                (
+                    coefficients_real,
+                    coefficients_imag,
+                    flat_x - expansion_x,
+                    flat_y - expansion_y,
+                    flat_x,
+                    flat_y,
+                ),
+                flat_cell,
                 minimum,
             )
             self.last_query_backend = "torch-compile" if compiled else "torch-eager"
@@ -622,19 +687,18 @@ class TaylorFarFieldApproximation:
             dtype=runtime.dtype,
         )
         if runtime.backend.value == "torch-compile":
-            (point_xx, point_xy), compiled = run_tensor_kernel(
-                runtime,
+            (point_xx, point_xy), compiled = self._local_query_kernel(
                 "far-field approximation Jacobian query",
                 _evaluate_far_field_jacobian,
-                derivative_real,
-                derivative_imag,
-                flat_x - expansion_x,
-                flat_y - expansion_y,
-                flat_x,
-                flat_y,
-                self.local_x[flat_cell],
-                self.local_y[flat_cell],
-                self.local_mass[flat_cell],
+                (
+                    derivative_real,
+                    derivative_imag,
+                    flat_x - expansion_x,
+                    flat_y - expansion_y,
+                    flat_x,
+                    flat_y,
+                ),
+                flat_cell,
                 minimum,
             )
             self.last_query_backend = "torch-compile" if compiled else "torch-eager"

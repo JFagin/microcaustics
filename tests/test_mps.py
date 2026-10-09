@@ -114,6 +114,9 @@ def _light_curve(device: str) -> mc.LightCurve:
 def test_microlensed_light_curve_matches_cpu():
     expected, actual = _light_curve("cpu"), _light_curve("mps")
     assert bool((expected.flux > 0).all())
+    # MPS maps are rasterized on the GPU; the CPU keeps the exact reference.
+    assert "torch_direct_cell" in str(actual.metadata)
+    assert "exact_sutherland_hodgman" in str(expected.metadata)
     torch.testing.assert_close(actual.flux.cpu(), expected.flux, rtol=2e-4, atol=0.0)
     torch.testing.assert_close(
         actual.unlensed_flux.cpu(), expected.unlensed_flux, rtol=5e-5, atol=0.0

@@ -157,8 +157,9 @@ importable Triton package. This path is significantly faster than compiled PyTor
   and then follow the Linux path above. This stays within upstream Triton's
   supported operating system.
 - **macOS or CPU.** Triton is not used. The package selects its portable
-  eager/compiled PyTorch implementation. Apple MPS is supported where PyTorch
-  supports the requested operations.
+  eager/compiled PyTorch implementation. On Apple MPS, IPM maps are rasterized
+  on the GPU by a batched PyTorch port of the Triton direct-cell kernel, so
+  `RuntimeConfig(device="auto")` runs the whole map pipeline on the Apple GPU.
 
 Check the detected runtime.
 
@@ -829,8 +830,9 @@ an advanced experiment needs an explicit numerical configuration.
 Both use `N=10_000_000, r=2, v=4` by default. These are not fixed constants. The implementation
 supports arbitrary sensible ray budgets and scout ratios, as well as
 `virtual_refinement >= refinement >= 1`. CUDA float32 automatically uses the
-direct-cell Triton rasterizer for `v <= 16`. CPU, Apple, float64, and larger
-`v` use the same numerical method through the exact portable rasterizer. See
+direct-cell Triton rasterizer for `v <= 16`. Apple MPS uses a batched PyTorch
+port of that rasterizer on the GPU. CPU, CUDA without Triton, and larger `v` on
+CUDA use the same numerical method through the exact portable rasterizer. See
 [`docs/ipm.md`](docs/ipm.md) for the meaning and tradeoffs of `N`, `k`, `r`,
 and `v`.
 The validated scout uses `scout_halo_pixels=0` and

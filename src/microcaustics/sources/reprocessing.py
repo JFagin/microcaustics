@@ -475,12 +475,17 @@ class ThermalReprocessingSource:
         state = self._brightness_state(times_days, device=device, dtype=dtype)
         return self._brightness_from_state(state)
 
-    def _brightness_from_state(self, state):
-        """Materialize a single cached static frame, or explicitly requested images."""
+    def _brightness_from_state(self, state, *, scale=1.0):
+        """Materialize a single cached static frame, or explicitly requested images.
+
+        ``scale`` is an internal exact multiplier; see
+        :func:`_transferred_brightness_from_temperature4`.
+        """
 
         temperature4, transfer, output_count = state
         brightness = _transferred_brightness_from_temperature4(
             temperature4,
+            scale=scale,
             geometry=self.geometry,
             transfer=transfer,
             source_redshift=self.source_redshift,
