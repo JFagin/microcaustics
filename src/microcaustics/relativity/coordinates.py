@@ -1860,8 +1860,8 @@ def add_observer_coordinates_batch(
                 inclination_r = torch.as_tensor(
                     math.radians(inclination), device=target, dtype=torch.float64
                 )
-                alpha_r = -screen_x_p[local].to(device=target, dtype=torch.float64)
-                beta_r = -screen_y_p[local].to(device=target, dtype=torch.float64)
+                alpha_r = -screen_x_p[local].to(target).to(torch.float64)
+                beta_r = -screen_y_p[local].to(target).to(torch.float64)
                 lam_r = -alpha_r * torch.sin(inclination_r)
                 eta_r = (
                     (alpha_r.square() - spin_r.square())

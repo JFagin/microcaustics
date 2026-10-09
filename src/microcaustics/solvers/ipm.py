@@ -736,7 +736,8 @@ def rasterize_triangles_exact_eager(
         raise ValueError("triangles must have shape [triangle, 3, 2]")
     if lens_area_per_triangle_uas2 <= 0:
         raise ValueError("lens_area_per_triangle_uas2 must be positive")
-    triangle_array = triangles.detach().to(device="cpu", dtype=torch.float64).numpy()
+    # Copy before casting: a single MPS -> CPU float64 .to() returns zeros.
+    triangle_array = triangles.detach().cpu().to(torch.float64).numpy()
     ny, nx = grid.shape
     dy, dx = grid.pixel_scale_uas
     xmin, xmax, ymin, ymax = grid.bounds_uas
