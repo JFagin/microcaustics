@@ -94,6 +94,63 @@ def complex_taylor_coefficients(
 
 
 @torch.no_grad()
+def masked_complex_taylor_coefficients(
+    center_x: torch.Tensor,
+    center_y: torch.Tensor,
+    star_x: torch.Tensor,
+    star_y: torch.Tensor,
+    einstein_radius_squared: torch.Tensor,
+    local_mask: torch.Tensor,
+    *,
+    order: int = 4,
+    star_chunk_size: int = 4096,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`complex_taylor_coefficients` for every center in one batch.
+
+    ``local_mask[center, star]`` marks stars excluded from that center's far
+    field. Excluded stars get zero mass instead of being gathered per center,
+    so accelerators avoid one host synchronization per center. Returns
+    tensors of shape ``[center, order + 1]``.
+    """
+
+    real = torch.zeros(
+        (center_x.numel(), int(order) + 1),
+        device=center_x.device,
+        dtype=center_x.dtype,
+    )
+    imag = torch.zeros_like(real)
+    minimum = 1.0e-30 if center_x.dtype == torch.float32 else 1.0e-300
+    for start in range(0, star_x.numel(), int(star_chunk_size)):
+        stop = min(star_x.numel(), start + int(star_chunk_size))
+        dx = center_x[:, None] - star_x[None, start:stop]
+        dy = center_y[:, None] - star_y[None, start:stop]
+        inverse_r2 = (dx.square() + dy.square()).clamp_min(minimum).reciprocal()
+        inverse_real = dx * inverse_r2
+        inverse_imag = dy * inverse_r2
+        power_real = inverse_real
+        power_imag = inverse_imag
+        chunk_mass = torch.where(
+            local_mask[:, start:stop],
+            torch.zeros((), device=real.device, dtype=real.dtype),
+            einstein_radius_squared[None, start:stop],
+        )
+        sign = 1.0
+        for coefficient_order in range(int(order) + 1):
+            real[:, coefficient_order].add_(
+                sign * (chunk_mass * power_real).sum(dim=1)
+            )
+            imag[:, coefficient_order].add_(
+                sign * (chunk_mass * power_imag).sum(dim=1)
+            )
+            if coefficient_order != int(order):
+                next_real = power_real * inverse_real - power_imag * inverse_imag
+                next_imag = power_real * inverse_imag + power_imag * inverse_real
+                power_real, power_imag = next_real, next_imag
+                sign = -sign
+    return real, imag
+
+
+@torch.no_grad()
 def translate_complex_taylor(
     coefficient_real,
     coefficient_imag,

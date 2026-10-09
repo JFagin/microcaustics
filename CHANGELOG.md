@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Apple GPU (MPS) support. IPM maps are rasterized on the device by a batched PyTorch port of the Triton direct-cell kernel (its elementwise math fused with `torch.compile`), far-field coefficients are built for all cells in one batch, and far-field queries are chunked to a fixed memory budget, so `RuntimeConfig(device="auto")` runs the whole map pipeline on the Apple GPU without exhausting unified memory. The runtime now reports Metal's recommended working set as the MPS memory budget. CUDA/Triton and CPU paths are unchanged.
+- Fixed MPS light curves: PyTorch MPS returns zeros for a combined MPS-to-CPU float64 copy, which emptied every IPM map, and flushes the subnormal brightness of faint disk pixels. MPS now matches CPU within float32 tolerance.
+
 ## 1.0.0
 
 Initial release of `microcaustics`:

@@ -16,7 +16,9 @@ from .config import DynamicConfig, IPMConfig, IRSConfig
 from .geometry import PlaneGrid, PlaneRegion
 from .lens import LensingDistances
 from .results import LightCurve, MagnificationMap, TimingBreakdown
+from .runtime import portable_accelerator
 from .sources import ModulatedSource, PixelatedSource
+from .sources.transferred_disk import _MPS_FLUX_SCALE
 from .trajectories import LinearTrajectory, SourceTrajectory
 
 if TYPE_CHECKING:
@@ -1012,12 +1014,21 @@ def _flexible_streaming_light_curves(
         pixel_count = math.prod(request.source.geometry.shape)
         cache_bytes = pixel_count * band_count * local_times.element_size()
         matrix = None
+        # MPS flushes subnormals; cache faint thermal pixels scaled by an exact
+        # power of two and unscale the contracted fluxes.
+        matrix_scale = (
+            _MPS_FLUX_SCALE
+            if static_states[-1] is not None and portable_accelerator(device)
+            else 1.0
+        )
         if is_static and cache_bytes <= static_cache_remaining:
             matrix = torch.empty((pixel_count, band_count), device=device, dtype=dtype)
             column = 0
             for chunk, valid in chunks[-1]:
                 frame = (
-                    chunk._brightness_from_state(static_states[-1])
+                    chunk._brightness_from_state(static_states[-1], scale=matrix_scale)
+                    if matrix_scale != 1.0
+                    else chunk._brightness_from_state(static_states[-1])
                     if static_states[-1] is not None
                     else chunk.brightness(local_times[:1], device=device, dtype=dtype)
                 )
@@ -1027,7 +1038,9 @@ def _flexible_streaming_light_curves(
                 column += valid
             static_cache_remaining -= cache_bytes
         static_matrices.append(
-            None if matrix is None else (matrix, matrix.sum(dim=0)[None])
+            None
+            if matrix is None
+            else (matrix, matrix.sum(dim=0)[None] / matrix_scale, matrix_scale)
         )
         if map_times.numel() == 1:
             right_indices.append(torch.zeros(times.numel(), dtype=torch.long))
@@ -1102,11 +1115,14 @@ def _flexible_streaming_light_curves(
     def contract(request_index, times, left, right, fraction):
         cached_matrix = static_matrices[request_index]
         if cached_matrix is not None:
-            matrix, intrinsic = cached_matrix
+            matrix, intrinsic, matrix_scale = cached_matrix
             # These are BLAS matrix products against a disk evaluated once.
             # Interpolate the small flux vectors, never daily static images.
             left_flux = left.flatten(1) @ matrix
             right_flux = left_flux if right is left else right.flatten(1) @ matrix
+            if matrix_scale != 1.0:
+                left_flux = left_flux / matrix_scale
+                right_flux = right_flux / matrix_scale
             return left_flux + fraction[:, None] * (right_flux - left_flux), intrinsic
         source = requests[request_index].source
         state = static_states[request_index]

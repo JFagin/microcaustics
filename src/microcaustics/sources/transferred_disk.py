@@ -160,10 +160,17 @@ def _transferred_arguments(
     return arguments, compatible_runtime
 
 
-def _transferred_brightness_from_temperature4(temperature4, **kwargs):
-    """Evaluate Planck brightness with the physical source's compiled runtime."""
+def _transferred_brightness_from_temperature4(temperature4, *, scale=1.0, **kwargs):
+    """Evaluate Planck brightness with the physical source's compiled runtime.
+
+    ``scale`` multiplies the result through the solid angle. An exact power of
+    two such as ``_MPS_FLUX_SCALE`` keeps faint pixels out of the subnormal
+    range on devices that flush subnormals.
+    """
 
     arguments, compatible_runtime = _transferred_arguments(temperature4, **kwargs)
+    if scale != 1.0:
+        arguments = (*arguments[:2], arguments[2] * scale, *arguments[3:])
     if compatible_runtime is None:
         return _transferred_brightness_kernel(*arguments)
     brightness, _ = run_tensor_kernel(

@@ -192,6 +192,9 @@ class RuntimeCapabilities:
         total_memory = (
             int(torch.cuda.get_device_properties(0).total_memory) if cuda else None
         )
+        if total_memory is None and mps:
+            # Unified memory: Metal's recommended working-set size for the GPU.
+            total_memory = int(torch.mps.recommended_max_memory())
         return cls(
             platform=platform.platform(),
             torch_version=str(torch.__version__),
@@ -262,6 +265,16 @@ class ResolvedRuntime:
             torch.cuda.synchronize(self.device)
         elif self.device.type == "mps":
             torch.mps.synchronize()
+
+
+def portable_accelerator(device: torch.device | str) -> bool:
+    """Whether ``device`` is an accelerator without Triton kernels (Apple MPS).
+
+    Such devices use batched tensor implementations where CUDA uses Triton.
+    The CPU and CUDA keep their existing reference and Triton paths.
+    """
+
+    return torch.device(device).type not in ("cpu", "cuda")
 
 
 def _auto_device(capabilities: RuntimeCapabilities) -> torch.device:
