@@ -411,7 +411,7 @@ class TaylorFarFieldApproximation:
             mean_local_stars=(
                 float(override_mean_local)
                 if self._local_override is not None
-                else float(local_counts_tensor.to(torch.float64).mean().detach().cpu())
+                else float(local_counts_tensor.detach().cpu().to(torch.float64).mean())
             ),
             build_seconds=perf_counter() - started,
         )
