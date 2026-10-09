@@ -222,8 +222,8 @@ class LightCurve:
         if comparison.band_names != self.band_names:
             raise ValueError("microlensing-only comparison must use the same bands")
         if comparison.times_days.shape != self.times_days.shape or not torch.allclose(
-            comparison.times_days.to(device="cpu", dtype=torch.float64),
-            self.times_days.to(device="cpu", dtype=torch.float64),
+            comparison.times_days.cpu().to(torch.float64),
+            self.times_days.cpu().to(torch.float64),
             rtol=0.0,
             atol=1.0e-6,
         ):
