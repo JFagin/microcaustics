@@ -337,6 +337,10 @@ class DynamicConfig:
     point-mass fields. The selected fine cells from both ends of each refresh
     interval are always retained throughout that interval. Set the refresh
     interval to one to recompute every frame. Static fields are reused exactly.
+    Fused IPM maps use the union of these selections over each temporal batch,
+    independently for every system. Changing cross-system concurrency preserves
+    this support at a fixed temporal batch size; changing the temporal batch
+    can change the extra cells retained by this conservative approximation.
     """
 
     temporal_batch_size: int | None = None

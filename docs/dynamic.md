@@ -178,6 +178,13 @@ interval. This coverage safeguard is always active. A refresh value of one
 recomputes the scout at every frame and disables temporal scout reuse.
 Full-field IPM and IRS do not use scout reuse.
 
+Fused IPM map generation shares the union of these endpoint selections across
+each temporal batch. Independent-curve batching uses the same union separately
+for each stellar field. Labels keep their per-refresh-interval support in both
+paths. Thus changing curve concurrency does not change the selected support
+at a fixed temporal batch size. Changing the temporal batch itself can change
+the extra cells retained by the conservative map union.
+
 The far-field approximation constructs the local-star packs and complete coefficient
 tables independently at every map epoch. Multiple epochs can share a batched
 CUDA/Triton coefficient-accumulation call, but no coefficient table is

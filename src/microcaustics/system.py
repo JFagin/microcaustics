@@ -1495,10 +1495,22 @@ class MicrolensingSystem:
                         "stellar_aperture center must match the automatically "
                         "required aperture center"
                     )
-                if aperture.radius_uas < required_aperture.radius_uas:
+                # A cached common aperture may equal the largest requirement
+                # up to geometry roundoff. Keep the supplied radius unchanged
+                # so accepting that boundary cannot alter the seeded stars.
+                if aperture.radius_uas < required_aperture.radius_uas and not math.isclose(
+                    aperture.radius_uas,
+                    required_aperture.radius_uas,
+                    rel_tol=1.0e-10,
+                    abs_tol=0.0,
+                ):
                     raise ValueError(
                         "stellar_aperture is smaller than the complete aperture "
-                        "required by the source, lens, duration, and kinematics"
+                        "required by the source, lens, duration, and kinematics: "
+                        f"supplied radius={aperture.radius_uas:.17g} uas, "
+                        f"required radius={required_aperture.radius_uas:.17g} uas, "
+                        "relative shortfall="
+                        f"{(required_aperture.radius_uas - aperture.radius_uas) / required_aperture.radius_uas:.6g}"
                     )
             sampling_aperture = aperture
             if align_rectangle:

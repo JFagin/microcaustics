@@ -1694,6 +1694,131 @@ class TritonTaylorTests(unittest.TestCase):
                 atol=0.0,
             )
 
+    def test_cross_curve_scout_union_spans_multiple_refresh_intervals(self) -> None:
+        """Maps, photometry, labels and lags agree across concurrency choices.
+
+        The older test used batch=refresh=2, hiding the distinction between
+        per-refresh and per-batch scout unions. Here batch=5 spans refresh=2
+        intervals, crosses interval boundaries, and ends in a one-frame tail.
+        Four systems also exercise a partial final independent-curve group.
+        """
+        from microcaustics.sources import ThermalReprocessingSource
+
+        systems = tuple(
+            _small_cuda_system(backend="triton", offset=offset)
+            for offset in (0.0, 0.04, -0.03, 0.08)
+        )
+        times = tuple(80.0 * index for index in range(11))
+        method = replace(
+            _small_production_method(),
+            rays=1024,
+            scout_trace_centers=False,
+            dual_scout_scalar_correction=True,
+        )
+        common = dict(
+            include_labels=True,
+            method=method,
+            schedule=replace(_small_dynamic_schedule(), temporal_batch_size=5),
+            caustics=replace(_small_caustic_config(), temporal_batch_size=5),
+        )
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1, 1, 9, device="cuda"),
+            torch.linspace(-1, 1, 11, device="cuda"),
+            indexing="ij",
+        )
+        radius = 10.0 + 30.0 * torch.sqrt(xx.square() + yy.square())
+        delay = 1.0 + radius / 20.0 + 0.2 * xx
+        unit = torch.ones_like(radius)
+        response = ThermalReprocessingSource(
+            systems[0].source.geometry,
+            mc.ObserverTransfer(
+                radius, unit, unit, unit.bool(), relative_delay_days=delay
+            ),
+            mc.CallableDrivingSignal(lambda t: torch.ones_like(t)),
+            1.0e16 / radius,
+            delay,
+            black_hole_mass_solar=1e8,
+            eddington_ratio=0.1,
+            spin=0.0,
+            source_redshift=0.0,
+        )
+
+        def run(concurrency):
+            captured = [[] for _ in systems]
+
+            def observer(owner):
+                def consume(index, frame):
+                    self.assertEqual(index, len(captured[owner]))
+                    captured[owner].append(frame.magnification_map)
+
+                return consume
+
+            batch = mc.batched_system_light_curves(
+                systems,
+                times,
+                curves_per_batch=concurrency,
+                map_observers=[observer(i) for i in range(len(systems))],
+                **common,
+            )
+            lags = [
+                mc.microlensed_mean_response_delays_batch(
+                    response,
+                    maps,
+                    systems[0].distances,
+                )
+                for maps in captured
+            ]
+            return batch, captured, lags
+
+        serial, reference_maps, reference_lags = run(1)
+        for concurrency in (2, 3):
+            with self.subTest(concurrency=concurrency):
+                fused, captured, lags = run(concurrency)
+                self.assertEqual(
+                    fused.executed_batch_sizes, (2, 2) if concurrency == 2 else (3, 1)
+                )
+                self.assertTrue(
+                    fused.light_curves[0].metadata["cross_system_solver_fused"]
+                )
+                for owner, (expected, actual) in enumerate(
+                    zip(
+                        serial.light_curves,
+                        fused.light_curves,
+                        strict=True,
+                    )
+                ):
+                    torch.testing.assert_close(
+                        actual.flux, expected.flux, rtol=5e-5, atol=0
+                    )
+                    for key in (
+                        "crossing_labels",
+                        "crossing_events",
+                        "center_distance_censored",
+                    ):
+                        torch.testing.assert_close(
+                            getattr(actual.labels, key),
+                            getattr(expected.labels, key),
+                            rtol=0,
+                            atol=0,
+                        )
+                    torch.testing.assert_close(
+                        actual.labels.center_distances_uas,
+                        expected.labels.center_distances_uas,
+                        rtol=5e-5,
+                        atol=1e-5,
+                    )
+                    self.assertEqual(len(captured[owner]), len(times))
+                    for original, current in zip(
+                        reference_maps[owner], captured[owner], strict=True
+                    ):
+                        # GPU atomic summation order is not bitwise stable.
+                        torch.testing.assert_close(
+                            current.values, original.values, rtol=1e-4, atol=2e-4
+                        )
+                    torch.testing.assert_close(
+                        lags[owner], reference_lags[owner], rtol=5e-5, atol=1e-5
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

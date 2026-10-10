@@ -1,9 +1,12 @@
 # Optional automatic work-size tuning
 
-Automatic tuning is opt-in. It changes only lossless scheduling parameters:
+Automatic tuning is opt-in. It adjusts scheduling parameters:
 the number of frames presented to a fused temporal calculation and the size
 of spatial work chunks. It never changes the physical lens, map field,
 resolution, ray budget, or IPM values `k`, `r`, and `v`.
+With temporal scout reuse, changing the temporal batch can change the extra
+cells retained in its conservative union. The tuner therefore checks numerical
+agreement rather than assuming bitwise identity across temporal batch sizes.
 
 For publication benchmarks, set `RuntimeConfig(strict_backend=True)`. Normal
 interactive runs retain portable fallbacks and emit a one-time warning if an
@@ -125,6 +128,14 @@ batch = mc.batched_system_light_curves(
 The tuner verifies fluxes and labels against sequential execution and rejects
 CUDA OOM candidates. Use systems representative of the intended dataset. The
 selected value is not treated as universal and is never applied implicitly.
+
+At a fixed temporal batch size, fused independent systems use the same
+per-system temporal-batch scout union as single-curve map generation. No scout
+cells are shared between independent stellar fields. Caustic labels retain
+their per-refresh-interval support in both paths. Changing `curves_per_batch`
+should therefore preserve maps, fluxes, and labels up to floating-point
+accumulation differences. Keep the temporal batch and scout refresh fixed
+when checking this equivalence.
 
 ## Thermal spectra and intrinsic variability
 

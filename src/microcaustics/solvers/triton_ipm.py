@@ -36,7 +36,6 @@ if triton is not None:
             tl.where(index == 4, 1.0, tl.where(index == 1, -0.125, 0.0)),
         )
 
-
     @triton.jit
     def _materialize_biquadratic_v4_kernel(
         raw_x,
@@ -56,9 +55,7 @@ if triton is not None:
         for source_i in tl.static_range(3):
             weight_i = _v4_basis(node_i, component=source_i)
             for source_j in tl.static_range(3):
-                weight = weight_i * _v4_basis(
-                    node_j, component=source_j
-                )
+                weight = weight_i * _v4_basis(node_j, component=source_j)
                 source = cell * 9 + source_i * 3 + source_j
                 value_x += weight * tl.load(raw_x + source)
                 value_y += weight * tl.load(raw_y + source)
@@ -72,13 +69,11 @@ if triton is not None:
         safe = tl.where(tl.abs(dy) > 1.1754944e-38, dy, 1.0)
         return x0 + (y - y0) * (x1 - x0) / safe
 
-
     @triton.jit
     def _pick_left(v0, v1, v2, a0, a1, a2):
         choose0 = (v0 <= v1) & (v0 <= v2)
         choose1 = (~choose0) & (v1 <= v2)
         return tl.where(choose0, a0, tl.where(choose1, a1, a2))
-
 
     @triton.jit
     def _pick_right(v0, v1, v2, a0, a1, a2):
@@ -86,20 +81,31 @@ if triton is not None:
         choose1 = (~choose0) & (v1 >= v2)
         return tl.where(choose0, a0, tl.where(choose1, a1, a2))
 
-
     @triton.jit
     def _positive_linear_integral(z0, z1, interval):
         both = (z0 >= 0.0) & (z1 >= 0.0)
         falling = (z0 > 0.0) & (z1 < 0.0)
         rising = (z0 < 0.0) & (z1 > 0.0)
         full = 0.5 * interval * (z0 + z1)
-        fall = 0.5 * interval * z0 * z0 / tl.maximum(
-            z0 - z1,
-            1.1754944e-38,
+        fall = (
+            0.5
+            * interval
+            * z0
+            * z0
+            / tl.maximum(
+                z0 - z1,
+                1.1754944e-38,
+            )
         )
-        rise = 0.5 * interval * z1 * z1 / tl.maximum(
-            z1 - z0,
-            1.1754944e-38,
+        rise = (
+            0.5
+            * interval
+            * z1
+            * z1
+            / tl.maximum(
+                z1 - z0,
+                1.1754944e-38,
+            )
         )
         return tl.where(
             both,
@@ -137,41 +143,47 @@ if triton is not None:
         index10 = base + (sub_i + 1) * node_side + sub_j
         index11 = base + (sub_i + 1) * node_side + sub_j + 1
         index01 = base + sub_i * node_side + sub_j + 1
-        ax = (tl.load(node_x_ptr + index00) - XMIN) * INV_PIXEL_X
-        ay = (tl.load(node_y_ptr + index00) - YMIN) * INV_PIXEL_Y
+        ax = (
+            tl.load(node_x_ptr + index00, mask=valid_triangle, other=0.0) - XMIN
+        ) * INV_PIXEL_X
+        ay = (
+            tl.load(node_y_ptr + index00, mask=valid_triangle, other=0.0) - YMIN
+        ) * INV_PIXEL_Y
         bx = (
             tl.where(
                 split == 0,
-                tl.load(node_x_ptr + index10),
-                tl.load(node_x_ptr + index11),
+                tl.load(node_x_ptr + index10, mask=valid_triangle, other=0.0),
+                tl.load(node_x_ptr + index11, mask=valid_triangle, other=0.0),
             )
             - XMIN
         ) * INV_PIXEL_X
         by = (
             tl.where(
                 split == 0,
-                tl.load(node_y_ptr + index10),
-                tl.load(node_y_ptr + index11),
+                tl.load(node_y_ptr + index10, mask=valid_triangle, other=0.0),
+                tl.load(node_y_ptr + index11, mask=valid_triangle, other=0.0),
             )
             - YMIN
         ) * INV_PIXEL_Y
         cx = (
             tl.where(
                 split == 0,
-                tl.load(node_x_ptr + index11),
-                tl.load(node_x_ptr + index01),
+                tl.load(node_x_ptr + index11, mask=valid_triangle, other=0.0),
+                tl.load(node_x_ptr + index01, mask=valid_triangle, other=0.0),
             )
             - XMIN
         ) * INV_PIXEL_X
         cy = (
             tl.where(
                 split == 0,
-                tl.load(node_y_ptr + index11),
-                tl.load(node_y_ptr + index01),
+                tl.load(node_y_ptr + index11, mask=valid_triangle, other=0.0),
+                tl.load(node_y_ptr + index01, mask=valid_triangle, other=0.0),
             )
             - YMIN
         ) * INV_PIXEL_Y
-        twice_area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        # This pass is only a conservative source-overlap filter. Testing
+        # degeneracy after converting to global pixel coordinates can discard
+        # thin, nonzero triangles. The rasterizer tests their native edge area.
         minimum_x = tl.minimum(ax, tl.minimum(bx, cx))
         maximum_x = tl.maximum(ax, tl.maximum(bx, cx))
         minimum_y = tl.minimum(ay, tl.minimum(by, cy))
@@ -194,7 +206,6 @@ if triton is not None:
             active_cell
             & valid_triangle
             & finite
-            & (tl.abs(twice_area) > 1.1754944e-38)
             & (maximum_x > 0.0)
             & (minimum_x < COLUMNS)
             & (maximum_y > 0.0)
@@ -212,7 +223,6 @@ if triton is not None:
             cell.to(tl.int32),
             mask=active_cell & has_source_triangle & first,
         )
-
 
     @triton.jit
     def _direct_cell_kernel(
@@ -265,42 +275,60 @@ if triton is not None:
         index10 = base + (sub_i + 1) * node_side + sub_j
         index11 = base + (sub_i + 1) * node_side + sub_j + 1
         index01 = base + sub_i * node_side + sub_j + 1
-        ax = (tl.load(node_x_ptr + index00) - XMIN) * INV_PIXEL_X
-        ay = (tl.load(node_y_ptr + index00) - YMIN) * INV_PIXEL_Y
-        bx = (
-            tl.where(
-                split == 0,
-                tl.load(node_x_ptr + index10),
-                tl.load(node_x_ptr + index11),
-            )
-            - XMIN
-        ) * INV_PIXEL_X
-        by = (
-            tl.where(
-                split == 0,
-                tl.load(node_y_ptr + index10),
-                tl.load(node_y_ptr + index11),
-            )
-            - YMIN
-        ) * INV_PIXEL_Y
-        cx = (
-            tl.where(
-                split == 0,
-                tl.load(node_x_ptr + index11),
-                tl.load(node_x_ptr + index01),
-            )
-            - XMIN
-        ) * INV_PIXEL_X
-        cy = (
-            tl.where(
-                split == 0,
-                tl.load(node_y_ptr + index11),
-                tl.load(node_y_ptr + index01),
-            )
-            - YMIN
-        ) * INV_PIXEL_Y
+        raw_ax = tl.load(node_x_ptr + index00, mask=valid_triangle, other=0.0)
+        raw_ay = tl.load(node_y_ptr + index00, mask=valid_triangle, other=0.0)
+        raw_bx = tl.where(
+            split == 0,
+            tl.load(node_x_ptr + index10, mask=valid_triangle, other=0.0),
+            tl.load(node_x_ptr + index11, mask=valid_triangle, other=0.0),
+        )
+        raw_by = tl.where(
+            split == 0,
+            tl.load(node_y_ptr + index10, mask=valid_triangle, other=0.0),
+            tl.load(node_y_ptr + index11, mask=valid_triangle, other=0.0),
+        )
+        raw_cx = tl.where(
+            split == 0,
+            tl.load(node_x_ptr + index11, mask=valid_triangle, other=0.0),
+            tl.load(node_x_ptr + index01, mask=valid_triangle, other=0.0),
+        )
+        raw_cy = tl.where(
+            split == 0,
+            tl.load(node_y_ptr + index11, mask=valid_triangle, other=0.0),
+            tl.load(node_y_ptr + index01, mask=valid_triangle, other=0.0),
+        )
 
-        twice_area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        # Keep the clipping geometry cell-local. Subtracting global pixel
+        # coordinates (~2000 on a 4096 grid) loses the width of near-critical
+        # triangles and can create flux spikes when dividing by their area.
+        # One integer origin per cell is shared by every triangle in its warp.
+        cell_x = tl.load(node_x_ptr + base)
+        cell_y = tl.load(node_y_ptr + base)
+        cell_x = tl.where(tl.abs(cell_x) < 3.4028235e38, cell_x, XMIN)
+        cell_y = tl.where(tl.abs(cell_y) < 3.4028235e38, cell_y, YMIN)
+        origin_x = tl.floor(
+            tl.minimum(COLUMNS - 1.0, tl.maximum(0.0, (cell_x - XMIN) * INV_PIXEL_X))
+        ).to(tl.int32)
+        origin_y = tl.floor(
+            tl.minimum(ROWS - 1.0, tl.maximum(0.0, (cell_y - YMIN) * INV_PIXEL_Y))
+        ).to(tl.int32)
+        anchor_x = tl.fma(origin_x.to(tl.float32), 1.0 / INV_PIXEL_X, XMIN)
+        anchor_y = tl.fma(origin_y.to(tl.float32), 1.0 / INV_PIXEL_Y, YMIN)
+        ax, ay = (raw_ax - anchor_x) * INV_PIXEL_X, (raw_ay - anchor_y) * INV_PIXEL_Y
+        bx, by = (raw_bx - anchor_x) * INV_PIXEL_X, (raw_by - anchor_y) * INV_PIXEL_Y
+        cx, cy = (raw_cx - anchor_x) * INV_PIXEL_X, (raw_cy - anchor_y) * INV_PIXEL_Y
+        column_low, column_high = -origin_x, COLUMNS - origin_x
+        row_low, row_high = -origin_y, ROWS - origin_y
+
+        # Compute the determinant before scaling or translating vertices.
+        # A compensated difference of products retains thin-triangle area
+        # without float64 arithmetic or disabling fused multiply-adds.
+        edge_bx, edge_by = raw_bx - raw_ax, raw_by - raw_ay
+        edge_cx, edge_cy = raw_cx - raw_ax, raw_cy - raw_ay
+        product = edge_by * edge_cx
+        twice_area = (
+            tl.fma(edge_bx, edge_cy, -product) + tl.fma(-edge_by, edge_cx, product)
+        ) * (INV_PIXEL_X * INV_PIXEL_Y)
         minimum_x = tl.minimum(ax, tl.minimum(bx, cx))
         maximum_x = tl.maximum(ax, tl.maximum(bx, cx))
         minimum_y = tl.minimum(ay, tl.minimum(by, cy))
@@ -324,22 +352,22 @@ if triton is not None:
             & valid_triangle
             & finite
             & (tl.abs(twice_area) > 1.1754944e-38)
-            & (maximum_x > 0.0)
-            & (minimum_x < COLUMNS)
-            & (maximum_y > 0.0)
-            & (minimum_y < ROWS)
+            & (maximum_x > column_low)
+            & (minimum_x < column_high)
+            & (maximum_y > row_low)
+            & (minimum_y < row_high)
         )
         density = TRIANGLE_MASS / tl.maximum(
             0.5 * tl.abs(twice_area),
             1.1754944e-38,
         )
         first_row = tl.maximum(
-            0,
-            tl.minimum(ROWS - 1, tl.floor(minimum_y).to(tl.int32)),
+            row_low,
+            tl.minimum(row_high - 1, tl.floor(minimum_y).to(tl.int32)),
         )
         last_row = tl.maximum(
-            0,
-            tl.minimum(ROWS - 1, tl.floor(maximum_y).to(tl.int32)),
+            row_low,
+            tl.minimum(row_high - 1, tl.floor(maximum_y).to(tl.int32)),
         )
         row_count = tl.where(keep, last_row - first_row + 1, 0)
         maximum_rows = tl.max(row_count, axis=0)
@@ -430,26 +458,26 @@ if triton is not None:
             valid_row = (
                 active_row
                 & (valid0 | valid1)
-                & (strip_max >= 0.0)
-                & (strip_min < COLUMNS)
+                & (strip_max >= column_low)
+                & (strip_min < column_high)
             )
             safe_min = tl.where(
                 valid_row,
-                tl.minimum(float(COLUMNS), tl.maximum(0.0, strip_min)),
+                tl.minimum(column_high, tl.maximum(column_low, strip_min)),
                 0.0,
             )
             safe_max = tl.where(
                 valid_row,
-                tl.minimum(float(COLUMNS), tl.maximum(0.0, strip_max)),
+                tl.minimum(column_high, tl.maximum(column_low, strip_max)),
                 0.0,
             )
             bbox0 = tl.maximum(
-                0,
-                tl.minimum(COLUMNS - 1, tl.floor(safe_min).to(tl.int32)),
+                column_low,
+                tl.minimum(column_high - 1, tl.floor(safe_min).to(tl.int32)),
             )
             bbox1 = tl.maximum(
-                0,
-                tl.minimum(COLUMNS - 1, tl.floor(safe_max).to(tl.int32)),
+                column_low,
+                tl.minimum(column_high - 1, tl.floor(safe_max).to(tl.int32)),
             )
             covered0 = tl.minimum(
                 tl.where(valid0, segment0_y0, float("inf")),
@@ -472,11 +500,11 @@ if triton is not None:
             raw_last = tl.floor(right_limit + full_epsilon).to(tl.int32) - 1
             full0 = tl.maximum(
                 bbox0,
-                tl.maximum(0, tl.minimum(COLUMNS - 1, raw_first)),
+                tl.maximum(column_low, tl.minimum(column_high - 1, raw_first)),
             )
             full1 = tl.minimum(
                 bbox1,
-                tl.maximum(0, tl.minimum(COLUMNS - 1, raw_last)),
+                tl.maximum(column_low, tl.minimum(column_high - 1, raw_last)),
             )
             full = (
                 valid_row
@@ -493,17 +521,16 @@ if triton is not None:
                 bbox1 - bbox0 + 1 - full_count,
                 0,
             )
-            row_base = (
-                frame.to(tl.int64) * ROWS * (COLUMNS + 1)
-                + row.to(tl.int64) * (COLUMNS + 1)
-            )
+            row_base = frame.to(tl.int64) * ROWS * (COLUMNS + 1) + (row + origin_y).to(
+                tl.int64
+            ) * (COLUMNS + 1)
             tl.atomic_add(
-                row_difference_ptr + row_base + full0,
+                row_difference_ptr + row_base + full0 + origin_x,
                 density,
                 mask=full,
             )
             tl.atomic_add(
-                row_difference_ptr + row_base + full1 + 1,
+                row_difference_ptr + row_base + full1 + origin_x + 1,
                 -density,
                 mask=full,
             )
@@ -535,8 +562,8 @@ if triton is not None:
                 area = tl.where(valid0, area0, 0.0) + tl.where(valid1, area1, 0.0)
                 histogram_index = (
                     frame.to(tl.int64) * ROWS * COLUMNS
-                    + row.to(tl.int64) * COLUMNS
-                    + column.to(tl.int64)
+                    + (row + origin_y).to(tl.int64) * COLUMNS
+                    + (column + origin_x).to(tl.int64)
                 )
                 tl.atomic_add(
                     histogram_ptr + histogram_index,
@@ -567,9 +594,7 @@ def materialize_biquadratic_v4_triton(
     n_cells = int(node_x.numel() // 9)
     raw_x = node_x.reshape(n_cells, 3, 3).contiguous()
     raw_y = node_y.reshape(n_cells, 3, 3).contiguous()
-    output_x = torch.empty(
-        (n_cells, 5, 5), dtype=node_x.dtype, device=node_x.device
-    )
+    output_x = torch.empty((n_cells, 5, 5), dtype=node_x.dtype, device=node_x.device)
     output_y = torch.empty_like(output_x)
     if n_cells:
         _materialize_biquadratic_v4_kernel[(n_cells,)](
@@ -666,8 +691,7 @@ def accumulate_cells_triton(
         raise ValueError("Triton IPM rasterization requires CUDA float32")
     if node_x.shape != node_y.shape or node_x.ndim not in (3, 4):
         raise ValueError(
-            "node arrays must share shape [cell, v+1, v+1] or "
-            "[frame, cell, v+1, v+1]"
+            "node arrays must share shape [cell, v+1, v+1] or [frame, cell, v+1, v+1]"
         )
     if node_x.shape[-2] != node_x.shape[-1] or node_x.shape[-1] < 2:
         raise ValueError("node lattices must be square with at least two nodes")
@@ -679,9 +703,11 @@ def accumulate_cells_triton(
     if indexed_frames:
         if node_x.ndim != 3:
             raise ValueError("indexed raster queues must have shape [cell, v+1, v+1]")
-        cell_frame_index = torch.as_tensor(
-            cell_frame_index, device=node_x.device, dtype=torch.int32
-        ).reshape(-1).contiguous()
+        cell_frame_index = (
+            torch.as_tensor(cell_frame_index, device=node_x.device, dtype=torch.int32)
+            .reshape(-1)
+            .contiguous()
+        )
         if cell_frame_index.numel() != cells_per_frame:
             raise ValueError("cell_frame_index must contain one entry per cell")
         if cell_frame_index.numel() and bool(
@@ -702,15 +728,15 @@ def accumulate_cells_triton(
     source_pixel_area = float(pixel_size_x) * float(pixel_size_y)
     triangle_count = 2 * virtual_refinement * virtual_refinement
     triangle_block = triton.next_power_of_2(triangle_count)
-    total_cells = cells_per_frame if indexed_frames else temporal_frames * cells_per_frame
+    total_cells = (
+        cells_per_frame if indexed_frames else temporal_frames * cells_per_frame
+    )
     frame_ptr = (
         cell_frame_index
         if indexed_frames
         else torch.empty(1, device=node_x.device, dtype=torch.int32)
     )
-    active_cells = torch.empty(
-        total_cells, device=node_x.device, dtype=torch.int32
-    )
+    active_cells = torch.empty(total_cells, device=node_x.device, dtype=torch.int32)
     active_count = torch.zeros((), device=node_x.device, dtype=torch.int32)
     _compact_active_triangles_kernel[(total_cells,)](
         node_x,

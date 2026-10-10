@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -679,6 +680,70 @@ class MicrolensingSystemTests(unittest.TestCase):
                 stellar_aperture_override=mc.StellarAperture(
                     required.radius_uas * 0.9,
                     required.center_uas,
+                ),
+            ).realize()
+
+    def test_shared_stellar_aperture_roundoff_preserves_seeded_field(self) -> None:
+        common = dict(
+            macro=self.macro,
+            distances=self.distances,
+            source_grid=self.source_grid,
+            stellar_population=mc.StellarPopulation.salpeter(count=8),
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+            seed=41,
+        )
+        automatic = mc.MicrolensingSystem(**common).realize()
+        aperture = automatic.stellar_aperture
+        assert aperture is not None
+        # Model a roundoff-level change in the recomputed requirement, not a
+        # changed source or physical population. Never expand the cached field.
+        for radius in (
+            math.nextafter(aperture.radius_uas, math.inf),
+            aperture.radius_uas * (1.0 + 5.0e-11),
+        ):
+            with self.subTest(radius=radius), patch(
+                "microcaustics.system.circular_stellar_aperture",
+                return_value=mc.StellarAperture(radius, aperture.center_uas),
+            ):
+                realized = mc.MicrolensingSystem(
+                    **common, stellar_aperture_override=aperture
+                ).realize()
+            self.assertIs(realized.stellar_aperture, aperture)
+            self.assertEqual(realized.lens_region, automatic.lens_region)
+            for name in ("x_uas", "y_uas", "mass_solar"):
+                self.assertTrue(
+                    torch.equal(
+                        getattr(realized.stars, name), getattr(automatic.stars, name)
+                    ), name
+                )
+
+    def test_stellar_aperture_shortfall_outside_roundoff_still_fails(self) -> None:
+        common = dict(
+            macro=self.macro,
+            distances=self.distances,
+            source_grid=self.source_grid,
+            stellar_population=mc.StellarPopulation.salpeter(count=8),
+            runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+            seed=41,
+        )
+        aperture = mc.MicrolensingSystem(**common).realize().stellar_aperture
+        assert aperture is not None
+        for shortfall in (2.0e-10, 1.0e-6, 0.1):
+            supplied = mc.StellarAperture(
+                aperture.radius_uas * (1.0 - shortfall), aperture.center_uas
+            )
+            with self.subTest(shortfall=shortfall), self.assertRaisesRegex(
+                ValueError,
+                r"supplied radius=.+ uas, required radius=.+ uas, relative shortfall=",
+            ):
+                mc.MicrolensingSystem(
+                    **common, stellar_aperture_override=supplied
+                ).realize()
+        with self.assertRaisesRegex(ValueError, "center must match"):
+            mc.MicrolensingSystem(
+                **common,
+                stellar_aperture_override=mc.StellarAperture(
+                    aperture.radius_uas, (1.0, 0.0)
                 ),
             ).realize()
 

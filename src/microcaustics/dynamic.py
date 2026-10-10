@@ -866,7 +866,9 @@ def _cross_system_tiled_ipm_maps(
 
     This is the map engine used by independent light-curve batching. Temporal
     states from all systems share launches, but every state retains its own
-    far-field coefficients and conservative scout cells. The function is
+    far-field coefficients and conservative scout cells. Maps use each system's
+    full temporal-batch scout union, as in the single-system scheduler. Labels
+    retain their refresh-interval support. The function is
     intentionally internal until non-IPM backends have an equivalent fused
     implementation.
     """
@@ -955,6 +957,7 @@ def _cross_system_tiled_ipm_maps(
         )
         all_far_fields = []
         all_cells = []
+        label_cells = []
         owners = []
         far_by_system = []
         for simulation, region, _grid, _, _, _ in requests:
@@ -1008,25 +1011,40 @@ def _cross_system_tiled_ipm_maps(
             positions = {
                 index: position for position, index in enumerate(anchor_indices)
             }
-            interval_cells = {
-                pair: _expand_interval_scout_cells(
-                    anchor_masks,
-                    positions,
-                    pair,
-                    ratio=ratio,
-                    fine_nx=fine_nx,
-                )
-                for pair in interval_pairs
-            }
-            frame_cells = tuple(
-                interval_cells[
-                    (
-                        (index // refresh) * refresh,
-                        min(len(times) - 1, ((index // refresh) + 1) * refresh - 1),
-                    )
-                ]
-                for index in real_indices
+            # The serial map scheduler shares the union of ALL scout anchors
+            # in this temporal batch. A narrower per-refresh union changes the
+            # integrated flux when independent curves are fused. Keep the
+            # union local to this system, never across independent star fields.
+            map_cells = _expand_interval_scout_cells(
+                anchor_masks,
+                positions,
+                anchor_indices,
+                ratio=ratio,
+                fine_nx=fine_nx,
             )
+            if caustic_requests is not None:
+                # Serial labels already use the narrower per-refresh support.
+                # Enlarging their queue with the map union would change that
+                # contract and unnecessarily increase determinant work.
+                interval_cells = {
+                    pair: _expand_interval_scout_cells(
+                        anchor_masks,
+                        positions,
+                        pair,
+                        ratio=ratio,
+                        fine_nx=fine_nx,
+                    )
+                    for pair in interval_pairs
+                }
+                label_cells.extend(
+                    interval_cells[
+                        (
+                            (index // refresh) * refresh,
+                            min(len(times) - 1, ((index // refresh) + 1) * refresh - 1),
+                        )
+                    ]
+                    for index in real_indices
+                )
             if method.dual_scout_scalar_correction and scalar_corrections[system_index] is None:
                 scalar_corrections[system_index], correction_metadata[system_index] = (
                     dual_scout_scalar_correction(
@@ -1039,7 +1057,7 @@ def _cross_system_tiled_ipm_maps(
                     )
                 )
             all_far_fields.extend(far_by_index[index] for index in real_indices)
-            all_cells.extend(frame_cells)
+            all_cells.extend([map_cells] * len(real_indices))
             owners.extend((system_index, index) for index in real_indices)
 
         corrections = torch.stack(
@@ -1085,7 +1103,7 @@ def _cross_system_tiled_ipm_maps(
                 [times[index] for _, index in owners],
                 first_caustic,
                 far_fields=all_far_fields,
-                selected_cell_indices_by_frame=all_cells,
+                selected_cell_indices_by_frame=label_cells,
                 selected_cell_shape=(fine_ny, fine_nx),
                 source_region=first_grid.region,
             )
