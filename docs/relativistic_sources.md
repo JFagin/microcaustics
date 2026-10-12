@@ -380,3 +380,98 @@ Low-level differentiable functions are available from
 radiative efficiencies, `circular_disk_gfactor`,
 `circular_disk_zamo_lorentz_factor`, and the explicitly named approximate
 frequency shift.
+
+## Transfer-function delay reconstruction
+
+Transfer functions store response **mass per delay bin**. The plotting helper
+only divides by bin widths. It never applies a Gaussian filter. Thermal disks
+use fine fractional delay deposition and average PCHIP reconstructions of four
+shifted CDF grids by default. They integrate the resulting polynomials over
+the requested output bins, independently of the reconstruction spacing.
+An explicit single-grid reconstruction remains available:
+
+```python
+native_edges = torch.linspace(0, 100, 201, device=runtime.device, dtype=runtime.dtype)
+output_edges = torch.linspace(0, 100, 1001, device=runtime.device, dtype=runtime.dtype)
+response = mc.steady_transfer_function(
+    source, output_edges, native_delay_edges_days=native_edges, runtime=runtime,
+)
+```
+
+Choose the native support to contain the physical delays, rather than cutting
+off a response tail. Check native-grid convergence separately from output-grid
+spacing. Reconstruction does not recover unresolved sub-bin features. The
+single-map, streaming, and system transfer-function APIs accept the same
+`native_delay_edges_days` option. Omitting it uses the thermal source's
+automatic CDF grid. Custom sources retain their own transfer implementation.
+Set `RuntimeConfig(response_reconstruction="ordinary")` when constructing a
+thermal source to retain direct histogramming. Low-level source methods also
+accept `reconstruction="ordinary"` or `native_delay_bin_days=...`.
+Sources supporting direct pixel moments retain those mean lags independently
+of reconstruction. Other sources report native-bin-center means, identified
+by `mean_delay_method` in the result metadata.
+
+The reconstructed curve's centroid is checked separately in regression tests
+against direct pixel moments, with a tolerance of the larger of 1% or 0.1 day.
+These tests cover inclined disks and caustic-weighted responses, including
+lower black-hole masses, on specified native grids. They do not guarantee that
+an arbitrarily coarse native grid preserves the lag. In particular, shorter
+lags require checking a finer native grid even when the output grid is dense.
+
+`mc.rebin_transfer_function(response, output_edges)` reconstructs an existing
+product while preserving its stored mean delays. A cropped output loses the
+excluded response mass without renormalization. Its stored mean still refers
+to the original response, not the cropped curve. Low-level repeated workloads
+can cache `mc.CDFResponseRebinner(native_edges, output_edges, runtime=runtime)`
+and call it on tensors shaped `[delay, band]` or `[batch, delay, band]`.
+The tensor hot path stays on the input device and dtype. CUDA defaults to a
+cached compiled specialization. Use `validate=False` only for already validated
+nonnegative finite masses to skip a repeated GPU-to-host validation barrier.
+Grid validation and interval construction occur once when the plan is built.
+
+Local Hermite differences preserve weak tails without subtracting two global
+CDF values close to one. SciPy is only a testing reference, not a runtime
+dependency. Float32 is supported throughout.
+
+`rebinner.experimental_signed(kernel)` reconstructs positive and negative
+native-bin contributions separately, retaining their absolute amplitudes.
+This experimental operation does not recover cancellation within a native bin
+and does not guarantee the exact first delay moment. It is **not** used by the
+linear- or quadratic-response light-curve modes. Their production quadratic
+path instead separates positive and negative **pixel** weights before binning,
+constructs two nonnegative CDFs, and subtracts their coefficients. This retains
+within-bin signed contributions, including zero-total kernels, without
+normalizing or clipping the signed response.
+
+Linear and quadratic response modes use the same phase-averaged CDF polynomials
+for driver convolution. The coarse spacing is selected once near the
+observer-frame light-crossing time of a source pixel, bounded by the narrowest
+band's central response width divided by 16 and the tabulated driver cadence.
+Fine deposition uses 16 subdivisions per coarse bin, and the four shifted
+grids share polynomial intervals at one quarter of the coarse spacing.
+A user-specified spacing overrides the automatic choice.
+It is a resolution heuristic, not a guarantee of spatial convergence. Tests
+compare full kernel shapes, mean lags, and convolutions, including caustic
+weighting. These comparisons are not repeated in production.
+
+In a 1024-square Q2237 disk test with 3651 daily samples, 32 continuum channels,
+LSST photometry, dense spectra and caustic labels, median warmed runtimes were
+1.12 s linear and 1.24 s quadratic on an RTX 5070 Ti. These exclude one-time
+Kerr construction and compilation. The source/spectrum calculation alone,
+replaying the same GPU-resident maps, took 0.19 s and 0.28 s. Packing the four
+CDF phases into one compiled calculation and sharing the static heating state
+across wavelength chunks reduced that replay cost by about 31% and 24% in a
+before/after check. The reconstruction, float32 precision and grid are unchanged.
+The default selected 0.25-day coarse CDF spacing. Relative to fine ordinary
+deposition of the same response order, the six-band RMS difference was 0.0026 and
+0.0030 mmag, respectively. These are reconstruction errors, not the larger
+physical Taylor-approximation errors relative to exact nonlinear evolution.
+Repeated runs introduced no new compiled graphs. These measurements describe
+one fixture, not a universal accuracy or performance bound. Exact nonlinear
+evolution remains unchanged and is still the default source evolution.
+
+For the Figure 8 crossing, the standard 1024-square source at 0.25-day output
+has normalized response-shape L1 differences of 0.4–0.6% unlensed and 0.7–1.4%
+microlensed against a saved 4096-square reference. Reconstructed centroids
+differ by less than 0.003 day. The microlensed comparison also includes the
+different magnification-map resolutions, so it is not an isolated CDF error.

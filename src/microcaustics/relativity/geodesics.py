@@ -282,7 +282,13 @@ def polar_mino_time(
         torch.asin(safe_argument),
         parameter,
     )
-    half_period = 2.0 * scale * elliptic_k(parameter)
+    quarter_period = scale * elliptic_k(parameter)
+    # The axis is a regular complete integral for lambda=0, eta>0. Moving
+    # its endpoint inward by O(eps) biases the travel time by O(sqrt(eps)),
+    # which is appreciable in float32. Keep the clamp for other endpoints.
+    on_axis = (lam == 0.0) & (inclination == 0.0) & (eta > 0.0)
+    observer_time = torch.where(on_axis, quarter_period, observer_time)
+    half_period = 2.0 * quarter_period
     mino_time = torch.where(beta > 0.0, half_period - observer_time, observer_time)
     valid = valid & torch.isfinite(mino_time) & (mino_time >= 0.0)
     return mino_time, valid
@@ -480,8 +486,14 @@ def incoming_radial_mino_time(
     root_real: torch.Tensor,
     root_imag: torch.Tensor,
     target_radius: torch.Tensor,
+    *,
+    radial_potential_at_target: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Locate a finite radius on the incoming infinity-connected branch."""
+    """Locate a finite radius on the incoming infinity-connected branch.
+
+    A known local radial potential avoids subtracting nearly equal radii at
+    an exterior turning point. It must use the same constants as the roots.
+    """
 
     counts = radial_root_real_count(root_real, root_imag)
     r1, r2, r3, r4 = root_real.unbind(dim=-1)
@@ -499,10 +511,20 @@ def incoming_radial_mino_time(
         torch.asin(infinity_argument4),
         parameter4,
     )
+    outer_gap = target_radius - r4
+    if radial_potential_at_target is not None:
+        # R(r) = product(r-r_i). For near-tangential axial launches the
+        # locally known R(r_s) retains cos(alpha)^2 even when r_s-r4 rounds
+        # to zero. This preserves angular ordering without a dtype change.
+        factored_gap = radial_potential_at_target / _signed_safe_denominator(
+            (target_radius - r1) * (target_radius - r2) * (target_radius - r3)
+        )
+        exterior = (counts == 4) & (target_radius >= r3) & (factored_gap >= 0.0)
+        outer_gap = torch.where(exterior, factored_gap, outer_gap)
     radius_argument4 = torch.sqrt(
         (
             r31
-            * (target_radius - r4)
+            * outer_gap
             / _signed_safe_denominator(r41 * (target_radius - r3))
         ).clamp(0.0, 1.0)
     )
@@ -594,6 +616,8 @@ def incoming_radial_mino_time(
 def inner_four_root_phase(
     root_real: torch.Tensor,
     radius: torch.Tensor,
+    *,
+    radial_potential_at_target: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return phase on the bounded interval of a four-real-root ray."""
 
@@ -604,7 +628,14 @@ def inner_four_root_phase(
     parameter = (q3 - q2) * (q4 - q1) / _signed_safe_denominator(
         (q3 - q1) * (q4 - q2)
     )
-    argument2 = (q4 - q2) * (q3 - radius) / _signed_safe_denominator(
+    turning_gap = q3 - radius
+    if radial_potential_at_target is not None:
+        # The same factored-potential identity also resolves a tangential
+        # launch on the bounded branch, where the upper turn is q3, not q4.
+        turning_gap = -radial_potential_at_target / _signed_safe_denominator(
+            (radius - q1) * (radius - q2) * (radius - q4)
+        )
+    argument2 = (q4 - q2) * turning_gap / _signed_safe_denominator(
         (q3 - q2) * (q4 - radius)
     )
     phase = 2.0 / scale * _elliptic_f_principal(
@@ -628,13 +659,18 @@ def lamppost_radial_radius(
     phase: torch.Tensor,
     inner_four_real: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Evaluate either radial branch used by an axial lamppost ray."""
+    """Evaluate a signed lamp phase on either radial branch.
+
+    The outer incoming inverse starts at infinity, so an outgoing phase
+    before escape is evaluated at its absolute value. The bounded inner
+    branch instead has its origin at a finite turning point.
+    """
 
     outer_radius, outer_valid, _ = invert_radial_motion(
         spin,
         root_real,
         root_imag,
-        phase,
+        phase.abs(),
     )
     q1, q2, q3, q4 = root_real.unbind(dim=-1)
     scale = torch.sqrt(

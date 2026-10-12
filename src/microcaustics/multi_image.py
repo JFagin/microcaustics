@@ -482,6 +482,7 @@ class MultiImageSimulation:
         map_observers: Mapping[str, Callable] | None = None,
         response_batch_size: int | None = None,
         response_spatial_chunk_size: int = 262_144,
+        native_delay_edges_days=None,
     ) -> MultiImageTransferFunctions:
         """Generate microlensing-weighted response functions per image.
 
@@ -528,6 +529,7 @@ class MultiImageSimulation:
                 map_observer=observers.get(image.name),
                 response_batch_size=response_batch_size,
                 response_spatial_chunk_size=response_spatial_chunk_size,
+                native_delay_edges_days=native_delay_edges_days,
             )
             outputs.append(
                 MacroImageTransferFunctions(

@@ -451,7 +451,6 @@ class PlottingTests(unittest.TestCase):
         self.assertEqual(len(ax.lines), 2)
         centers, density = mcp.transfer_response_density(
             transfer,
-            smoothing_sigma_days=0.4,
         )
         self.assertEqual(tuple(centers.shape), (3,))
         np.testing.assert_allclose(
@@ -470,7 +469,6 @@ class PlottingTests(unittest.TestCase):
         )
         _, causal_density = mcp.transfer_response_density(
             causal,
-            smoothing_sigma_days=1.0,
         )
         self.assertEqual(float(causal_density[0, 0]), 0.0)
         self.assertEqual(float(causal_density[1, 0]), 0.0)

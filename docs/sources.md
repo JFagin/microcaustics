@@ -524,7 +524,7 @@ mean-driver result in `microlensing_only_flux`, component band fluxes in
 The continuum and its bandpass integrals are evaluated at every requested
 source epoch, including daily intrinsic variability between 25-day maps.
 
-### Experimental response-based source evolution
+### Response-based source evolution
 
 The default `source_evolution="exact"` evaluates the nonlinear thermal disk at
 every requested source epoch. For a stationary `ThermalReprocessingSource`,
@@ -533,8 +533,10 @@ unnormalized delay response with each sparse magnification map, then
 interpolates those products between map epochs. The driver and output remain
 sampled daily; only the expensive spatial disk evaluation is approximated.
 The unnormalized kernel is essential because microlensing changes both its
-shape and response amplitude. Adjacent delay bins share each pixel's weight,
-preserving the response's total weight and mean delay.
+shape and response amplitude. The default CDF/PCHIP reconstruction conserves
+total response mass. Fine fractional deposition and averaging four shifted
+CDF grids reduce artifacts from individual pixel delays. The same polynomials generate transfer-function
+products and convolve with the driver, without plot-only smoothing.
 
 ```python
 approximate = system.light_curve(
@@ -546,9 +548,26 @@ approximate = system.light_curve(
     wavelength_batch_size=16,
     include_microlensing_only=True,
     source_evolution="linear_response",  # opt in; "exact" is the default
-    response_delay_bin_days=0.25,
+    response_delay_bin_days=None,  # automatic native CDF spacing
 )
 ```
+
+Both response modes select the coarse CDF spacing once near the observer-frame
+light-crossing time of a source pixel, bounded by the narrowest unlensed
+response width and the tabulated driver's cadence. Set a positive
+`response_delay_bin_days` to select it explicitly. Output transfer-function
+edges do not set the native resolution. Tabulated drivers are integrated
+analytically over each PCHIP piece; scalar callable drivers use three-point
+Gaussian quadrature. The common polynomial intervals, one quarter of the
+coarse spacing, must not exceed the tabulated driver cadence.
+No ordinary-response comparison or convergence audit runs per map.
+
+`RuntimeConfig(response_reconstruction="ordinary")` restores the previous
+two-node, moment-preserving response deposition, with 0.1-day bins when no
+spacing is supplied. The same setting selects direct thermal transfer
+histograms. Neither option changes `source_evolution="exact"`, which remains
+the default evolution mode. CDF preserves response mass, but its centroid is
+only approximately preserved. Transfer products retain direct pixel mean lags.
 
 The same controls work on individual `LightCurveRequest` objects, with
 optional caustic labels, and with `TimeShiftedSource` arrival delays. Source
@@ -578,7 +597,8 @@ caustic labels or first-call compilation.
 coefficient. In the full-spectrum test its maximum six-band error was 0.09 mmag
 and the best-fit shift was 0.01–0.02 day. With the same compiled projection,
 it took 1.16–1.19 s, about 1.33 times faster than exact in this case.
-These measurements are for one realization and are not general error bounds;
+These historical measurements used ordinary 0.25-day response bins. They are for one
+realization and are not general error bounds;
 compare with `"exact"` for
 other disks, drivers, and caustics. The response modes cache one spatial
 weight per sampled disk wavelength and use more GPU memory than the exact

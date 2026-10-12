@@ -297,8 +297,10 @@ class RenderedMacroImage:
 class TransferFunction:
     """One steady-state or microlensing-weighted response function.
 
-    ``values`` has shape ``[delay_bin, band]``. Mean delays are calculated
-    from the centers of the supplied bins and are therefore reported in days.
+    ``values`` has shape ``[delay_bin, band]`` and stores response mass.
+    Mean delays are in days. CDF reconstruction preserves the original means
+    (direct pixel moments when supported); it does not infer them from the
+    reconstructed curve. Metadata identifies the calculation convention.
     """
 
     delay_edges_days: torch.Tensor

@@ -200,11 +200,19 @@ def _trace_chunk(
         photon_lambda,
     )
     source_radius_ray = source_radius.expand_as(launch_angle)
+    radial_potential_at_source = torch.where(
+        theta_source == 0.0,
+        sigma_source.square() * torch.cos(launch_angle).square(),
+        (source_radius.square() + spin.square()).square()
+        - (source_radius.square() - 2.0 * source_radius + spin.square())
+        * (carter_eta + spin.square()),
+    )
     source_time_outer, source_valid_outer = incoming_radial_mino_time(
         spin_ray,
         root_real,
         root_imag,
         source_radius_ray,
+        radial_potential_at_target=radial_potential_at_source,
     )
     root_counts = radial_root_real_count(root_real, root_imag)
     _, q2, q3, _ = root_real.unbind(dim=-1)
@@ -221,6 +229,7 @@ def _trace_chunk(
     source_time_inner, source_valid_inner = inner_four_root_phase(
         root_real,
         source_radius_ray,
+        radial_potential_at_target=radial_potential_at_source,
     )
     source_time = torch.where(
         inner_four_real,
@@ -232,6 +241,9 @@ def _trace_chunk(
         source_valid_inner,
         source_valid_outer,
     )
+    # The signed phase increases with elapsed Mino time on both branches.
+    # Its outer negative half describes outgoing rays before escape, while
+    # the inner branch can pass through zero at a finite radial turn.
     source_phase = -initial_radial_sign * source_time
     disk_phase = source_phase + polar_time
     radius, radius_valid = lamppost_radial_radius(
@@ -288,7 +300,7 @@ def _trace_chunk(
         & (radius >= disk_inner)
         & (radius <= disk_outer)
         & (lamp_to_disk_gfactor > 0.0)
-        & ((initial_radial_sign < 0.0) | (disk_phase <= 0.0))
+        & (inner_four_real | (initial_radial_sign < 0.0) | (disk_phase < 0.0))
     )
     return (
         radius,

@@ -172,6 +172,12 @@ The relativistic disk layer also works independently of microlensing.
 transfer functions and daily multiband continuum-reverberation light curves
 without creating a magnification map.
 
+Response plots show bin mass divided by bin width without filtering. Gaussian
+response smoothing is no longer supported. Use the numerical
+[CDF/PCHIP reconstruction](relativistic_sources.md#transfer-function-delay-reconstruction)
+when a different output delay grid is needed, and check the native-grid
+resolution separately.
+
 `workflows/04_simulation_datasets.ipynb` shows both fixed-system and
 prior-sampled labeled light curves as vertical panels and distinguishes
 first-call from subsequent generation. It defines and simulates its systems

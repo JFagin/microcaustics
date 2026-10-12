@@ -1091,25 +1091,27 @@ class FoundationTests(unittest.TestCase):
         )
         rays = profile.rays
         hit = rays.hit
-        self.assertEqual(int(hit.sum()), 91)
+        # Includes outward rays bending back to the disk. Independent ODE
+        # and travel-time checks live in test_lamppost_numerics.py.
+        self.assertEqual(int(hit.sum()), 92)
         self.assertAlmostEqual(
             float(rays.radius_rg[hit].sum()),
-            1266.8307827755639,
+            1315.2649581861751,
             places=10,
         )
         self.assertAlmostEqual(
             float(rays.travel_time_rg[hit].sum()),
-            592.5028160000445,
+            631.7539615678706,
             places=9,
         )
         self.assertAlmostEqual(
             float(profile.illumination.sum()),
-            0.13778851271845494,
+            0.1378213475719396,
             places=13,
         )
         self.assertAlmostEqual(
             float(profile.hit_fraction),
-            0.45300421317498346,
+            0.4591880175119899,
             places=14,
         )
 

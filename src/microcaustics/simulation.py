@@ -348,7 +348,7 @@ class MicrolensingSimulation:
         microlensing_only_source: PixelatedSource | None = None,
         band_batch_size: int | None = None,
         source_evolution: str = "exact",
-        response_delay_bin_days: float = 0.25,
+        response_delay_bin_days: float | None = None,
     ):
         """Stream a finite-source LC with aligned center-crossing labels."""
 
@@ -469,7 +469,7 @@ class MicrolensingSimulation:
         band_batch_size: int | None = None,
         microlensing_only_source: PixelatedSource | None = None,
         source_evolution: str = "exact",
-        response_delay_bin_days: float = 0.25,
+        response_delay_bin_days: float | None = None,
     ) -> LightCurve:
         """Stream dynamic maps directly into an arbitrary source light curve.
 
@@ -588,7 +588,7 @@ class MicrolensingSimulation:
         band_batch_size: int | None = None,
         microlensing_only_source: PixelatedSource | None = None,
         source_evolution: str = "exact",
-        response_delay_bin_days: float = 0.25,
+        response_delay_bin_days: float | None = None,
     ) -> LightCurve:
         """Combine sparse dynamic maps with a finer source/light-curve cadence.
 
@@ -676,7 +676,7 @@ class MicrolensingSimulation:
         microlensing_only_source: PixelatedSource | None = None,
         band_batch_size: int | None = None,
         source_evolution: str = "exact",
-        response_delay_bin_days: float = 0.25,
+        response_delay_bin_days: float | None = None,
     ):
         """Return fine-cadence flux with labels at the dynamic-map epochs.
 
@@ -744,6 +744,7 @@ class MicrolensingSimulation:
         map_observer=None,
         response_batch_size: int | None = None,
         response_spatial_chunk_size: int = 262_144,
+        native_delay_edges_days=None,
     ):
         """Stream dynamic maps into microlensing-weighted transfer functions.
 
@@ -770,4 +771,5 @@ class MicrolensingSimulation:
             map_observer=map_observer,
             response_batch_size=response_batch_size,
             response_spatial_chunk_size=response_spatial_chunk_size,
+            native_delay_edges_days=native_delay_edges_days,
         )

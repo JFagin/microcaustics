@@ -78,7 +78,7 @@ class LightCurveRequest:
     flux_cadence_days: float | None = None
     flux_times_days: Sequence[float] | torch.Tensor | None = None
     source_evolution: str = "exact"
-    response_delay_bin_days: float = 0.25
+    response_delay_bin_days: float | None = None
 
     def __post_init__(self) -> None:
         if self.flux_cadence_days is not None and self.flux_times_days is not None:
@@ -101,7 +101,7 @@ class LightCurveRequest:
                 "source_evolution must be 'exact', 'linear_response', "
                 "or 'quadratic_response'"
             )
-        if (
+        if self.response_delay_bin_days is not None and (
             not math.isfinite(self.response_delay_bin_days)
             or self.response_delay_bin_days <= 0
         ):
@@ -1259,10 +1259,11 @@ def _flexible_streaming_light_curves(
                     "source_batch_size": source_temporal_batches[index],
                     "source_evolution": request.source_evolution,
                     "response_delay_bin_days": (
-                        request.response_delay_bin_days
+                        response_plans[index].delay_bin_days
                         if response_plans[index] is not None
                         else None
                     ),
+                    **(response_plans[index].metadata() if response_plans[index] is not None else {}),
                     "band_batch_size": band_batch_size,
                     "map_aligned_source_fast_path": aligned[index],
                     "coherent_source_factorized": bool(

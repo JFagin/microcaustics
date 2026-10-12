@@ -87,6 +87,44 @@ def simulation() -> mc.MicrolensingSimulation:
 
 
 class TransferFunctionTests(unittest.TestCase):
+    def test_cdf_public_steady_and_microlensed_products(self):
+        native = torch.tensor([0.0, 1.0, 2.0], dtype=torch.float64)
+        output = torch.linspace(0.0, 2.0, 9, dtype=torch.float64)
+        original = mc.steady_transfer_function(ResponseSource(), native)
+        actual = mc.steady_transfer_function(
+            ResponseSource(), output, native_delay_edges_days=native
+        )
+        expected = mc.rebin_transfer_function(original, output)
+        torch.testing.assert_close(actual.values, expected.values)
+        torch.testing.assert_close(actual.mean_delays_days, original.mean_delays_days)
+        self.assertEqual(actual.metadata["mean_delay_method"], "native_bin_centers")
+
+        class DirectSource(ResponseSource):
+            @staticmethod
+            def mean_response_delays(**kwargs):
+                return torch.tensor([0.91, 1.09], dtype=torch.float64)
+
+        direct = mc.steady_transfer_function(
+            DirectSource(), output, native_delay_edges_days=native
+        )
+        torch.testing.assert_close(
+            direct.mean_delays_days, DirectSource.mean_response_delays()
+        )
+        magnification = mc.MagnificationMap(
+            torch.ones(5, 5, dtype=torch.float64),
+            mc.PlaneGrid((5, 5), (2.0, 2.0)),
+            method="test",
+        )
+        lensed = mc.microlensed_transfer_function(
+            DirectSource(),
+            magnification,
+            mc.LensingDistances(1e25, 2e25, 1e25),
+            output,
+            native_delay_edges_days=native,
+        )
+        torch.testing.assert_close(lensed.values, direct.values)
+        torch.testing.assert_close(lensed.mean_delays_days, direct.mean_delays_days)
+
     def test_steady_product_needs_no_microlensing_simulation(self) -> None:
         product = mc.steady_transfer_function(
             ResponseSource(),
@@ -104,7 +142,6 @@ class TransferFunctionTests(unittest.TestCase):
         product = mc.steady_transfer_function(ResponseSource(), [0.0, 1.0, 2.0])
         centers, density = mcp.transfer_response_density(
             product,
-            smoothing_sigma_days=0.25,
             include_zero_boundaries=True,
         )
         self.assertEqual(tuple(centers.shape), (4,))
@@ -207,6 +244,23 @@ class TransferFunctionTests(unittest.TestCase):
             sequential.mean_delays_days,
         )
         self.assertEqual(batched.metadata["response_batch_size"], 2)
+        output = torch.linspace(0.0, 2.0, 17, dtype=torch.float64)
+        native = common["delay_edges_days"]
+        cdf_args = {
+            **common,
+            "delay_edges_days": output,
+            "native_delay_edges_days": native,
+        }
+        cdf_batch = mc.streaming_microlensed_transfer_functions(
+            **cdf_args, response_batch_size=2
+        )
+        cdf_single = mc.streaming_microlensed_transfer_functions(
+            **cdf_args, response_batch_size=1
+        )
+        expected = mc.rebin_transfer_function(batched, output)
+        torch.testing.assert_close(cdf_batch.values, expected.values)
+        torch.testing.assert_close(cdf_batch.values, cdf_single.values)
+        torch.testing.assert_close(cdf_batch.mean_delays_days, batched.mean_delays_days)
 
 
 if __name__ == "__main__":

@@ -61,9 +61,7 @@ def test_compile_warning_can_be_disabled() -> None:
         warnings.simplefilter("always")
         run_tensor_kernel(runtime, "quiet kernel", kernel, torch.tensor(1.0))
 
-    assert not any(
-        issubclass(item.category, mc.CompilationWarning) for item in caught
-    )
+    assert not any(issubclass(item.category, mc.CompilationWarning) for item in caught)
 
 
 def test_fixed_and_dynamic_shape_kernels_have_separate_compiled_wrappers() -> None:
@@ -105,9 +103,7 @@ def test_fixed_shape_compilation_warns_on_new_shapes() -> None:
             run_tensor_kernel(
                 runtime, "fixed shape test", kernel, torch.ones(length), dynamic=False
             )
-    assert sum(
-        issubclass(item.category, mc.CompilationWarning) for item in caught
-    ) == 2
+    assert sum(issubclass(item.category, mc.CompilationWarning) for item in caught) == 2
 
 
 def test_compilation_warning_category_supports_standard_filters() -> None:
@@ -125,3 +121,19 @@ def test_compilation_warning_category_supports_standard_filters() -> None:
         run_tensor_kernel(runtime, "filtered kernel", kernel, torch.tensor(1.0))
 
     assert caught == []
+
+
+def test_nested_tensor_signatures_never_read_tensor_values() -> None:
+    from microcaustics.compile import _argument_signature
+
+    a, b = torch.ones(3), torch.zeros(3)
+    with patch.object(
+        torch.Tensor, "__repr__", side_effect=AssertionError("host read")
+    ):
+        first = _argument_signature(([a, (a, {"grid": a})],), include_shape=True)
+        second = _argument_signature(([b, (b, {"grid": b})],), include_shape=True)
+        changed = _argument_signature(
+            ([torch.ones(4), (b, {"grid": b})],), include_shape=True
+        )
+    assert first == second
+    assert first != changed

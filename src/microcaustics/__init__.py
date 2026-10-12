@@ -112,6 +112,7 @@ from .rendering import (
     caustics_pixelated_sources,
     gaussian_psf_kernel,
 )
+from .response_rebin import CDFResponseRebinner
 from .results import (
     AnchorGaugeLabels,
     CausticField,
@@ -205,6 +206,7 @@ from .transfer_functions import (
     microlensed_mean_response_delays,
     microlensed_mean_response_delays_batch,
     microlensed_transfer_function,
+    rebin_transfer_function,
     steady_mean_response_delays,
     steady_transfer_function,
     streaming_microlensed_transfer_functions,
@@ -382,6 +384,8 @@ __all__ = [
     "streaming_light_curves",
     "streaming_microlensed_transfer_functions",
     "steady_transfer_function",
+    "rebin_transfer_function",
+    "CDFResponseRebinner",
     "steady_mean_response_delays",
     "trace_primary_equatorial",
     "trace_axis_lamppost",

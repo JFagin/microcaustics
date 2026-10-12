@@ -13,9 +13,7 @@ from .runtime import ResolvedRuntime, warn_backend_fallback, warn_compilation
 _COMPILED_KERNELS: dict[
     tuple[Callable[..., Any], str | None, bool], Callable[..., Any]
 ] = {}
-_DISABLED_KERNELS: dict[
-    tuple[Callable[..., Any], str, str, str | None, bool], str
-] = {}
+_DISABLED_KERNELS: dict[tuple[Callable[..., Any], str, str, str | None, bool], str] = {}
 _PREPARED_SPECIALIZATIONS: set[tuple[object, ...]] = set()
 
 
@@ -29,6 +27,24 @@ def _argument_signature(args, *, include_shape: bool = False) -> tuple[object, .
                     str(value.device),
                     str(value.dtype),
                     tuple(value.shape) if include_shape else value.ndim,
+                )
+            )
+        elif isinstance(value, (tuple, list)):
+            # Never repr a container of GPU tensors. Tensor repr reads values
+            # back to the host and synchronizes the stream on every dispatch.
+            signature.append(
+                (
+                    type(value).__qualname__,
+                    _argument_signature(value, include_shape=include_shape),
+                )
+            )
+        elif isinstance(value, dict):
+            signature.append(
+                (
+                    "dict",
+                    _argument_signature(
+                        tuple(value.items()), include_shape=include_shape
+                    ),
                 )
             )
         else:

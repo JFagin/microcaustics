@@ -366,7 +366,7 @@ class MicrolensingRealization:
         include_microlensing_only=False,
         band_batch_size=None,
         source_evolution="exact",
-        response_delay_bin_days=0.25,
+        response_delay_bin_days=None,
     ):
         """Resolve geometry and observers once for all four photometry schedulers."""
 
@@ -454,7 +454,7 @@ class MicrolensingRealization:
         spectrum_wavelengths=None,
         host_lensing: str = "omit",
         source_evolution: str = "exact",
-        response_delay_bin_days: float = 0.25,
+        response_delay_bin_days: float | None = None,
     ) -> LightCurve:
         """Generate a finite-source light curve for this realization."""
 
@@ -767,7 +767,7 @@ class MicrolensingRealization:
         spectrum_wavelengths=None,
         host_lensing: str = "omit",
         source_evolution: str = "exact",
-        response_delay_bin_days: float = 0.25,
+        response_delay_bin_days: float | None = None,
     ) -> LightCurve:
         """Use sparse dynamic maps with independently sampled source evolution."""
 
@@ -878,7 +878,7 @@ class MicrolensingRealization:
         include_microlensing_only: bool = False,
         band_batch_size: int | None = None,
         source_evolution: str = "exact",
-        response_delay_bin_days: float = 0.25,
+        response_delay_bin_days: float | None = None,
     ):
         """Return fine-cadence flux and labels at the sparse map epochs."""
 
@@ -919,7 +919,7 @@ class MicrolensingRealization:
         include_microlensing_only: bool = False,
         band_batch_size: int | None = None,
         source_evolution: str = "exact",
-        response_delay_bin_days: float = 0.25,
+        response_delay_bin_days: float | None = None,
     ):
         """Generate a light curve with aligned source-center caustic labels."""
 
@@ -985,6 +985,7 @@ class MicrolensingRealization:
         source=None,
         driver_amplitude: float = 1.0,
         normalize: bool = True,
+        native_delay_edges_days=None,
     ):
         """Return an unlensed response function without constructing a map."""
 
@@ -998,6 +999,8 @@ class MicrolensingRealization:
             delay_edges_days,
             driver_amplitude=driver_amplitude,
             normalize=normalize,
+            native_delay_edges_days=native_delay_edges_days,
+            runtime=self.simulation.runtime,
         )
 
     def transfer_functions(
@@ -1015,6 +1018,7 @@ class MicrolensingRealization:
         map_observer=None,
         response_batch_size: int | None = None,
         response_spatial_chunk_size: int = 262_144,
+        native_delay_edges_days=None,
     ):
         """Stream dynamic maps into microlensed response functions."""
 
@@ -1046,6 +1050,7 @@ class MicrolensingRealization:
             map_observer=map_observer,
             response_batch_size=response_batch_size,
             response_spatial_chunk_size=response_spatial_chunk_size,
+            native_delay_edges_days=native_delay_edges_days,
         )
 
     def _trajectory_in_local_frame(
@@ -2109,7 +2114,7 @@ class MicrolensingSystem:
         spectrum_wavelengths=None,
         host_lensing: str = "omit",
         source_evolution: str = "exact",
-        response_delay_bin_days: float = 0.25,
+        response_delay_bin_days: float | None = None,
         start_day: float = 0.0,
         **kwargs,
     ) -> LightCurve:
@@ -2151,7 +2156,7 @@ class MicrolensingSystem:
                 "source_evolution must be 'exact', 'linear_response', "
                 "or 'quadratic_response'"
             )
-        if not math.isfinite(response_delay_bin_days) or response_delay_bin_days <= 0:
+        if response_delay_bin_days is not None and (not math.isfinite(response_delay_bin_days) or response_delay_bin_days <= 0):
             raise ValueError("response_delay_bin_days must be finite and positive")
 
         map_times, flux_times = _light_curve_times(

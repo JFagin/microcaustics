@@ -157,6 +157,11 @@ class RuntimeConfig:
         Compile the delay-response map projection for fixed tensor shapes.
         Enabled by default. New valid-pixel counts or delay-bin counts can
         recompile; set false for heterogeneous source populations.
+    response_reconstruction:
+        "cdf" (default) shares conservative CDF/PCHIP kernels between thermal
+        transfer products and linear/quadratic response light curves.
+        "ordinary" retains direct transfer histograms and two-node response
+        deposition. Neither setting changes exact nonlinear source evolution.
     profiling:
         ``"off"`` avoids timing-only accelerator barriers. ``"total"``
         synchronizes only around complete public calculations.
@@ -172,6 +177,7 @@ class RuntimeConfig:
     warn_on_compile: bool = True
     thermal_flux_block_pixels: int | None = None
     static_response_projection: bool = True
+    response_reconstruction: str = "cdf"
     profiling: ProfilingLevel | str = ProfilingLevel.OFF
 
     def __post_init__(self) -> None:
@@ -195,6 +201,8 @@ class RuntimeConfig:
             )
         if not isinstance(self.static_response_projection, bool):
             raise ValueError("static_response_projection must be a boolean")
+        if self.response_reconstruction not in {"cdf", "ordinary"}:
+            raise ValueError("response_reconstruction must be 'cdf' or 'ordinary'")
         object.__setattr__(self, "backend", backend)
         object.__setattr__(self, "dtype", dtype)
         object.__setattr__(self, "profiling", profiling)

@@ -1,5 +1,6 @@
 """Optimized spectral contractions preserve dense photometry and driver semantics."""
 
+import inspect
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from microcaustics.photometry import (
 )
 from microcaustics.sources.linear_response import (
     LinearResponsePlan,
+    OrdinaryResponsePlan,
     _project_response_chunk,
 )
 from microcaustics.sources.transferred_disk import (
@@ -572,6 +574,45 @@ def test_linear_response_rejects_moving_source_and_invalid_mode():
         )
 
 
+def test_response_delay_default_is_consistent_across_api_layers():
+    from microcaustics.system import MicrolensingRealization
+
+    assert mc.LightCurveRequest().response_delay_bin_days is None
+    assert mc.LightCurveRequest().source_evolution == "exact"
+    for cls in (mc.MicrolensingSystem, MicrolensingRealization, mc.MicrolensingSimulation):
+        checked = 0
+        for _, method in inspect.getmembers(cls, inspect.isfunction):
+            parameters = inspect.signature(method).parameters
+            if "response_delay_bin_days" in parameters:
+                assert parameters["response_delay_bin_days"].default is None
+                assert parameters["source_evolution"].default == "exact"
+                checked += 1
+        assert checked > 0
+
+
+@pytest.mark.parametrize("mode", ["linear_response", "quadratic_response"])
+def test_response_default_matches_explicit_selected_cdf_bins(mode):
+    source, distances, maps, runtime = thermal_fixture()
+    times = torch.tensor([0.0, 0.37, 1.13, 2.0], dtype=torch.float64)
+
+    def evaluate(**options):
+        (curve,) = _flexible_streaming_light_curves(
+            SimpleNamespace(runtime=runtime), None, maps[0].grid,
+            [0.0, 1.0, 2.0],
+            (mc.LightCurveRequest(source, distances, source_evolution=mode, **options),),
+            (times,), method=None, schedule=None, map_observer=None,
+            band_batch_size=2, map_iterator=iter(maps),
+        )
+        return curve
+
+    default = evaluate()
+    explicit = evaluate(response_delay_bin_days=default.metadata["response_delay_bin_days"])
+    torch.testing.assert_close(default.flux, explicit.flux, rtol=0, atol=0)
+    torch.testing.assert_close(default.unlensed_flux, explicit.unlensed_flux, rtol=0, atol=0)
+    assert default.metadata["response_reconstruction"] == "cdf_pchip"
+    assert evaluate(response_delay_bin_days=0.25).metadata["response_delay_bin_days"] == 0.25
+
+
 def test_linear_response_respects_macroimage_arrival_shift():
     source, distances, maps, runtime = thermal_fixture()
     source = replace(
@@ -601,25 +642,31 @@ def test_linear_response_respects_macroimage_arrival_shift():
     )
 
 
-def test_linear_response_delay_deposition_preserves_mean_lag():
+@pytest.mark.parametrize("order", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_linear_response_delay_deposition_preserves_mean_lag(order, dtype):
     source, _, maps, _ = thermal_fixture()
-    times = torch.tensor([0.0, 1.0], dtype=torch.float64)
+    times = torch.tensor([0.0, 1.0], dtype=dtype)
     with torch.no_grad():
-        plan = LinearResponsePlan(
+        plan = OrdinaryResponsePlan(
             source, ((source, len(source.geometry.band_names)),),
-            times, delay_bin_days=0.11,
+            times, delay_bin_days=0.11, response_order=order,
         )
-        _, kernel, _ = plan.project_map(maps[1].values)
-        weights = source.linear_response_weights(dtype=torch.float64)
-        weighted = weights * maps[1].values[..., None]
+        _, kernel, quadratic = plan.project_map(maps[1].values.to(dtype))
+        weights = source.linear_response_weights(dtype=dtype)
+        if order == 2:
+            kernel = torch.cat((kernel, quadratic), dim=1)
+            weights = torch.cat((weights, source.quadratic_response_weights(dtype=dtype)), dim=-1)
+        weighted = weights * maps[1].values.to(dtype)[..., None]
         true_mass = weighted.sum(dim=(0, 1))
         true_first_moment = (
-            weighted * source.delay_days[..., None]
+            weighted * source.delay_days.to(dtype)[..., None]
         ).sum(dim=(0, 1))
-    torch.testing.assert_close(kernel.sum(dim=0), true_mass, rtol=1e-12, atol=0)
+    tolerance = 2e-6 if dtype == torch.float32 else 1e-12
+    torch.testing.assert_close(kernel.sum(dim=0), true_mass, rtol=tolerance, atol=0)
     torch.testing.assert_close(
         (kernel * plan.delay_centers_days[:, None]).sum(dim=0),
-        true_first_moment, rtol=1e-12, atol=0,
+        true_first_moment, rtol=tolerance, atol=0,
     )
 
 
@@ -657,7 +704,7 @@ def test_response_projection_shape_setting_preserves_flux(static_shapes):
             static_response_projection=static_shapes,
         )
     )
-    plan = LinearResponsePlan(
+    plan = OrdinaryResponsePlan(
         source, ((source, len(source.geometry.band_names)),), times,
         delay_bin_days=0.2, response_order=2, runtime=runtime,
     )

@@ -223,6 +223,7 @@ class ResolvedRuntime:
     profiling: ProfilingLevel
     capabilities: RuntimeCapabilities
     fallback_reason: str | None = None
+    response_reconstruction: str = "cdf"
 
     @property
     def available_memory_bytes(self) -> int | None:
@@ -397,6 +398,7 @@ def resolve_runtime(
         warn_on_compile=bool(config.warn_on_compile),
         thermal_flux_block_pixels=config.thermal_flux_block_pixels,
         static_response_projection=config.static_response_projection,
+        response_reconstruction=config.response_reconstruction,
         profiling=config.profiling,
         capabilities=capabilities,
         fallback_reason=reason,

@@ -67,6 +67,7 @@ def _quadratic_response_weight_kernel(
     color,
     pixel_area,
     driver_amplitude,
+    quadratic=True,
 ):
     """Share the temperature and Planck evaluation between both derivatives."""
 
@@ -96,6 +97,8 @@ def _quadratic_response_weight_kernel(
         / pixel_area
     )
     first = torch.where(hit[..., None] & torch.isfinite(first), first, 0.0)
+    if not quadratic:
+        return first, None
     second = (
         first
         * (response / (4.0 * total4))[..., None]
@@ -173,6 +176,12 @@ class ThermalReprocessingSource:
         compare=False,
     )
     _evaluation_cache: dict = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _cdf_response_cache: dict = field(
         default_factory=dict,
         init=False,
         repr=False,
@@ -873,8 +882,29 @@ class ThermalReprocessingSource:
         magnification: torch.Tensor | None = None,
         driver_amplitude: float = 1.0,
         normalize: bool = True,
+        reconstruction: str | None = None,
+        native_delay_bin_days: float | None = None,
     ) -> torch.Tensor:
-        """Bin linear response mass by delay, returning ``[delay, band]``."""
+        """Return response mass per output bin, using CDF/PCHIP by default.
+
+        The native grid is independent of the output spacing. Full-support
+        normalization precedes cropping. Use ``reconstruction="ordinary"``
+        for the original histogram and its in-range normalization.
+        """
+
+        reconstruction = reconstruction or getattr(
+            self._runtime, "response_reconstruction", "cdf"
+        )
+        if reconstruction not in {"cdf", "ordinary"}:
+            raise ValueError("reconstruction must be 'cdf' or 'ordinary'")
+        if reconstruction == "cdf":
+            return self._cdf_transfer_functions(
+                delay_edges_days,
+                magnification=magnification,
+                driver_amplitude=driver_amplitude,
+                normalize=normalize,
+                native_delay_bin_days=native_delay_bin_days,
+            )[0]
 
         weights = self.linear_response_weights(
             driver_amplitude=driver_amplitude,
@@ -924,17 +954,40 @@ class ThermalReprocessingSource:
         driver_amplitude: float = 1.0,
         normalize: bool = True,
         spatial_chunk_size: int = 262_144,
+        reconstruction: str | None = None,
+        native_delay_bin_days: float | None = None,
     ) -> torch.Tensor:
         """Bin several magnification-weighted responses in bounded chunks.
 
         ``magnification`` has shape ``[batch, y, x]``. Source-dependent
-        response weights and delay-bin assignments are constructed once, and
-        the spatial chunk bounds the temporary ``[batch, pixel, band]``
-        product independently of temporal batch size.
+        response weights and delay-bin assignments are constructed once.
+        CDF processes one map at a time with a bounded ``[pixel, band]``
+        temporary. Ordinary deposition bounds a ``[batch, pixel, band]``
+        temporary with the same spatial chunk control.
         """
 
         if spatial_chunk_size < 1:
             raise ValueError("spatial_chunk_size must be positive")
+        reconstruction = reconstruction or getattr(
+            self._runtime, "response_reconstruction", "cdf"
+        )
+        if reconstruction not in {"cdf", "ordinary"}:
+            raise ValueError("reconstruction must be 'cdf' or 'ordinary'")
+        if reconstruction == "cdf":
+            magnification = torch.as_tensor(magnification)
+            if (
+                magnification.ndim != 3
+                or magnification.shape[1:] != self.geometry.shape
+            ):
+                raise ValueError("magnification must have shape [batch, y, x]")
+            return self._cdf_transfer_functions(
+                delay_edges_days,
+                magnification=magnification,
+                driver_amplitude=driver_amplitude,
+                normalize=normalize,
+                native_delay_bin_days=native_delay_bin_days,
+                spatial_chunk_size=spatial_chunk_size,
+            )
         weights = self.linear_response_weights(
             driver_amplitude=driver_amplitude,
             normalize=False,
@@ -987,6 +1040,97 @@ class ThermalReprocessingSource:
                 torch.finfo(output.dtype).tiny
             )
         return output
+
+    def _cdf_transfer_functions(
+        self,
+        edges,
+        *,
+        magnification,
+        driver_amplitude,
+        normalize,
+        native_delay_bin_days,
+        spatial_chunk_size=262_144,
+    ):
+        from .._response_cdf import (
+            NativeCDFGrid,
+            pixel_delay_scale,
+            rebin_coefficients,
+            signal_cadence,
+        )
+        from ..response_rebin import CDFResponseRebinner
+
+        weights = self.linear_response_weights(
+            driver_amplitude=driver_amplitude, normalize=False
+        )
+        delay = self.delay_days.to(weights)
+        key = (
+            float(driver_amplitude),
+            native_delay_bin_days,
+            weights.device,
+            weights.dtype,
+            weights.data_ptr(),
+            None if weights.is_inference() else weights._version,
+            delay.data_ptr(),
+            None if delay.is_inference() else delay._version,
+        )
+        cacheable = not (weights.requires_grad or delay.requires_grad)
+        entry = self._cdf_response_cache.get(key) if cacheable else None
+        if entry is None:
+            valid = self.transfer.hit.to(weights.device) & torch.isfinite(delay)
+            positions = torch.nonzero(valid.flatten()).flatten()
+            selected = weights.reshape(-1, weights.shape[-1])[positions]
+            scale = selected.sum(0).clamp_min(torch.finfo(weights.dtype).tiny)
+            selected = selected / scale
+            grid = NativeCDFGrid(
+                delay.flatten()[positions],
+                [selected],
+                step=native_delay_bin_days,
+                cadence=signal_cadence(self.signal, weights),
+                runtime=self._runtime,
+                pixel_delay_days=pixel_delay_scale(self),
+            )
+            ready = None
+            if weights.device.type == "cuda":
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(weights.device))
+            entry = positions, selected, scale, grid, ready
+            if cacheable:
+                if len(self._cdf_response_cache) >= 4:
+                    self._cdf_response_cache.clear()
+                self._cdf_response_cache[key] = entry
+        positions, selected, scale, grid, ready = entry
+        if ready is not None:
+            torch.cuda.current_stream(weights.device).wait_event(ready)
+        if magnification is None:
+            samples = torch.ones_like(delay).reshape(1, -1)[:, positions]
+        else:
+            magnification = torch.as_tensor(
+                magnification, device=weights.device, dtype=weights.dtype
+            )
+            if magnification.ndim == 2:
+                magnification = magnification[None]
+            if (
+                magnification.ndim != 3
+                or magnification.shape[1:] != self.geometry.shape
+            ):
+                raise ValueError("magnification must match the source geometry")
+            if not bool(
+                torch.isfinite(magnification).all() & (magnification >= 0).all()
+            ):
+                raise ValueError("magnification must be finite and nonnegative")
+            samples = magnification.reshape(len(magnification), -1)[:, positions]
+        rebin = CDFResponseRebinner(grid.edges, edges, runtime=self._runtime)
+        output = []
+        for sample in samples:
+            coeff = grid.project_response(sample, selected, spatial_chunk_size)
+            if normalize:
+                coeff = coeff / coeff[: grid.count].sum(0).clamp_min(
+                    torch.finfo(coeff.dtype).tiny
+                )
+            else:
+                coeff = coeff * scale
+            output.append(rebin_coefficients(coeff, rebin).clamp_min(0))
+        return torch.stack(output)
 
     def metadata(self) -> Mapping[str, object]:
         """Return source, driver, and transfer provenance without map arrays."""

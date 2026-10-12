@@ -747,7 +747,6 @@ The main accuracy and throughput controls in the example are listed below.
 | `source_setup_batch_size` | Number of compatible Kerr disks sharing fixed-shape observer-delay launches |
 | `cell_chunk_size` | Maximum spatial work chunk before automatic memory backoff |
 | `caustic_grid_shape` | Resolution of determinant, critical-curve, and source-center-label products |
-| `discovery_downsample_ratio` | Coarsening of the critical-curve discovery grid before sparse full-resolution determinant evaluation |
 
 The production far-field configuration uses a `16 x 16` partition to decide
 which stars are evaluated exactly. Each partition cell contains an `8 x 8`
@@ -905,9 +904,11 @@ Contributors include the following authors.
 - [James Hung-Hsu Chan](https://orcid.org/0000-0001-8797-725X)
 - [Sophia Miskiewicz](https://orcid.org/0000-0003-0631-9701)
 - [Henry Best](https://orcid.org/0009-0009-6932-6379)
+- [Paras Sharma](https://orcid.org/0000-0002-6909-205X)
 - [Matthew O'Dowd](https://orcid.org/0009-0000-4476-5003)
 - [Laurence Perreault-Levasseur](https://orcid.org/0000-0003-3544-3939)
 - [Yashar Hezaveh](https://orcid.org/0000-0002-8669-5733)
+- [Simon Birrer](https://orcid.org/0000-0003-3195-5507)
 
 ## Selected scientific references
 

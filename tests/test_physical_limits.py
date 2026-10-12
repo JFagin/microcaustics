@@ -190,6 +190,11 @@ class TransferFunctionLimitTests(unittest.TestCase):
             257,
             dtype=dtype,
         )
+        ordinary = source.transfer_function(edges, reconstruction="ordinary")
+        self.assertAlmostEqual(float(ordinary[:, 0].sum()), 1.0, places=14)
+        # The native CDF bins can extend beyond the extreme pixel delays.
+        # Include their complete support, rather than cropping boundary bins.
+        edges = torch.linspace(0.0, float(maximum_delay) + 0.25, 1025, dtype=dtype)
         product = mc.steady_transfer_function(source, edges)
 
         magnifications = torch.stack(
@@ -221,8 +226,8 @@ class TransferFunctionLimitTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(product.values[:, 0].sum()), 1.0, places=14)
         nonzero = torch.nonzero(product.values[:, 0] > 0.0).reshape(-1)
-        self.assertEqual(int(nonzero[0]), 0)
-        self.assertEqual(int(nonzero[-1]), product.values.shape[0] - 1)
+        self.assertGreaterEqual(float(edges[nonzero[0]]), float(minimum_delay) - 0.25)
+        self.assertLessEqual(float(edges[nonzero[-1] + 1]), float(maximum_delay) + 0.25)
 
         weights = source.linear_response_weights(dtype=dtype)[..., 0]
         direct_mean = (weights[hit] * analytic_delay[hit]).sum() / weights[hit].sum()
