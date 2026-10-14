@@ -20,7 +20,6 @@ from .taylor import (
     translate_complex_taylor,
 )
 
-
 # Temporary-memory budget for one gathered far-field query chunk on
 # accelerators without Triton, whose fused kernels never gather.
 _PORTABLE_QUERY_BYTES = 256 * 1024**2
