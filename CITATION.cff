@@ -22,9 +22,11 @@ keywords:
 preferred-citation:
   type: article
   title: >-
-    Microcaustics: a Fast GPU-Accelerated Dynamical Microlensing Simulator
-    for the LSST Era
+    Microcaustics: Fast GPU-Accelerated Dynamical Microlensing of
+    Time-Dependent Extended Sources
   year: 2026
+  journal: arXiv e-prints
+  url: https://arxiv.org/abs/2610.19703
   authors:
     - family-names: Fagin
       given-names: Joshua
@@ -41,6 +43,9 @@ preferred-citation:
     - family-names: Best
       given-names: Henry
       orcid: https://orcid.org/0009-0009-6932-6379
+    - family-names: Sharma
+      given-names: Paras
+      orcid: https://orcid.org/0000-0002-6909-205X
     - family-names: O'Dowd
       given-names: Matthew
       orcid: https://orcid.org/0009-0000-4476-5003
@@ -50,3 +55,6 @@ preferred-citation:
     - family-names: Hezaveh
       given-names: Yashar
       orcid: https://orcid.org/0000-0002-8669-5733
+    - family-names: Birrer
+      given-names: Simon
+      orcid: https://orcid.org/0000-0003-3195-5507

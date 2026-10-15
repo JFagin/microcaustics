@@ -884,15 +884,36 @@ maps are optional diagnostics. Center-only queries do not materialize them.
 
 ## Citation
 
-If `microcaustics` contributes to published work, please cite the accompanying
-methods paper rather than the GitHub repository. The DOI and publication
-details will be added after publication.
+If you use `microcaustics` in published work, please cite Fagin et al. (2026),
+[*Microcaustics: Fast GPU-Accelerated Dynamical Microlensing of Time-Dependent Extended Sources*](https://arxiv.org/abs/2610.19703).
+
+<details>
+<summary>BibTeX</summary>
+
+```bibtex
+@article{Fagin2026Microcaustics,
+  author = {Fagin, Joshua and Stone, Connor and Chan, James Hung-Hsu
+            and Miskiewicz, Sophia and Best, Henry and Sharma, Paras
+            and O'Dowd, Matthew and Perreault-Levasseur, Laurence
+            and Hezaveh, Yashar and Birrer, Simon},
+  title = {{Microcaustics: Fast GPU-Accelerated Dynamical Microlensing
+            of Time-Dependent Extended Sources}},
+  journal = {arXiv e-prints},
+  year = {2026},
+  pages = {arXiv:2610.19703},
+  archivePrefix = {arXiv},
+  eprint = {2610.19703},
+  url = {https://arxiv.org/abs/2610.19703}
+}
+```
+
+</details>
 
 Questions, bug reports, and collaboration inquiries may be sent to Joshua
 Fagin at [faginjoshua@gmail.com](mailto:faginjoshua@gmail.com) or opened as a
 GitHub issue.
 
-## Author
+## Authors and contributions
 
 `microcaustics` was created and is maintained by
 [Joshua Fagin](https://orcid.org/0000-0001-8723-6136). He can be reached at
@@ -900,15 +921,23 @@ GitHub issue.
 
 Contributors include the following authors.
 
-- [Connor Stone](https://orcid.org/0000-0002-9086-6398)
-- [James Hung-Hsu Chan](https://orcid.org/0000-0001-8797-725X)
-- [Sophia Miskiewicz](https://orcid.org/0000-0003-0631-9701)
-- [Henry Best](https://orcid.org/0009-0009-6932-6379)
-- [Paras Sharma](https://orcid.org/0000-0002-6909-205X)
+- [Connor Stone](https://orcid.org/0000-0002-9086-6398) played a key role in developing the microlensing simulator.
+- [James Hung-Hsu Chan](https://orcid.org/0000-0001-8797-725X) played a key role in developing the stellar dynamics model.
+- [Sophia Miskiewicz](https://orcid.org/0000-0003-0631-9701) contributed to bug fixing.
+- [Henry Best](https://orcid.org/0009-0009-6932-6379) contributed to the relativistic quasar source model.
+- [Paras Sharma](https://orcid.org/0000-0002-6909-205X) contributed to bug fixing.
 - [Matthew O'Dowd](https://orcid.org/0009-0000-4476-5003)
 - [Laurence Perreault-Levasseur](https://orcid.org/0000-0003-3544-3939)
 - [Yashar Hezaveh](https://orcid.org/0000-0002-8669-5733)
 - [Simon Birrer](https://orcid.org/0000-0003-3195-5507)
+
+## Acknowledgments
+
+Microcaustics is a product of the FutureLens collaboration, funded by Schmidt
+Sciences, LLC.
+
+OpenAI Codex assisted with code development. The authors reviewed the resulting
+code and take responsibility for the package.
 
 ## Selected scientific references
 
