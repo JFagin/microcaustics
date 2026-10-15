@@ -6,7 +6,7 @@ chunk tuning comes last because it changes throughput, not the calculation.
 ## Map-only calculations
 
 - Use `IRSConfig(sampling="cartesian")` for deterministic Cartesian inverse ray
-  shooting. This is the package default.
+  shooting. This is the default sampling rule for `IRSConfig`.
 - Use `IRSConfig(sampling="random", seed=...)` for a conventional Monte Carlo
   inverse-ray-shooting control. The fixed seed preserves the same ray sample
   across dynamic frames and prevents shot noise from producing artificial
@@ -17,8 +17,8 @@ chunk tuning comes last because it changes throughput, not the calculation.
   small fraction of the mapped lens plane. Validate representative frames
   against full-field IPM before adopting aggressive scout settings.
 - For one independent static tiled map, start with `k=1`. For a dynamic
-  sequence, `k=2` plus the one-time dual-scout scalar repair can amortize the
-  conservative `k=1` normalization across all epochs.
+  sequence, `k=2` uses the denser `k=1` scout at the first epoch to estimate
+  a uniform normalization correction for subsequent maps.
 
 IRS and IPM return absolute, source-independent magnification maps on the same
 `PlaneGrid`. A source is required only for finite-source photometry.

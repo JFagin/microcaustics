@@ -1,12 +1,13 @@
 # Timing conventions
 
-Every accelerated result distinguishes three costs:
+Report these three costs separately when timing accelerated calculations:
 
 - **Compile time.** One-time graph or kernel compilation for a new shape.
 - **Warmup time.** Untimed calls used to populate caches and stabilize memory.
 - **Steady-state time.** Delivered runtime after compilation and warmup.
 
-Timing-only accelerator synchronization is disabled by default. Set
+GPU work can finish after the Python call returns, so timing it requires
+waiting for the device. Extra synchronization for timing is disabled by default. Set
 `RuntimeConfig(profiling="total")` for synchronized end-to-end time, or
 `profiling="detailed"` for component timing and peak-memory diagnostics.
 `TimingBreakdown.collected` records whether its numeric fields are valid.

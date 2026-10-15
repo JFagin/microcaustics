@@ -139,8 +139,8 @@ disk = mc.ThinDiskModel(
 The optional `name` and `metadata()` members are recorded in the resolved
 source metadata for reproducibility. They are not required for evaluation.
 The existing `temperature_slope_beta` remains a separate radial-temperature
-tilt whose normalization preserves the selected profile's bolometric viscous
-power.
+tilt whose normalization preserves the disk-area integral of the local viscous
+flux, as defined in the methods paper.
 
 Omit `driving_signal` for a static relativistic disk. Use
 `disk.with_driving_signal(signal)` to retain every other choice. Resolution,
@@ -189,7 +189,7 @@ The lower-level observer-transfer components remain public for inspecting the
 trace, importing an external transfer, or developing a different illumination
 model. The next section documents that advanced interface.
 
-## Observer-transfer contract
+## Observer-transfer data
 
 `ObserverTransfer` separates photon propagation from emission physics. It
 stores package-standard `[y, x]` maps of emission radius, frequency shift,
@@ -334,7 +334,7 @@ same compiled callables. A failed compiler toolchain falls back to eager Torch
 unless strict runtime behavior or `fallback_to_eager=False` is requested.
 
 Compilation warnings are enabled by default. Set `warn_on_compile=False` on
-`KerrDiskModel` or the low-level solvers to suppress them; a runtime with
+`KerrDiskModel` or the low-level solvers to suppress them. A runtime with
 `RuntimeConfig(warn_on_compile=False)` also suppresses compilation warnings
 during high-level Kerr source construction.
 
@@ -356,7 +356,7 @@ union and integrated flux ratios within `4e-7` of unity.
 On CUDA float32, finite-observer travel time uses the paper's compiled analytic
 radial and polar endpoint solver. Hit rays are evaluated in fixed, padded
 chunks so different disk parameters and a short final chunk reuse the same
-compiled shape. `observer_coordinate_chunk_size=524_288` is the default; it is
+compiled shape. `observer_coordinate_chunk_size=524_288` is the default. It is
 user configurable and automatically halved and remembered if a CUDA
 out-of-memory error occurs. A compact float64 CPU queue repairs the small
 non-four-real-root or ill-conditioned complement without rerunning the dense
@@ -364,7 +364,7 @@ GPU calculation. Passing `coordinate_dtype=torch.float64` to the low-level
 function selects the eager quadrature reference instead.
 
 CPU and Apple execution cap the effective quadrature chunk at 65,536 rays to
-avoid materializing an unnecessarily large integration-node workspace; the
+avoid allocating unnecessarily large arrays of integration nodes. The
 requested and effective sizes are both recorded in transfer metadata.
 
 An axisymmetric disk does not consume emission azimuth, so `KerrDiskModel`
@@ -383,10 +383,13 @@ frequency shift.
 
 ## Transfer-function delay reconstruction
 
-Transfer functions store response **mass per delay bin**. The plotting helper
+Transfer functions store the integrated response in each delay bin, called
+the bin's response mass. The plotting helper
 only divides by bin widths. It never applies a Gaussian filter. Thermal disks
-use fine fractional delay deposition and average PCHIP reconstructions of four
-shifted CDF grids by default. They integrate the resulting polynomials over
+split each pixel's response between neighboring fine delay samples. By default,
+they reconstruct a cumulative distribution function (CDF) with piecewise cubic
+Hermite interpolation (PCHIP) and average four shifted grids. They integrate the
+resulting polynomials over
 the requested output bins, independently of the reconstruction spacing.
 An explicit single-grid reconstruction remains available:
 
@@ -424,9 +427,10 @@ excluded response mass without renormalization. Its stored mean still refers
 to the original response, not the cropped curve. Low-level repeated workloads
 can cache `mc.CDFResponseRebinner(native_edges, output_edges, runtime=runtime)`
 and call it on tensors shaped `[delay, band]` or `[batch, delay, band]`.
-The tensor hot path stays on the input device and dtype. CUDA defaults to a
-cached compiled specialization. Use `validate=False` only for already validated
-nonnegative finite masses to skip a repeated GPU-to-host validation barrier.
+The repeated calculation keeps arrays on their input device and at their input
+precision. CUDA reuses a compiled kernel. Use `validate=False` only for already
+validated nonnegative finite masses to avoid repeating validation that requires
+GPU-to-CPU synchronization.
 Grid validation and interval construction occur once when the plan is built.
 
 Local Hermite differences preserve weak tails without subtracting two global

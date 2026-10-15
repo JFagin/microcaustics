@@ -34,7 +34,7 @@ Omitting the switch uses the source's driver when one is configured. Disabling t
 disable other evolution such as photospheric expansion. Custom multiplicative
 drivers use unit baseline unless their metadata supplies `mean_amplitude`.
 To obtain both products in one map calculation, set
-`include_microlensing_only=True`; the comparison is returned as
+`include_microlensing_only=True`. The comparison is returned as
 `curve.microlensing_only_flux` and `curve.microlensing_only_magnitude`.
 
 A source without a driver needs no special handling. Omitting the switch or
@@ -67,8 +67,8 @@ never inherits the previous source's driver. Independent-system batches apply
 the same switch to every input and reject `True` if any source lacks a driver.
 
 Sampled drivers reuse their interpolation tables on each requested device and
-dtype. Treat sample tensors as immutable and construct a new driver to replace
-them. Tables that require gradients are not cached. Concurrent curves sharing
+dtype. Do not modify these sampled arrays in place. Construct a new driver to
+replace them. Tables that require gradients are not cached. Concurrent curves sharing
 one bound driver also share one generated realization, including unseeded runs.
 
 Explicit sampled and callable signals remain available for custom sources and
@@ -180,8 +180,8 @@ sources = mc.batched_pixelate_sources(
 )
 ```
 
-On CUDA, compatible driven Kerr disks share fixed-size observer-delay launches;
-other source types and incompatible settings retain their ordinary serial
+On CUDA, compatible driven Kerr disks calculate observer delays together in
+fixed-size GPU batches. Other source types and incompatible settings use their ordinary serial
 calculation. This changes scheduling only. The requested model order and each
 source's independent physical parameters are preserved, CUDA memory exhaustion
 reduces the active source batch without changing numerical settings, and later
@@ -371,7 +371,7 @@ spectrum = mc.light_curve_from_maps(
 )
 ```
 
-Here the result is an ordinary multiband `LightCurve`; `batch_size` bounds the
+Here the result is an ordinary multiband `LightCurve`. `batch_size` bounds the
 temporary wavelength-by-pixel cube without changing the calculation.
 
 When only the first moment is needed, use the direct mean-delay operations:
@@ -424,7 +424,7 @@ series = simulation.transfer_functions(
 ```
 
 Built-in thermal sources batch full transfer-function accumulation across map
-epochs. By default the response batch follows the dynamic temporal batch;
+epochs. By default the response batch follows the dynamic temporal batch.
 `response_batch_size` can lower its memory footprint independently, while
 `response_spatial_chunk_size` bounds the temporary pixel-by-band product.
 Custom transfer-function sources without a batched implementation continue to
@@ -468,7 +468,7 @@ spectrum = system.light_curve(
 
 For several products from one map sequence, prefer
 `LightCurveRequest(bands_angstrom=...)` with `system.light_curves`. Requests can
-independently set `flux_cadence_days` and `apply_driving_signal=False`; no
+independently set `flux_cadence_days` and `apply_driving_signal=False`. No
 manual distance calculation, pixelation, or constant-driver source is needed.
 The final partial wavelength batch is padded internally and trimmed from the
 returned `[time, band]` arrays.
@@ -506,8 +506,8 @@ result = system.light_curve(
 ```
 
 `wavelength_samples` controls the log-spaced physical continuum grid across the
-combined filter support (32 by default); normalization of host or line templates
-may add hidden physical wavelengths outside that range.
+combined filter support (32 by default). Normalizing host or line templates
+may require additional disk wavelengths outside that range.
 `wavelength_batch_size` controls how many spatial disk channels are
 evaluated together. Emission-line templates and response curves are evaluated
 on a separate fine one-dimensional grid using log-flux interpolation of the
@@ -528,10 +528,11 @@ source epoch, including daily intrinsic variability between 25-day maps.
 
 The default `source_evolution="exact"` evaluates the nonlinear thermal disk at
 every requested source epoch. For a stationary `ThermalReprocessingSource`,
-`source_evolution="linear_response"` instead contracts the mean disk and its
-unnormalized delay response with each sparse magnification map, then
-interpolates those products between map epochs. The driver and output remain
-sampled daily; only the expensive spatial disk evaluation is approximated.
+`source_evolution="linear_response"` instead multiplies the mean disk and its
+unnormalized delay response by each magnification map and sums over pixels.
+It interpolates these results between map epochs and combines the response
+with the driving signal. The driver and output remain sampled daily. Only
+the expensive spatial disk evaluation is approximated.
 The unnormalized kernel is essential because microlensing changes both its
 shape and response amplitude. The default CDF/PCHIP reconstruction conserves
 total response mass. Fine fractional deposition and averaging four shifted
@@ -557,7 +558,7 @@ light-crossing time of a source pixel, bounded by the narrowest unlensed
 response width and the tabulated driver's cadence. Set a positive
 `response_delay_bin_days` to select it explicitly. Output transfer-function
 edges do not set the native resolution. Tabulated drivers are integrated
-analytically over each PCHIP piece; scalar callable drivers use three-point
+analytically over each PCHIP piece. Scalar callable drivers use three-point
 Gaussian quadrature. The common polynomial intervals, one quarter of the
 coarse spacing, must not exceed the tabulated driver cadence.
 No ordinary-response comparison or convergence audit runs per map.
@@ -571,7 +572,7 @@ only approximately preserved. Transfer products retain direct pixel mean lags.
 
 The same controls work on individual `LightCurveRequest` objects, with
 optional caustic labels, and with `TimeShiftedSource` arrival delays. Source
-trajectories must be stationary in these modes; a moving source currently
+trajectories must be stationary in these modes. A moving source currently
 raises an error rather than reusing invalid response weights.
 
 This is an approximation to the nonlinear Planck response, not merely a
@@ -589,7 +590,7 @@ first-order approximation and can matter for continuum-lag studies.
 With a sampled `QuasarSpectrum` and the same 32-wavelength continuum,
 warmed calls were 1.57–1.65 s exact versus 1.10–1.15 s with linear
 response (about 1.43 times faster). Both runs returned a spectrum at every
-daily epoch; neither reduced the intrinsic cadence to the 25-day map cadence.
+daily epoch. Neither reduced the intrinsic cadence to the 25-day map cadence.
 These timings include map generation and spectral post-processing but not
 caustic labels or first-call compilation.
 
@@ -598,28 +599,27 @@ coefficient. In the full-spectrum test its maximum six-band error was 0.09 mmag
 and the best-fit shift was 0.01–0.02 day. With the same compiled projection,
 it took 1.16–1.19 s, about 1.33 times faster than exact in this case.
 These historical measurements used ordinary 0.25-day response bins. They are for one
-realization and are not general error bounds;
-compare with `"exact"` for
+realization and are not general error bounds. Compare with `"exact"` for
 other disks, drivers, and caustics. The response modes cache one spatial
 weight per sampled disk wavelength and use more GPU memory than the exact
-streaming path. Moderate wavelength sets use one compiled, fused map projection;
-larger sets retain chunked projections under a GPU-memory cap. Check available
+streaming path. Moderate wavelength sets use one compiled map-response calculation.
+Larger sets are processed in chunks within a GPU-memory limit. Check available
 memory before using hundreds of wavelengths.
 
 Thermal disks share the retarded driving signal and temperature field across
 wavelength chunks. On compiled backends, regular grids use tiled Planck emission
 and map-weighted flux reductions without retaining a full
 time-by-pixel-by-wavelength cube. Irregular grids remain supported.
-NVIDIA CUDA float32 uses a wavelength-vectorized Triton kernel; requests needing
+NVIDIA CUDA float32 evaluates wavelengths together in a Triton kernel. Requests needing
 gradients, float64, or another GPU backend retain the compiled PyTorch path.
 This also applies to source-only photometry and time-shifted multi-image sources.
 Temporal tails repeat the last valid evaluation time internally and are trimmed
 from the result, so padding never extends the driving-signal horizon.
 
-For a stationary mean-driver disk, the code contracts the static source with
-each map once and interpolates the resulting band fluxes. This is algebraically
+For a stationary mean-driver disk, the code multiplies the static brightness by
+each map, sums over pixels once, and interpolates the resulting band fluxes. This is algebraically
 equivalent to the original map interpolation, not an approximation to intrinsic
-variability. Static brightness caches are memory-bounded; larger spectra retain
+variability. Cached static brightness uses a fixed memory budget. Larger spectra retain
 the wavelength-streaming path. `include_labels=True` shares the same map stream
 and preserves the caustic labels through spectral post-processing.
 
@@ -650,7 +650,7 @@ source = mc.ThinDiskModel(
 )
 ```
 
-The default viscous flux profile is `"novikov-thorne"`; select
+The default viscous flux profile is `"novikov-thorne"`. Select
 `"shakura-sunyaev"` for the Newtonian thin-disk profile. A custom callable
 receives `(radius_rg, spin, isco_rg)` and may carry additional parameters in a
 closure, `functools.partial`, or callable object. Custom profiles require an

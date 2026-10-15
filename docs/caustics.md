@@ -6,38 +6,43 @@ marching squares, and maps their endpoints to the source plane. Passing a
 `FarFieldApproxConfig` selects the local-exact Taylor accelerator. Omitting it uses
 the direct point-mass reference.
 
-A returned `CausticField` provides point, center, and full-grid parity,
-winding-number, and distance queries. Full label and distance maps are
-diagnostics. They are never materialized just to obtain the source-center
-label.
+A returned `CausticField` provides binary caustic labels, winding numbers,
+and distances at individual points or across a grid. A signed winding number
+counts how many times oriented closed caustics wrap around a query point.
+Full label and distance
+maps are optional diagnostics. They are not constructed when only the
+source-center label is requested.
 
-## Production anchor/gauge labels
+## Caustic-crossing labels with anchors and gauges
 
-Finite determinant grids can clip critical-curve components, so an infinite
-positive-x parity ray is not a reliable production label. Use
+The fast calculation constructs only the caustics that can affect the requested
+source field. It counts caustic intersections along paths from reference
+points called anchors and combines their classifications by majority vote.
+Additional reference points called gauges keep the binary convention
+consistent between frames. Use
 `system.light_curve(..., include_labels=True)` for photometry with center
 labels. The low-level `MicrolensingSimulation` also provides
 `labeled_caustics`, `dynamic_labeled_caustics`, `dynamic_labeled_maps`, and
 `light_curve_with_labels`. These methods use the validated production
 construction.
 
-- nine reproducibly offset anchors and nine distinct gauge probes just inside
-  the requested source boundary.
-- finite anchor-to-query paths and a consistent half-open shared-vertex rule.
-- redundant anchor-pair constraints followed by a majority vote at the source
-  center and each gauge.
-- per-query rejection of votes intersecting a critical-curve component clipped
-  by the determinant-grid boundary.
-- safe gauge consensus to remove the arbitrary global binary XOR between
-  adjacent epochs.
+By default, nine anchors and nine gauges lie near the source-field perimeter,
+with small reproducible offsets to break symmetry. Intersection counts between
+anchors establish their relative binary classes before voting. Intersections at shared
+segment endpoints are counted only once. Votes involving curves cut by the
+determinant-grid boundary are rejected. Gauges away from caustics determine
+whether the zero and one labels need to be exchanged between adjacent frames.
+Counting along an infinite ray instead would require a complete caustic field.
 
-Before extraction, the default local 3×3 sign-island cleanup removes only
-unresolved one- or few-pixel detA speckles. The setting
+Before extraction, a local 3×3 check removes isolated determinant-sign regions
+that occupy only a few pixels. The setting
 `minimum_determinant_sign_pixels=4` controls this threshold. Set it to zero
 for a literal determinant contour audit.
 
 The zero/one naming is conventional. A transition in `center_label`, reported
-as `center_crossing`, is the physical crossing observable. `center_vote_count`
+as `center_crossing`, marks a source-center caustic crossing. Two crossings
+between sampled epochs can leave the label unchanged and be missed. Choose a
+cadence fine enough for the expected motion. `center_vote_count`
 and `center_valid_count` expose the consensus instead of hiding an uncertain
 decision.
 
@@ -82,10 +87,10 @@ resolution does not change.
 
 ## Sharing work with maps and light curves
 
-For fused tiled IPM, `dynamic_labeled_maps` reuses the already-built temporal
-far-field states for detA evaluation and caustic endpoint tracing. It does not
-rebuild the far field. The high-level light-curve call consumes those maps
-immediately, retaining only the final fluxes and lightweight caustic products.
+For tiled IPM, `dynamic_labeled_maps` uses the same per-epoch far-field
+coefficients as the magnification maps to calculate the Jacobian determinant
+and map the critical curves. The high-level light-curve call uses each map
+immediately and retains the final fluxes and requested caustic products.
 
 ```python
 result = system.light_curve(
@@ -116,7 +121,7 @@ At censored epochs, `distance_uas == R_src` means only
 `d_caustic >= R_src`. It does not place a caustic on the source boundary.
 
 Map-only and light-curve-only calls still skip every caustic calculation.
-CPU, Apple, float64, and non-Triton execution use the same predicates through
+CPU, Apple, float64, and non-Triton execution use the same intersection rules through
 the portable chunked implementation. CUDA float32 uses compact two-pass
 marching squares plus fused crossing/distance kernels. Temporal and spatial
 batches reduce losslessly after a CUDA OOM. No physical resolution parameter
@@ -124,12 +129,12 @@ is changed.
 
 ## Diagnostic maps and numerical audit
 
-Pass `diagnostic_grid=` to materialize the full anchor/gauge majority map and
+Pass `diagnostic_grid=` to calculate the full binary caustic map and
 `include_distance_map=True` to additionally store nearest-caustic distance.
 These options are intended for validation and animations, not center-only
 production labels.
 
-Regular-grid parity and winding maps use an exact scanline accumulation. A
+Regular-grid binary caustic and winding maps accumulate intersections row by row. A
 segment crossing updates one contiguous row prefix, followed by an integer
 cumulative sum. CUDA float32 performs the half-open crossing tests, binary
 searches the actual sampled x axis, and accumulates the integer prefix updates
@@ -148,17 +153,18 @@ map itself uses the scanline path above.
 
 For CUDA float32 order-four far fields, complete-field determinant evaluation
 loads the two regular-grid coordinate axes directly inside the Triton query.
-It therefore uses one launch without materializing full coordinate meshes.
+It therefore uses one GPU call without allocating full coordinate meshes.
 Compact Triton marching squares then extracts only the zero-crossing segments.
 Other dtypes and backends evaluate the same grid in bounded coordinate chunks.
 
-Canonical shared vertices, half-open predicates, and invalid-component vote
-masks make the label query stable in the solver dtype. A second float64 label
-replay is therefore not part of the production or public configuration.
+Consistent shared endpoints, rules that count each intersection once, and
+rejection of votes involving clipped curves keep labels stable at the selected
+precision. Production labels do not require a second float64 calculation.
 
-Signed winding numbers require consistently oriented closed segments. Parity
-labels do not require orientation, but both quantities require a complete
-field unless the anchor/gauge invalid-component handling is used.
+Signed winding numbers require consistently oriented closed segments. Binary
+caustic labels do not require orientation. The direct infinite-ray calculation
+requires a complete field, while the anchor/gauge method rejects votes
+involving clipped curves.
 
 Imported segment collections that have lost their traversal order can be
 registered before a signed winding query:

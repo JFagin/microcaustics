@@ -17,3 +17,8 @@ generated directly from the tested source docstrings.
 
 Runnable scripts and CUDA-aware notebooks are distributed in the `examples`
 directory. They use only the public package interface.
+
+The numerical methods and paper benchmarks are described in
+[Fagin et al. (2026)](https://arxiv.org/abs/2610.19703). The package also provides
+optional spectrum and response-based source calculations beyond those used
+for the paper's figures and benchmarks.

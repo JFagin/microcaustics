@@ -2,8 +2,8 @@
 
 ## Public vocabulary
 
-The primary user object is `MicrolensingSimulation`. Public APIs use physical
-names rather than generic orchestration terms. Results use names such as
+Most users start with `MicrolensingSystem`, while `MicrolensingSimulation`
+provides direct control over grids and solvers. Results use names such as
 `MagnificationMap`, `LightCurve`, and `CausticField`.
 
 ## Separation of concerns
@@ -23,7 +23,7 @@ CUDA/Triton, compiled or eager PyTorch, CPU, and Apple devices. Accelerated
 specializations are implementation details and always retain a portable
 correctness path.
 
-## High-level system facade
+## Physical system interface
 
 `microcaustics.system` remains the stable home of `MicrolensingSystem`,
 `MicrolensingRealization`, and `IntegrationDomain`. Cohesive implementation
@@ -31,15 +31,14 @@ details live in the private `microcaustics._system` package:
 
 
 - `scheduling` resolves cadences, numerical controls, dynamic defaults,
-  retained-map observers, and light-curve dispatch;
-- `geometry` derives source and lens-plane regions; and
+  retained-map observers, and light-curve calls.
+- `geometry` derives source and lens-plane regions.
 - `coordinates` handles coordinate-basis transformations and point-lens
   motion diagnostics.
 
 Application code should continue importing the public classes from
 `microcaustics`. The private modules exist to keep the facade readable and
-to let batching and multi-image orchestration reuse policy without importing
-it indirectly through the public system class module.
+to share setup and scheduling between batched and multi-image calculations.
 
 ## Migration rule
 
@@ -56,7 +55,7 @@ share one tested plotting implementation.
 
 ## Migrated production components
 
-The dynamic IPM path is now implemented behind the public solver contracts.
+The dynamic IPM calculation uses the public solver interface.
 Its CUDA specialization fuses temporal Taylor far-field queries and direct-cell
 rasterization while retaining the exact portable Sutherland–Hodgman reference
 for validation and non-CUDA systems. Source scouting, tail padding, and memory

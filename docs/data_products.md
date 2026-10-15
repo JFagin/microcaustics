@@ -37,7 +37,7 @@ preferable for long sequences. Serialization is always explicit.
 
 Dataset generation can write directly from `batched_system_light_curves`.
 Passing a directory creates flat files named by system and image, plus one
-`manifest.json`; passing a filename ending in `.npz` creates a single archive
+`manifest.json`. Passing a filename ending in `.npz` creates a single archive
 with the manifest embedded. In both cases the returned batch index provides
 `load_system(index)` and preserves multi-image names, ordering, arrival delays,
 and metadata. Flat files are convenient for partial reruns and parallel

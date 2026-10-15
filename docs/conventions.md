@@ -37,7 +37,7 @@ local lens-motion clock.
 
 `MagnificationMap.values` contains absolute linear magnification, not a
 magnitude residual and not a mean-normalized map. IRS and IPM use the same
-contract. Map comparisons retain normalization bias unless a caller explicitly
+normalization. Map comparisons retain normalization bias unless a caller explicitly
 requests a shape-only light-curve comparison.
 
 Magnitude residuals follow
@@ -46,8 +46,8 @@ residuals are fainter than the reference. `rmse_mmag` is the RMS of that
 residual multiplied by 1000. Fractional NRMSE is the RMS of the pixelwise
 fractional residual over common finite, positive pixels.
 
-## Provenance
+## Recording calculation settings
 
 Result metadata records the actual backend, numerical method, reuse settings,
 padding, tuning decisions, and relevant geometry. Persist that metadata with
-saved arrays so a map can be registered and reproduced.
+saved arrays so the coordinates and calculation can be reproduced.

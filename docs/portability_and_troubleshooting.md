@@ -59,8 +59,8 @@ microcaustics doctor
 ```
 
 The Triton import is expected to fail on a deliberately portable CPU/macOS
-environment. On an accelerated environment, `doctor` should report
-Expected output includes `cuda_available: true`, `triton_importable: true`, and automatic backend
+environment. On an accelerated environment, expected output from `doctor`
+includes `cuda_available: true`, `triton_importable: true`, and automatic backend
 `triton`. Use `strict_backend=True` for published timings or installation
 smoke tests so an accelerated-kernel failure cannot be hidden by fallback.
 

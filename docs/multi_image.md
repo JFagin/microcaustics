@@ -215,10 +215,11 @@ measured delays and local lens parameters directly.
 ## Multi-rate resolved-quasar workflow
 
 Intrinsic variability and reprocessing often require a much finer time grid
-than the moving microlens field. Generate maps sparsely and return daily fluxes
-with two map–source contractions per source epoch:
+than the moving microlens field. Generate maps at a coarser cadence and
+evaluate the current source brightness with each of the two bracketing maps.
+Interpolate between the resulting fluxes to obtain the finer light curve.
 
-The paper example uses `broken_power_law_driving_signal` with a 200-day PSD
+This guide uses `broken_power_law_driving_signal` with a 200-day PSD
 break. This choice belongs to the source model. Any custom `DrivingSignal` can
 be substituted without changing the multi-image or microlensing calculation.
 
@@ -232,7 +233,7 @@ curves = system.light_curves(
 )
 ```
 
-The implementation retains at most two maps and never materializes daily
+The implementation retains at most two maps and never constructs daily
 interpolated maps. Caustic labels are returned only at the sparse map epochs,
 available through each image's `labels.times_days`. At observer time `t`, image `i` evaluates the source at
 `t - arrival_time_delay_days[i]`, while maps and source trajectories stay at
@@ -311,7 +312,7 @@ result = system.light_curves(
 events_a = result["A"].crossing_events
 ```
 
-The current production anchor/gauge labels describe the fixed center of the
+The binary caustic labels describe the fixed center of the
 source grid. To prevent a silent mismatch, the high-level interface requires
 `trajectory=None` when labels are requested. Relative bulk motion can be
 encoded in each image's point-mass velocities, which is the validated
@@ -320,4 +321,4 @@ map-centered production convention. Light curves without labels support any
 
 Diagnostic full label and distance maps remain opt-in through
 `diagnostic_grid` and `include_distance_map`. Ordinary center labels do not
-materialize them.
+construct them.

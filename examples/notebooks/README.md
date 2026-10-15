@@ -16,7 +16,7 @@ macro-rendering tutorials.
 The distributed notebooks include their executed cell outputs so figures and
 animations are visible on GitHub. Each performance-sensitive notebook prints
 the runtime that produced its results. Larger standalone figures, animations,
-and numerical products are written to local output directories; these do not
+and numerical products are written to local output directories. These do not
 all need to be committed because the notebooks embed their display outputs.
 
 The current tutorial code uses seed 0, with subsequent integer seeds for
@@ -60,7 +60,7 @@ The collection is grouped by purpose rather than presented as one long
 sequence shown below.
 
 - `getting_started/00_static_maps_and_numerical_methods` combines runtime
-  selection, honest first-call/warmed timing, IRS and IPM, and the scout/full/
+  selection, separate first-call and warmed timings, IRS and IPM, and the scout/full/
   rectangle integration domains.
 - `getting_started/01_q2237_production_light_curve_and_gif` is the primary
   end-to-end introduction. It creates a ten-year Q2237 image-B-like dynamic

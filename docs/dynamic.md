@@ -52,19 +52,19 @@ maps = simulation.dynamic_maps(
 )
 ```
 
-On CUDA float32 with the Triton backend, this is genuine fused temporal IPM:
+On CUDA float32, Triton processes several map epochs together:
 
 - far-field Taylor coefficients are accumulated in batches for every map epoch.
-- local-star membership and positions remain exact at every frame.
-- one Taylor far-field query launch traces the shared node coordinates for every
-  frame in a temporal batch.
+- the nearby stars and their current positions are determined at every frame.
+- rays are traced at shared node coordinates using each frame's own
+  far-field coefficients and nearby stars.
 - retained cells are interpolated and rasterized directly into a stack of
-  maps without materializing global triangle arrays.
-- a short final batch may be padded to the compiled temporal shape, with the
-  synthetic maps discarded.
+  maps without storing large arrays of intermediate triangles.
+- a short final batch may include extra frames to reuse the compiled shape.
+  Those extra frames are discarded.
 
-CPU, Apple, float64, eager PyTorch, and compiled PyTorch follow the same public
-contract through the exact portable calculation. The iterator does not retain
+CPU, Apple, float64, eager PyTorch, and compiled PyTorch provide the same
+interface through the exact portable calculation. The iterator does not retain
 the complete map cube after values have been consumed by the caller.
 
 ## Different map and source cadences
@@ -88,9 +88,10 @@ curve = simulation.multirate_light_curve(
 )
 ```
 
-At each fine epoch the implementation evaluates the source and interpolates
-its contractions with the two bracketing maps. It retains at most two maps and
-never constructs a daily map cube. This is a source-independent interface:
+At each fine epoch, the calculation multiplies the current source brightness
+by each of the two bracketing maps and sums over pixels. It then interpolates
+between those two fluxes. At most two maps are retained, with no daily map
+cube. This interface accepts any supported source:
 `source` may be a quasar disk, expanding supernova, analytic profile, or any
 user-defined `CallableSource`. Use `multirate_light_curve_with_labels` to add
 source-center labels at the sparse map epochs.
@@ -171,11 +172,14 @@ temporal-batch keywords. Static batches use
 If the point-mass field has no velocities, all requested frames share the same
 lens state. The scheduler calculates one map and reuses its tensor exactly.
 
-For a moving tiled-IPM field, `scout_refresh_frames > 1` is an explicit
-approximation. Scouts are evaluated at the beginning and end of each interval.
-All fine cells selected by either endpoint are retained throughout the
-interval. This coverage safeguard is always active. A refresh value of one
-recomputes the scout at every frame and disables temporal scout reuse.
+For moving stars, `scout_refresh_frames > 1` reuses the selected lens-plane
+cells between scout evaluations. Scouts are evaluated at the beginning and
+end of each interval, and cells selected at either endpoint are retained
+throughout it. The lens mapping and magnification are still recalculated at
+every frame using the current stellar positions. This is an approximation
+because a cell can contribute only between the two endpoints. Validate the
+interval for the chosen cadence and stellar motion. A refresh value of one
+recomputes the scout at every frame and disables this reuse.
 Full-field IPM and IRS do not use scout reuse.
 
 Fused IPM map generation shares the union of these endpoint selections across
@@ -185,11 +189,9 @@ paths. Thus changing curve concurrency does not change the selected support
 at a fixed temporal batch size. Changing the temporal batch itself can change
 the extra cells retained by the conservative map union.
 
-The far-field approximation constructs the local-star packs and complete coefficient
-tables independently at every map epoch. Multiple epochs can share a batched
-CUDA/Triton coefficient-accumulation call, but no coefficient table is
-interpolated in time. This preserves pixel-level map fidelity while retaining
-the throughput benefit of temporal batching.
+The nearby-star lists and far-field coefficients are calculated independently
+at every map epoch. Several epochs can be processed together on the GPU, but
+the coefficients are not interpolated in time.
 
 Every map result records its scout refresh endpoints, selected-cell count,
 whether endpoint union was used, and whether the selection was approximate. This provenance is
@@ -217,12 +219,13 @@ This shared-map source batching is distinct from independent-system
 concurrency. `batched_system_light_curves` accepts arbitrary mixtures of
 single- and multi-image systems. It realizes inputs lazily, batches individual
 macroimage curves with `curves_per_batch`, and reconstructs each system in its
-original image order. Compatible tiled-IPM Triton curves fuse their far-field,
-ragged scout-cell rasterization, and optional Jacobian/marching-squares queues
-without mixing stellar fields or tracing a union of different systems' cells.
-For mixed doubles or quads, matching macroimage contracts are grouped across
-systems while incompatible images use the established private-stream path.
-Lossless OOM backoff halves CUDA concurrency and retries; CPU and Apple MPS use
+original image order. Compatible tiled-IPM calculations combine the far-field,
+selected-cell area mapping, and optional Jacobian and marching-squares work
+in shared GPU operations. Each curve keeps its own stellar field and cells.
+For mixed doubles or quads, images with compatible numerical settings are
+grouped across systems. Other images are processed on separate GPU streams.
+If CUDA runs out of memory, the calculation retries with half as many
+concurrent curves and the same numerical settings. CPU and Apple MPS use
 the same interface and execute curves sequentially.
 The same `include_microlensing_only=True` option applies to every single or
 multi-image result and is preserved by both disk-backed output modes.
@@ -232,17 +235,17 @@ For collections of relativistic variable sources, set
 disks then pool their directly traced rays through the same fixed-size compiled
 observer-delay kernel before the stellar realizations are built. A double or
 quad contributes one shared source, not one source per macroimage. Repeated
-batches reuse the compiled specialization even when the disk parameters or
-batch occupancy change; only source resolution, dtype, compile mode, or the
+batches reuse the compiled kernel even when the disk parameters or
+number of sources change. Only source resolution, dtype, compile mode, or the
 explicit observer-coordinate chunk size can require another specialization.
 
 Set `output_path` to a directory for flat per-image NPZ files and a manifest,
 or to a `.npz` file for one combined NumPy archive. A bounded single-writer
 queue overlaps serialization with calculation. The returned
-`IndependentLightCurveBatch` stores compact records instead of every curve;
+`IndependentLightCurveBatch` stores compact records instead of every curve.
 `batch.load_system(index)` reconstructs a single `LightCurve` or complete
 `MultiImageLightCurves`. Use `compression=False` when write speed matters more
-than space. Flat-directory output supports `resume=True`; a complete system is
+than space. Flat-directory output supports `resume=True`. A complete system is
 reused only when every expected image file exists. Combined archives are
 atomically finalized and do not support partial resume. Retained maps remain
 separate products and should be handled with map observers in disk-backed runs.
@@ -261,8 +264,8 @@ This resolves to $N=10^7$, $k=2$, $r=2$, $v=4$, a 16-by-16 local-membership
 partition with 8-by-8 Taylor nodes per cell, temporal batch 49, and refresh-10
 endpoint-union scouting. It uses no source-pixel halo
 (`scout_halo_pixels=0`) and retains one lens-plane scout-cell support ring
-(`scout_dilation_cells=1`). The dual-scout option performs the frame-zero `k=1`
-to `k=2` scalar normalization correction and reuses that constant for later
+(`scout_dilation_cells=1`). At the first epoch, the denser `k=1` scout
+estimates the initial normalization correction for `k=2`. This constant is reused for later
 frames. For one unrelated static map, use
 the default static-map operation, which selects `k=1` and does not run
 the dynamic correction. For a

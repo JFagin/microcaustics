@@ -2,7 +2,7 @@
 
 `microcaustics` can select Rubin visits from a local OpSim SQLite database and
 apply them to either one light curve or all resolved macroimages of a lensed
-system. The database is indexed once per Python process; subsequent sky
+system. The database is indexed once per Python process. Subsequent sky
 queries and random samples use compact in-memory arrays rather than rescanning
 SQLite.
 
@@ -54,7 +54,7 @@ cadence = rubin.at_sky_position(
 Every cadence uses the first MJD in the full OpSim database as its time origin.
 This preserves the relative seasonal phase of different sky positions. The
 selection is a circular pointing-center approximation controlled by
-`radius_deg`; it does not evaluate the detailed camera footprint.
+`radius_deg`. It does not evaluate the detailed camera footprint.
 
 ## Observe one light curve
 

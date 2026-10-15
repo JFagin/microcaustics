@@ -7,12 +7,11 @@ available for specialized calculations.
 
 ## What the interface handles
 
-The ordinary workflow should not require a user to calculate source-plane
-support, lens-plane aperture, stellar count, Einstein radii, or angular
-velocities by hand. It should still expose every physical assumption and every
-derived value.
+The system derives the source extent, lens-plane aperture, stellar count,
+Einstein radii, and angular velocities from the physical inputs. The resulting
+values and assumptions can be inspected before running the calculation.
 
-The high-level interface must support all current workflows.
+The high-level interface supports the following workflows.
 
 - Static and dynamic source-independent magnification maps
 - Finite-source light curves with optional intrinsic variability
@@ -182,9 +181,9 @@ exactly those objects and never adds, removes, or rescales them.
 
 An automatic conservative bounding calculation derives a finite integration
 domain from the requested source-plane map, macro model, and supplied stars.
-An explicit lens region remains an escape hatch for regression fixtures,
-external-code reproduction, moving direct-star fields, and deliberately
-truncated experiments.
+An explicit lens region remains available for numerical tests, comparisons
+with other codes, moving directly supplied stars, and deliberately truncated
+experiments.
 
 ## Microlensing system and realization
 
@@ -276,26 +275,26 @@ Each returns the same existing, independently replaceable configuration
 objects used by the low-level interface.
 
 The default dynamic calculation uses 10 million rays, scout ratio 2,
-refinement 2, virtual refinement 4, the validated Taylor far field, a
-49-frame temporal batch, a ten-frame endpoint-union scout refresh, and the
-frame-zero scout-ratio normalization correction. Source-center labels use nine
+refinement 2, virtual refinement 4, the validated Taylor far field, scout
+evaluations every ten frames, and the initial normalization correction.
+Light curves use batches of 49 map epochs without labels and 30 with labels,
+unless a different schedule is supplied. Source-center labels use nine
 anchors and nine gauges on an 8192-square determinant grid.
 
-On CUDA float32 runs, temporal caustic segments remain in packed ragged form
-through fused Triton crossing and distance reductions. The implementation falls
-back first to the padded Triton reduction and then to the portable Torch path if
-the preferred kernel is unavailable.
+On CUDA float32 runs, caustic segments from several epochs are stored together,
+with each epoch keeping its own segment range. Triton calculates crossings
+and distances from these segments. If that kernel is unavailable, the code
+uses a padded Triton calculation or the portable PyTorch implementation.
 
 Every nested setting remains independently replaceable. Existing low-level
 configuration constructors remain public.
 
 ## Batching and multi-image systems
 
-Independent batching accepts resolved realizations. Compatible production
-Triton requests use ownership-tagged ragged GPU queues across systems while
-retaining independent stars, scout cells, far-field states, sources, and
-metadata. Mixed multi-image inputs are partitioned by compatible macroimage
-contract and reconstructed in their original order.
+Several independent light curves can be processed together on the GPU.
+Each retains its own stars, selected scout cells, far-field coefficients,
+source, and metadata. For multi-image inputs, images with compatible numerical
+settings are grouped for calculation and returned in their original order.
 
 Multi-image systems contain one resolved realization per macro image. Each image
 has an independent stellar population, integration region, trajectory, and

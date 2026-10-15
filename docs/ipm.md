@@ -1,7 +1,8 @@
 # Configuring inverse polygon mapping
 
-The inverse polygon mapping (IPM) interface separates four controls that are
-often conflated. They can be changed independently, subject only to
+Inverse polygon mapping (IPM) maps lens-plane cells into the source plane and
+distributes their area among overlapping source pixels. Four controls set its
+sampling and reconstruction. They can be changed independently, subject to
 `virtual_refinement >= refinement`.
 
 ```python
@@ -28,14 +29,18 @@ many cells along each axis as the fine grid. Every selected scout tile is then
 expanded back into its exact `k × k` fine cells before IPM. Thus `k` changes
 the cost and spatial resolution of source-region discovery. It does not change
 the retained cells' final lens-plane size. Smaller `k` is more conservative.
+The search includes cells intersecting the circular stellar aperture and one
+neighboring layer outside it. The retained neighbors described below are a
+separate guard around cells selected by the scout.
+
 The scout safety controls act in different coordinate spaces:
 
 - `scout_halo_pixels` expands the requested source aperture before testing
   mapped scout cells, in units of source pixels. The validated production
   default is `0.0`.
-- `scout_dilation_cells` expands the selected mask in the lens plane after the
-  scout test. The production default is one cell, retaining a support ring
-  around the selected region.
+- `scout_dilation_cells` retains neighboring scout cells in the lens plane
+  after selection. The production default is one layer. At `k=2`, that layer
+  is two fine cells wide.
 - `scout_trace_centers` supplements mapped scout-corner tests with cell-center
   queries. The fast dynamic preset disables it after validation found a
   sub-mmag effect with a measurable runtime cost. Set it to `True` for an
@@ -43,18 +48,17 @@ The scout safety controls act in different coordinate spaces:
 
 These controls are independent of `scout_ratio` (`k`) and remain configurable.
 Increasing either halo is more conservative but retains more cells. Setting
-`k=1` is the complete tiled scout and is the recommended baseline for one
+`k=1` scouts at the fine-grid spacing and is the recommended baseline for one
 independent static map.
 
-For a dynamic sequence's optional normalization repair, set
-`dual_scout_scalar_correction=True` with tiled `k=2`. A one-time dense `k=1`
-corner trace supplies both scouts. Only cells in their signed symmetric
-difference are mapped into one source-plane bin, yielding a reference-free
-constant correction. The correction is added to every magnification-map pixel
-and therefore propagates exactly through finite-source map-to-flux
-convolution. It repairs the small global `k=2` selection offset. It is not a
-spatial residual-map correction. For one independent static map, use `k=1`
-directly. There is no temporal sequence over which to amortize the repair.
+For a dynamic sequence, `dual_scout_scalar_correction=True` enables the initial
+normalization correction with tiled `k=2`. At the first epoch, the denser
+`k=1` scout estimates a uniform magnification offset between the two
+selections. This estimate requires no external reference map. The correction
+is added uniformly to subsequent magnification maps before integrating the
+source brightness. It accounts for an approximately uniform missing
+contribution but does not recover unresolved spatial structure. For one
+independent static map, use `k=1` directly.
 
 `refinement` (`r`) sets the number of true mapped subcells along each selected
 base-cell axis. The lens equation is evaluated on an `(r+1) × (r+1)` lattice.
@@ -62,7 +66,8 @@ Increasing `r` therefore spends additional ray traces to model curvature.
 
 `virtual_refinement` (`v`) sets the number of raster polygons per base-cell
 axis. The traced `r` lattice is interpolated to `(v+1) × (v+1)` nodes before
-rasterization, without further lens-equation evaluations. `r=1` is affine,
+rasterization, without further lens-equation evaluations. `r=1` interpolates
+the four corner nodes,
 `r=2` is the paper's biquadratic mapping, and higher `r` uses the corresponding
 tensor-product Lagrange interpolant. Increasing `v` can make curved mapped
 boundaries smoother, but cannot recover information absent from the true
@@ -73,8 +78,9 @@ boundaries smoother, but cannot recover information absent from the true
 - **Independent static map.** The high-level static operation selects
   `N=10_000_000, k=1, r=2, v=4` by default.
 - **Dynamic production sequence.** The high-level dynamic operation selects
-  `N=10_000_000, k=2, r=2, v=4`, uses a corner-only scout with a one-cell
-  support ring, and computes the one-time `k=1` to `k=2` normalization repair.
+  `N=10_000_000, k=2, r=2, v=4`, uses mapped cell corners for selection,
+  retains one layer of neighboring scout cells, and computes the initial
+  normalization correction.
 - **Center-assisted validation.** Start from `production_ipm_config` and pass
   `scout_trace_centers=True`.
 - **Fast exploratory map.** Reduce `N`, keep `r=2, v=4`, and validate the chosen
@@ -100,4 +106,4 @@ share one GPU launch schedule. Use `StaticMapRequest` and
 `batched_magnification_maps`. Each request retains its own point masses,
 far-field coefficients, scout mask, normalization, timing, and metadata. The
 helper requires static `k=1` tiled IPM and losslessly reduces the batch after an
-out-of-memory allocation. It never substitutes the dynamic scalar repair.
+out-of-memory allocation. It does not use the dynamic normalization correction.

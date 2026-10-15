@@ -1,9 +1,8 @@
 # microcaustics
 
 `microcaustics` is a Python package for static and dynamic gravitational
-microlensing simulations. Version 1.0.0 packages the validated numerical
-methods used for the accompanying methods paper behind a documented public
-interface.
+microlensing simulations. Version 1.0.0 implements the numerical methods
+validated in the accompanying methods paper.
 
 ![Ten-year Q2237 image-B-like dynamic magnification map with source-plane caustics](docs/assets/q2237_image_b_dynamic_magnification.gif)
 
@@ -30,10 +29,11 @@ expansion. Higher-order sampling within each selected cell captures curvature
 in the lens mapping and reduces finite-cell artifacts.
 
 The selected cells are mapped and accumulated directly into the magnification
-map by fused Triton kernels. This avoids storing large intermediate ray,
-polygon, and triangle arrays. Temporal batches reuse the selected geometry and
-numerical work across moving-star frames. Separate maps and light curves can
-also be processed concurrently, and compatible simulations reuse already
+map by Triton GPU kernels that combine these operations. This avoids storing
+large intermediate ray, polygon, and triangle arrays. Several epochs can be
+processed together, each with its current stellar positions and magnification
+map. Nearby epochs can reuse the scouted cells. Independent maps and light
+curves can also be processed together, and compatible simulations reuse
 compiled kernels.
 
 Caustic extraction uses compact batched marching squares. Dedicated GPU
@@ -54,8 +54,8 @@ velocity dispersion. Individual microlens masses, positions, and velocities
 can also be supplied directly. The required circular stellar field is normally
 determined automatically from the requested source region, light-loss
 tolerance, and safety scale. Internal stellar motions reflect specularly at
-that boundary to preserve the finite population and its macro parameters;
-coherent bulk translation is applied afterward and consistently to the full
+that boundary to preserve the finite population and its macro parameters.
+Coherent bulk translation is applied afterward and consistently to the full
 local lens mapping.
 
 The package includes general-relativistic Novikov–Thorne accretion disks with
@@ -172,7 +172,7 @@ strict_backend=True)`. The default CUDA memory ceiling is 95 percent, and
 lossless OOM recovery reduces chunks or splits batches when necessary. See the
 [portability and troubleshooting guide](docs/portability_and_troubleshooting.md)
 for cache, compiler, first-call timing, and out-of-memory guidance.
-Potentially slow compilation events are reported by default; set
+Potentially slow compilation events are reported by default. Set
 `warn_on_compile=False` in `RuntimeConfig` to silence them.
 
 </details>
@@ -200,7 +200,7 @@ Start with
 It generates a ten-year dynamic magnification sequence, finite-source light
 curves with and without intrinsic variability, source-center caustic labels,
 and the animation shown above. The calculation uses the documented production
-IPM and far-field settings rather than a simplified plotting surrogate.
+IPM and far-field settings used for production calculations.
 
 The complete notebook guide is organized into five tracks.
 
@@ -529,11 +529,15 @@ controls described below. Use `method="irs"` for inverse ray shooting, or set
 ### 3. Generate a production light curve with labels
 
 The shortest call uses the complete validated production path. This means
-`N=10^7`, `k=2`, true refinement `r=2`, virtual refinement `v=4`, the
-local-exact complex-Taylor far field, temporal batching, conservative
-endpoint-union scout reuse, and aligned source-center labels.
-The maps use the `source_grid_shape` set on the source above, while `rays`
-can be changed on each light-curve call. For dynamic light curves, temporal
+`N=10^7`, `k=2`, true refinement `r=2`, and virtual refinement `v=4`.
+Nearby stellar deflections are calculated exactly and distant ones use the
+Taylor approximation. Several epochs are processed together on the GPU.
+The scout reuses cells selected at either end of each refresh interval, while
+the lens mapping is recalculated at every epoch. Optional binary caustic
+labels track crossings at the source center.
+The map resolution defaults to the source's `source_grid_shape` and can be
+set independently with `map_grid_shape`. The `rays` budget can be changed
+on each light-curve call. For dynamic light curves, temporal
 batch size and the scout refresh interval are also important controls.
 
 ```python
@@ -630,8 +634,8 @@ print(combined.microlensing_only_magnitude.shape)   # [3651, 6]
 ```
 
 See the [source guide](docs/sources.md) for the spectral assumptions, custom
-filters, and optional evolving-spectrum output; the [tuning guide](docs/tuning.md)
-for advanced performance controls; and the
+filters, and optional evolving-spectrum output. The [tuning guide](docs/tuning.md)
+covers advanced performance controls. See the
 [Q2237 tutorial](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb)
 for the complete dynamic light-curve and GIF workflow.
 
@@ -724,7 +728,7 @@ See the [multi-image guide](docs/multi_image.md) and
 settings, maps, labels, and transfer functions. The
 [resolved-quasar workflow](examples/multirate_lensed_quasar.py) also includes
 macro-image solving and Rubin OpSim sampling. The survey notebook uses a local
-OpSim SQLite database specified by `MICROCAUSTICS_LSST_OPSIM`; see Rubin's
+OpSim SQLite database specified by `MICROCAUSTICS_LSST_OPSIM`. See Rubin's
 [`rubin_sim` data guide](https://rubin-sim.lsst.io/data-download.html) and the
 [observations guide](docs/observations.md) for cadence selection.
 
@@ -747,8 +751,10 @@ circular star population. The latter can use a separate
 `rectangle_light_loss=` value on `MicrolensingSystem`.
 
 For dynamic scout calculations, `scout_refresh_frames` is the reuse interval.
-Endpoint union retains the cells selected at both ends of each interval, which
-protects motion between refreshes. The far-field Taylor coefficients themselves
+The calculation retains cells selected at either end of each interval.
+Cells that contribute only between the endpoints can still be missed, so
+validate the refresh interval for the chosen cadence and motion.
+The far-field Taylor coefficients themselves
 are rebuilt at every epoch in the validated production mode. There is no hidden
 temporal coefficient reuse. Disable the far-field approximation with
 `FarFieldApproxConfig(enabled=False)` for a direct point-mass reference calculation.
@@ -769,7 +775,7 @@ The main accuracy and throughput controls in the example are listed below.
 | `scout_refresh_frames` | Number of dynamic epochs sharing an endpoint-union scout selection |
 | `temporal_batch_size` | Number of consecutive maps processed by one fused temporal batch |
 | `light_curve_batch_size` | Number of sources or trajectories sampled from one shared map sequence |
-| `band_batch_size` | Wavelength channels evaluated together; the final batch is padded and trimmed |
+| `band_batch_size` | Wavelength channels evaluated together. The final batch is padded and trimmed |
 | `curves_per_batch` | Number of independent macroimage light curves run concurrently on one GPU |
 | `source_setup_batch_size` | Number of compatible Kerr disks sharing fixed-shape observer-delay launches |
 | `cell_chunk_size` | Maximum spatial work chunk before automatic memory backoff |
@@ -787,7 +793,8 @@ supplied stellar fields. Automatic tuning and lossless CUDA out-of-memory
 backoff remain available when explicit batch or chunk values are omitted.
 
 The default dynamic method is the validated `N=10^7`, `k=2`, `r=2`, `v=4`
-scout IPM with the one-time `k=1` normalization correction. The stellar field
+scout IPM with the initial normalization correction estimated using the denser
+`k=1` scout. The stellar field
 is always the complete circular field. `integration_domain="full"` evaluates
 all cells in its bounding square, while `"rectangle"` changes only the launch
 region and never removes stars. Directly supplied `PointMassField` objects and
@@ -817,7 +824,7 @@ rectangles or safety factors. See
 
 High-level operations choose the production scout automatically. An
 independent static map uses `k=1`, while a moving sequence uses `k=2` plus the
-one-time `k=1` normalization repair. Call `production_ipm_config()` only when
+initial normalization correction. Call `production_ipm_config()` only when
 an advanced experiment needs an explicit numerical configuration.
 Both use `N=10_000_000, r=2, v=4` by default. These are not fixed constants. The implementation
 supports arbitrary sensible ray budgets and scout ratios, as well as
@@ -905,9 +912,9 @@ and observer-frame relative delays are available. The axial Kerr lamppost
 tracer provides conservative illumination and lamp-to-disk delays for the
 nonlinear thermal-reprocessing and transfer-function source layer.
 
-Critical curves, caustics, parity labels, signed winding numbers, and distance
+Critical curves, caustics, binary caustic labels, signed winding numbers, and distance
 queries are documented in [`docs/caustics.md`](docs/caustics.md). Full label
-maps are optional diagnostics. Center-only queries do not materialize them.
+maps are optional diagnostics. Queries at the source center do not construct them.
 
 </details>
 

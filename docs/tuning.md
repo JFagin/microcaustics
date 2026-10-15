@@ -1,8 +1,7 @@
-# Optional automatic work-size tuning
+# Choosing batch and chunk sizes automatically
 
-Automatic tuning is opt-in. It adjusts scheduling parameters:
-the number of frames presented to a fused temporal calculation and the size
-of spatial work chunks. It never changes the physical lens, map field,
+Automatic tuning is opt-in. It tests how many epochs and spatial cells to
+process together. It never changes the physical lens, map field,
 resolution, ray budget, or IPM values `k`, `r`, and `v`.
 With temporal scout reuse, changing the temporal batch can change the extra
 cells retained in its conservative union. The tuner therefore checks numerical
@@ -40,9 +39,8 @@ timings and recorded separately in result metadata.
 Candidates are rejected when they:
 
 - raise a CUDA out-of-memory error.
-- exceed the configured memory ceiling. Or
-- fail a deterministic numerical signature check against the first accepted
-  candidate.
+- exceed the configured memory ceiling.
+- fail the numerical comparison with the first accepted candidate.
 
 `RuntimeConfig.memory_fraction` is the default device-memory ceiling.
 `AutoTuningConfig.memory_fraction` can impose a more conservative ceiling for
@@ -140,7 +138,7 @@ when checking this equivalence.
 ## Thermal spectra and intrinsic variability
 
 Use `wavelength_batch_size` with bandpass photometry (or `band_batch_size` with
-explicit wavelength channels) to bound the spectral working set. This does not
+explicit wavelength channels) to limit memory used by spectral calculations. This does not
 change source cadence or replace the nonlinear thermal response with a scalar
 modulation. The same prepared heating state is reused across wavelength chunks,
 and compiled backends use pixel-contiguous brightness/flux reductions.
@@ -156,21 +154,21 @@ Advanced users can set `RuntimeConfig(thermal_flux_block_pixels=512)` to
 select 128, 256, 512, or 1024 pixels per Triton thermal-flux block. The
 default `None` keeps the measured choice: 512 pixels for a 16-wavelength
 chunk and 256 for narrower chunks. On a sparse observer mask, the exact
-active-tile layout follows the chosen block size; otherwise the kernel uses
+active-tile layout follows the chosen block size. Otherwise the kernel uses
 the complete linear pixel grid. Neither mode drops hit pixels. This setting
 does not affect the map solver or the
 PyTorch fallback. Larger blocks can increase register pressure and become
 slower or use more memory. Warm each candidate before timing it on the target
-GPU; changing the block size may compile another kernel specialization.
+GPU. Changing the block size may compile another kernel.
 
 For dynamic spectra, source evaluation uses no more than the largest number
 of requested flux epochs within one map interval. This avoids padding a
-sparse source request to the map/caustic-label temporal batch size; the map
+sparse source request to the map/caustic-label temporal batch size. The map
 and label batches themselves are unchanged. On one 64-wavelength Q2237 B
 CUDA workload, 16-wavelength chunks were modestly faster than chunks of 8.
 Treat that as a starting point to measure on the intended GPU and lens cases,
-not a universal optimum. A new source-batch shape may need one compilation;
-repeated requests with the same shape reuse it.
+not a universal optimum. A new source-batch shape may need one compilation.
+Repeated requests with the same shape reuse it.
 
 For large response-approximation datasets with a repeated disk, the default
 `RuntimeConfig(static_response_projection=True)` compiles the map-response
@@ -184,8 +182,8 @@ This option affects only
 
 Static disks use a per-call brightness cache when it fits within one thirty-second
 of the configured device memory budget, capped at 512 MiB across all requests.
-Above that limit the thermal contraction remains wavelength-streamed. Templates
+Above that limit, brightness and flux are calculated in wavelength batches. Templates
 are cached separately on the requested device. Initial kernel compilation is
-excluded from steady-state timings; warm each requested shape before comparing
+excluded from steady-state timings. Warm each requested shape before comparing
 throughput. Reducing source cadence to the microlensing cadence removes daily
 variability information and is not required to use these optimizations.
