@@ -40,7 +40,7 @@ def orient_mapped_closed_segments(
     if critical.shape[0] == 0:
         return critical.clone(), caustic.clone()
 
-    coordinates = critical.detach().to(device="cpu", dtype=torch.float64)
+    coordinates = critical.detach().cpu().to(torch.float64)
     bins: dict[tuple[int, int], list[int]] = {}
     representatives: list[tuple[float, float]] = []
     endpoint_nodes: list[tuple[int, int]] = []

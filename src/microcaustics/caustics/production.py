@@ -78,7 +78,7 @@ def _boundary_component_mask(
     sampled_ymax = ymax - 0.5 * dy
     tolerance = max(min(dx, dy) * 1.0e-5, 1.0e-12)
     points = (
-        critical_segments.detach().to(device="cpu", dtype=torch.float64).reshape(-1, 2)
+        critical_segments.detach().cpu().to(torch.float64).reshape(-1, 2)
     )
     on_boundary = (
         ((points[:, 0] - sampled_xmin).abs() <= tolerance)
@@ -722,7 +722,7 @@ def _sparse_boundary_component_mask(
         return torch.zeros(count, device=critical_segments.device, dtype=torch.bool)
 
     points = (
-        critical_segments.detach().to(device="cpu", dtype=torch.float64).reshape(-1, 2)
+        critical_segments.detach().cpu().to(torch.float64).reshape(-1, 2)
     )
     tolerance = max(min(lens_grid.pixel_scale_uas) * 1.0e-5, 1.0e-12)
     parent = list(range(2 * count))

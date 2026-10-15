@@ -52,6 +52,13 @@ def _scalar_tensor(value, *, name: str, device, dtype) -> torch.Tensor:
     return tensor.reshape(())
 
 
+def _logspace(start: float, end: float, steps: int, *, device, dtype) -> torch.Tensor:
+    """``torch.logspace``, built on the CPU for MPS, which does not implement it."""
+    if device is not None and torch.device(device).type == "mps":
+        return torch.logspace(start, end, steps, dtype=dtype).to(device)
+    return torch.logspace(start, end, steps, device=device, dtype=dtype)
+
+
 def _validate_viscous_prescriptions(
     viscous_flux_profile: ViscousFluxProfile,
     radiative_efficiency: RadiativeEfficiency,
@@ -284,7 +291,7 @@ def thin_disk_temperature4(
     modifier = radius.clamp(1.0e-6, 1.0e6).pow(radial_tilt)
     physical = radius > isco
 
-    normalization_radius = torch.logspace(
+    normalization_radius = _logspace(
         -4.0,
         6.0,
         int(normalization_samples),
@@ -375,7 +382,7 @@ def thin_disk_flux_radius_rg(
     if float(corona_height_above_isco_rg) < 0.0:
         raise ValueError("corona_height_above_isco_rg must be non-negative")
 
-    radius = torch.logspace(
+    radius = _logspace(
         -4.0,
         6.0,
         int(radial_samples),
