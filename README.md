@@ -129,6 +129,9 @@ The numerical core supports Python 3.10 and newer.
 The production fused IPM path requires an NVIDIA CUDA device, float32, and an
 importable Triton package. This path is significantly faster than compiled PyTorch.
 
+<details>
+<summary>Show Triton installation by platform</summary>
+
 - **Linux.** Upstream Triton officially supports Linux. Install PyTorch first.
   If `import triton` is still unavailable, follow the
   [official Triton installation and compatibility guidance](https://github.com/triton-lang/triton#compatibility).
@@ -171,6 +174,8 @@ lossless OOM recovery reduces chunks or splits batches when necessary. See the
 for cache, compiler, first-call timing, and out-of-memory guidance.
 Potentially slow compilation events are reported by default; set
 `warn_on_compile=False` in `RuntimeConfig` to silence them.
+
+</details>
 
 ## Tutorial notebooks
 
@@ -219,6 +224,9 @@ on a disk or brightness profile. Specify the redshifts, lens parameters, and
 stellar population, then choose the map width and pixel count. The package
 derives the circular stellar field, number of stars, Einstein radii, and
 lens-plane bounds automatically.
+
+<details>
+<summary>Show the complete magnification-map examples</summary>
 
 ### 1. Generate a static map
 
@@ -362,6 +370,8 @@ only when the source map itself must be rectangular or off-center. See the
 [static-map tutorial](examples/notebooks/getting_started/00_static_maps_and_numerical_methods.ipynb)
 for these controls and conversions to mean-microlens Einstein units.
 
+</details>
+
 ## Physical sources and light curves
 
 This example follows the first tutorial notebook. It defines one Q2237 image
@@ -370,6 +380,9 @@ generates a ten-year light curve with source-center caustic labels. The
 requested light-curve time axis automatically expands the stellar aperture
 and map geometry for the full trajectory. The package derives the source grid, circular stellar field,
 number of stars, Einstein radii, stellar velocities, and lens-plane bounds.
+
+<details>
+<summary>Show the complete physical-source and light-curve example</summary>
 
 ### 1. Define the lens, source, and stellar population
 
@@ -622,6 +635,8 @@ for advanced performance controls; and the
 [Q2237 tutorial](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb)
 for the complete dynamic light-curve and GIF workflow.
 
+</details>
+
 ## Warmup and batching
 
 Compiled kernels are cached for compatible shapes. An optional warmup separates
@@ -642,6 +657,9 @@ systems. See the [dynamic guide](docs/dynamic.md) for batching and reuse, the
 Resolved lensed systems use the same physical interface. This example reuses
 the source and stellar population defined above. Each macroimage has its own
 local lens parameters, while the intrinsic driver is shared.
+
+<details>
+<summary>Show the complete multi-image light-curve example</summary>
 
 ```python
 image_macros = {
@@ -710,7 +728,16 @@ OpSim SQLite database specified by `MICROCAUSTICS_LSST_OPSIM`; see Rubin's
 [`rubin_sim` data guide](https://rubin-sim.lsst.io/data-download.html) and the
 [observations guide](docs/observations.md) for cadence selection.
 
+</details>
+
 ## Further guides and examples
+
+Start with the [source guide](docs/sources.md),
+[dynamic calculations](docs/dynamic.md), [multi-image guide](docs/multi_image.md),
+[tuning guide](docs/tuning.md), or [data products](docs/data_products.md).
+
+<details>
+<summary>Show advanced configuration and further guides</summary>
 
 `integration_domain="scout"` is the fast production path. It evaluates only
 cells that can map into the source field. `"full"` evaluates every cell in the
@@ -882,6 +909,8 @@ Critical curves, caustics, parity labels, signed winding numbers, and distance
 queries are documented in [`docs/caustics.md`](docs/caustics.md). Full label
 maps are optional diagnostics. Center-only queries do not materialize them.
 
+</details>
+
 ## Citation
 
 If you use `microcaustics` in published work, please cite Fagin et al. (2026),
@@ -946,6 +975,9 @@ emission, continuum reverberation, and time-domain survey simulation. The
 references below are grouped by the parts of the package they most directly
 motivate.
 
+<details>
+<summary>Show the selected scientific references</summary>
+
 ### Microlensing and numerical methods
 
 - Wambsganss, Paczyński, and Katz (1990),
@@ -991,3 +1023,5 @@ motivate.
   [*Joint Modeling of Quasar Variability and Accretion Disk Reprocessing using Latent Stochastic Differential Equations*](https://doi.org/10.3847/1538-4357/addabc).
 - Fagin et al. (2024),
   [*Latent Stochastic Differential Equations for Modeling Quasar Variability and Inferring Black Hole Properties*](https://doi.org/10.3847/1538-4357/ad2988).
+
+</details>
