@@ -222,7 +222,13 @@ def test_lamppost_normalization_uses_selected_efficiency() -> None:
 @pytest.mark.parametrize("eddington_ratio", [0.03, 0.1, 1.0])
 def test_lamppost_heating_absorbs_half_the_lamp_luminosity(eddington_ratio: float) -> None:
     from microcaustics.sources.thin_disk import (
-        _C, _G, _M_PROTON, _M_SUN, _SIGMA_SB, _SIGMA_T, _thin_disk_temperature4_coefficient,
+        _C,
+        _G,
+        _M_PROTON,
+        _M_SUN,
+        _SIGMA_SB,
+        _SIGMA_T,
+        _thin_disk_temperature4_coefficient,
     )
 
     mass, lamp_fraction, height = 1.0e8, 0.1, 26.0
