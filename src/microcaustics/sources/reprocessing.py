@@ -119,10 +119,15 @@ def lamppost_irradiation_efficiency(
     """Return the dimensionless lamppost heating normalization.
 
     ``lamp_fraction`` is the fraction of the bolometric accretion luminosity
-    assigned to the lamppost. Dividing by the Eddington ratio converts that
-    fraction to the temperature-scale normalization used by
-    :meth:`ThermalReprocessingSource.from_axis_lamppost`. The radiative
-    efficiency follows the selected viscous profile unless it is overridden.
+    assigned to an isotropic lamppost, ``L_lamp = lamp_fraction * eta * Mdot
+    c**2``. The flat-space heating of one disk face is then
+    ``sigma dT**4 = L_lamp h / (4 pi d**3)``, which is this normalization times
+    the accretion temperature scale ``3 Mdot c**2 / (8 pi sigma r_g**2)`` and
+    the illumination ``(4/3) h / d**3``: ``lamp_fraction * eta / 2``. The
+    accretion temperature scale already carries the Eddington ratio, so the
+    normalization does not depend on it; ``eddington_ratio`` is only checked.
+    The radiative efficiency follows the selected viscous profile unless it is
+    overridden.
     """
 
     if not math.isfinite(float(lamp_fraction)) or float(lamp_fraction) < 0.0:
@@ -139,7 +144,7 @@ def lamppost_irradiation_efficiency(
         spin_tensor,
         isco,
     )
-    return float(lamp_fraction) * efficiency / float(eddington_ratio)
+    return 0.5 * float(lamp_fraction) * efficiency
 
 
 @dataclass(frozen=True)

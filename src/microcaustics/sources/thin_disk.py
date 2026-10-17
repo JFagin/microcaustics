@@ -401,12 +401,6 @@ def thin_disk_flux_radius_rg(
         device=device,
         dtype=dtype,
     )
-    ratio = _scalar_tensor(
-        eddington_ratio,
-        name="eddington_ratio",
-        device=device,
-        dtype=dtype,
-    )
     spin_tensor = _scalar_tensor(spin, name="spin", device=device, dtype=dtype)
     efficiency = _radiative_efficiency(
         radiative_efficiency,
@@ -416,9 +410,9 @@ def thin_disk_flux_radius_rg(
     )
     height = isco + float(corona_height_above_isco_rg)
     lamp_temperature4 = (
-        float(lamp_fraction)
+        0.5
+        * float(lamp_fraction)
         * efficiency
-        / ratio
         * coefficient
         * (4.0 / 3.0)
         * height
