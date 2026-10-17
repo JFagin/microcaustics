@@ -211,12 +211,38 @@ def test_lamppost_normalization_uses_selected_efficiency() -> None:
     )
     torch.testing.assert_close(
         nt,
-        0.5 * mc.novikov_thorne_radiative_efficiency(0.0),
+        0.05 * mc.novikov_thorne_radiative_efficiency(0.0),
     )
     torch.testing.assert_close(
         ss,
-        0.5 * mc.shakura_sunyaev_radiative_efficiency(0.0),
+        0.05 * mc.shakura_sunyaev_radiative_efficiency(0.0),
     )
+
+
+@pytest.mark.parametrize("eddington_ratio", [0.03, 0.1, 1.0])
+def test_lamppost_heating_absorbs_half_the_lamp_luminosity(eddington_ratio: float) -> None:
+    from microcaustics.sources.thin_disk import (
+        _C,
+        _G,
+        _M_PROTON,
+        _M_SUN,
+        _SIGMA_SB,
+        _SIGMA_T,
+        _thin_disk_temperature4_coefficient,
+    )
+
+    mass, lamp_fraction, height = 1.0e8, 0.1, 26.0
+    coefficient, _ = _thin_disk_temperature4_coefficient(
+        mass, eddington_ratio, 0.0, device="cpu", dtype=torch.float64
+    )
+    efficiency = mc.lamppost_irradiation_efficiency(lamp_fraction, eddington_ratio, 0.0)
+    radius = torch.logspace(-6.0, 9.0, 200_001, dtype=torch.float64)
+    heating = efficiency * coefficient * (4.0 / 3.0) * height / (radius.square() + height**2).pow(1.5)
+    r_g = _G * _M_SUN * mass / _C**2
+    absorbed = _SIGMA_SB * torch.trapezoid(heating * 2.0 * math.pi * radius, radius) * r_g**2
+    eddington_luminosity = 4.0 * math.pi * _G * _M_SUN * mass * _M_PROTON * _C / _SIGMA_T
+    lamp_luminosity = lamp_fraction * eddington_ratio * eddington_luminosity
+    assert float(absorbed) == pytest.approx(0.5 * lamp_luminosity, rel=2e-3)
 
 
 @pytest.mark.cuda

@@ -94,7 +94,7 @@ class FoundationTests(unittest.TestCase):
             lamp_fraction=0.1,
             corona_height_above_isco_rg=20.0,
         )
-        self.assertAlmostEqual(radius, 690.2878, places=2)
+        self.assertAlmostEqual(radius, 570.1985, places=2)
 
     def test_far_field_approx_config_is_public(self) -> None:
         config = FarFieldApproxConfig(cells_per_axis=16, nodes_per_cell_axis=8)
@@ -1330,7 +1330,7 @@ class FoundationTests(unittest.TestCase):
         )
         torch.testing.assert_close(
             lamppost_irradiation_efficiency(0.1, 0.34, spin),
-            0.1 * expected_efficiency / 0.34,
+            0.5 * 0.1 * expected_efficiency,
         )
 
     def test_temperature_tilt_preserves_coordinate_area_luminosity(self) -> None:
