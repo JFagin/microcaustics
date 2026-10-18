@@ -59,23 +59,9 @@ class AxisLamppostRayTransfer:
     execution: str = "torch eager"
 
 
-def _flat_lamppost_illumination(radius_rg, height_rg):
-    """Fraction of an isotropic lamp's photons reaching unit disk area (``r_g**-2``).
-
-    Flat space: ``h / (4 pi d**3)`` with ``d = sqrt(r**2 + h**2)`` (Cackett,
-    Horne and Winkler 2007, Eq. 2); it integrates to 1/2 over one disk face.
-    """
-
-    return height_rg / (4.0 * math.pi * (radius_rg**2 + height_rg**2) ** 1.5)
-
-
 @dataclass(frozen=True)
 class AxisLamppostProfile:
-    """Conservative annular lamppost illumination and delay profile.
-
-    ``illumination`` is the fraction of lamp photons per unit proper area, with
-    its total kept at the flat-space value.
-    """
+    """Conservative annular lamppost illumination and delay profile."""
 
     radius_rg: torch.Tensor
     lamp_delay_rg: torch.Tensor
@@ -722,9 +708,9 @@ def axis_lamppost_profile(
         / proper_area
     )
     flat_delay = torch.sqrt(centers.square() + float(source_height_rg) ** 2)
-    flat_illumination = _flat_lamppost_illumination(
-        centers, float(source_height_rg)
-    )
+    flat_illumination = (4.0 / 3.0) * float(source_height_rg) / (
+        centers.square() + float(source_height_rg) ** 2
+    ).clamp_min(torch.finfo(dtype).tiny).pow(1.5)
     center_delay = _additive_continuation(
         center_delay,
         reached,

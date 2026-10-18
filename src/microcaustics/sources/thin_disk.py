@@ -16,7 +16,6 @@ from ..relativity import (
     shakura_sunyaev_flux_factor,
     shakura_sunyaev_radiative_efficiency,
 )
-from ..relativity.lamppost import _flat_lamppost_illumination
 from .base import SourceGeometry, _as_times
 
 _C = 299_792_458.0
@@ -228,17 +227,6 @@ def _thin_disk_temperature4_coefficient(
     return coefficient, isco
 
 
-def _accretion_power_temperature4_scale(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``Mdot c**2 / (sigma r_g**2)``: the viscous coefficient without its 3 / (8 pi).
-
-    Times an absorbed luminosity fraction and an area density in ``r_g**-2`` it
-    gives the lamp heating ``sigma dT**4``.
-    """
-
-    coefficient, isco = _thin_disk_temperature4_coefficient(*args, **kwargs)
-    return coefficient * (8.0 * math.pi / 3.0), isco
-
-
 def thin_disk_temperature4(
     radius_rg: torch.Tensor,
     *,
@@ -349,7 +337,6 @@ def thin_disk_flux_radius_rg(
     color_correction: float = 1.0,
     lamp_fraction: float = 0.1,
     corona_height_above_isco_rg: float = 20.0,
-    lamp_albedo: float = 0.0,
     flux_fraction: float = 0.999,
     safety_factor: float = 1.05,
     radial_samples: int = 20_000,
@@ -368,8 +355,7 @@ def thin_disk_flux_radius_rg(
     ``corona_height_above_isco_rg`` follows the public lamppost convention. The
     Boyer--Lindquist source height used by the heating profile is this value
     plus the Kerr ISCO radius. Set ``lamp_fraction=0`` for a stationary
-    Novikov--Thorne disk without external heating. ``lamp_albedo`` is the
-    fraction of the lamp's light the disk reflects instead of absorbing.
+    Novikov--Thorne disk without external heating.
     """
 
     if not 0.0 < float(flux_fraction) < 1.0:
@@ -386,8 +372,6 @@ def thin_disk_flux_radius_rg(
         raise ValueError("color_correction must be positive")
     if float(lamp_fraction) < 0.0:
         raise ValueError("lamp_fraction must be non-negative")
-    if not 0.0 <= float(lamp_albedo) < 1.0:
-        raise ValueError("lamp_albedo must lie in [0, 1)")
     if float(corona_height_above_isco_rg) < 0.0:
         raise ValueError("corona_height_above_isco_rg must be non-negative")
 
@@ -408,7 +392,7 @@ def thin_disk_flux_radius_rg(
         radiative_efficiency=radiative_efficiency,
         normalization_samples=radial_samples,
     )
-    scale, _ = _accretion_power_temperature4_scale(
+    coefficient, _ = _thin_disk_temperature4_coefficient(
         black_hole_mass_solar,
         eddington_ratio,
         spin,
@@ -425,9 +409,14 @@ def thin_disk_flux_radius_rg(
         isco,
     )
     height = isco + float(corona_height_above_isco_rg)
-    absorbed_fraction = (1.0 - float(lamp_albedo)) * float(lamp_fraction) * efficiency
     lamp_temperature4 = (
-        absorbed_fraction * scale * _flat_lamppost_illumination(radius, height)
+        0.5
+        * float(lamp_fraction)
+        * efficiency
+        * coefficient
+        * (4.0 / 3.0)
+        * height
+        * (radius.square() + height.square()).pow(-1.5)
     )
     lamp_temperature4 = torch.where(
         radius >= isco,

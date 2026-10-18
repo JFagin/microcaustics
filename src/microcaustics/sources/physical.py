@@ -24,7 +24,6 @@ from ..relativity import (
     trace_primary_equatorial,
 )
 from ..relativity.coordinates import add_observer_coordinates_batch
-from ..relativity.lamppost import _flat_lamppost_illumination
 from ..runtime import ResolvedRuntime, RuntimeConfig, resolve_runtime
 from .analytic import GaussianSource
 from .base import PixelatedSource, SourceGeometry
@@ -36,7 +35,7 @@ from .thin_disk import (
     RadiativeEfficiency,
     ThinDiskSource,
     ViscousFluxProfile,
-    _accretion_power_temperature4_scale,
+    _thin_disk_temperature4_coefficient,
     _validate_viscous_prescriptions,
     thin_disk_flux_radius_rg,
 )
@@ -253,7 +252,6 @@ class ThinDiskModel:
     driving_signal: DrivingSignal | None = None
     lamp_fraction: float = 0.0
     corona_height_above_isco_rg: float = 20.0
-    lamp_albedo: float = 0.0
     relativity: str = "none"
     grid: SourceGridConfig = SourceGridConfig()
     source_grid_shape: int | tuple[int, int] | None = None
@@ -302,8 +300,6 @@ class ThinDiskModel:
             raise ValueError("source_redshift must be non-negative")
         if self.lamp_fraction < 0.0:
             raise ValueError("lamp_fraction must be non-negative")
-        if not 0.0 <= self.lamp_albedo < 1.0:
-            raise ValueError("lamp_albedo must lie in [0, 1)")
         if self.corona_height_above_isco_rg < 0.0:
             raise ValueError("corona_height_above_isco_rg must be non-negative")
         if self.relativity not in {"none", "approximate"}:
@@ -357,7 +353,6 @@ class ThinDiskModel:
             color_correction=self.color_correction,
             lamp_fraction=self.lamp_fraction,
             corona_height_above_isco_rg=self.corona_height_above_isco_rg,
-            lamp_albedo=self.lamp_albedo,
             flux_fraction=resolved.enclosed_flux_fraction,
             safety_factor=resolved.margin,
             radial_samples=resolved.radial_samples,
@@ -488,7 +483,7 @@ def _newtonian_lamppost_source(
         spin, model.corona_height_above_isco_rg
     ).to(device=device, dtype=dtype)
     lamp_distance_rg = torch.sqrt(radius_rg.square() + height_rg.square())
-    illumination = _flat_lamppost_illumination(radius_rg, height_rg)
+    illumination = (4.0 / 3.0) * height_rg / lamp_distance_rg.pow(3)
 
     radius_m = torch.sqrt(disk_x.square() + disk_y.square())
     outer_radius_m = 0.5 * min(ny * dy, nx * dx)
@@ -540,7 +535,7 @@ def _newtonian_lamppost_source(
             "source_height_rg": float(height_rg.detach().cpu()),
         },
     )
-    scale, _ = _accretion_power_temperature4_scale(
+    coefficient, _ = _thin_disk_temperature4_coefficient(
         model.black_hole_mass_solar,
         model.eddington_ratio,
         model.spin,
@@ -553,7 +548,6 @@ def _newtonian_lamppost_source(
         model.lamp_fraction,
         model.eddington_ratio,
         model.spin,
-        albedo=model.lamp_albedo,
         viscous_flux_profile=model.viscous_flux_profile,
         radiative_efficiency=model.radiative_efficiency,
     ).to(device=device, dtype=dtype)
@@ -561,7 +555,7 @@ def _newtonian_lamppost_source(
         geometry,
         transfer,
         model.driving_signal,
-        efficiency * scale * illumination,
+        efficiency * coefficient * illumination,
         delay_days,
         model.black_hole_mass_solar,
         model.eddington_ratio,
@@ -576,7 +570,6 @@ def _newtonian_lamppost_source(
             "model": "axis_newtonian_lamppost",
             "source_height_rg": float(height_rg.detach().cpu()),
             "lamp_fraction": float(model.lamp_fraction),
-            "lamp_albedo": float(model.lamp_albedo),
             "irradiation_efficiency": float(efficiency.detach().cpu()),
         },
         _runtime=resolved,
@@ -620,7 +613,6 @@ class KerrDiskModel:
     radiative_efficiency: RadiativeEfficiency = None
     lamp_fraction: float = 0.1
     corona_height_above_isco_rg: float = 20.0
-    lamp_albedo: float = 0.0
     driving_signal: DrivingSignal | None = None
     grid: SourceGridConfig = SourceGridConfig()
     source_grid_shape: int | tuple[int, int] | None = None
@@ -672,7 +664,6 @@ class KerrDiskModel:
             radiative_efficiency=self.radiative_efficiency,
             lamp_fraction=self.lamp_fraction,
             corona_height_above_isco_rg=self.corona_height_above_isco_rg,
-            lamp_albedo=self.lamp_albedo,
             grid=self.grid,
         )
         del support
@@ -682,8 +673,6 @@ class KerrDiskModel:
             raise ValueError("inclination_deg must lie in [0, 90)")
         if self.lamp_fraction < 0.0:
             raise ValueError("lamp_fraction must be non-negative")
-        if not 0.0 <= self.lamp_albedo < 1.0:
-            raise ValueError("lamp_albedo must lie in [0, 1)")
         if self.corona_height_above_isco_rg < 0.0:
             raise ValueError("corona_height_above_isco_rg must be non-negative")
         if self.primary_repair_max_passes < 0:
@@ -728,7 +717,6 @@ class KerrDiskModel:
             radiative_efficiency=self.radiative_efficiency,
             lamp_fraction=self.lamp_fraction,
             corona_height_above_isco_rg=self.corona_height_above_isco_rg,
-            lamp_albedo=self.lamp_albedo,
             grid=self.grid,
         )
 
@@ -964,7 +952,6 @@ def _finish_kerr_pixelation(
         spin=model.spin,
         source_redshift=plan.redshift,
         lamp_fraction=model.lamp_fraction,
-        lamp_albedo=model.lamp_albedo,
         color_correction=model.color_correction,
         temperature_slope_beta=model.temperature_slope_beta,
         viscous_flux_profile=model.viscous_flux_profile,
