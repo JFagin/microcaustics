@@ -22,10 +22,10 @@ from .thin_disk import (
     _NOVIKOV_THORNE,
     RadiativeEfficiency,
     ViscousFluxProfile,
+    _accretion_power_temperature4_scale,
     _prescription_metadata,
     _prescription_name,
     _radiative_efficiency,
-    _thin_disk_temperature4_coefficient,
     _validate_viscous_prescriptions,
     thin_disk_temperature4,
 )
@@ -113,27 +113,27 @@ def lamppost_irradiation_efficiency(
     eddington_ratio: float,
     spin,
     *,
+    albedo: float = 0.0,
     viscous_flux_profile: ViscousFluxProfile = _NOVIKOV_THORNE,
     radiative_efficiency: RadiativeEfficiency = None,
 ) -> torch.Tensor:
-    """Return the dimensionless lamppost heating normalization.
+    """Return the absorbed lamp luminosity in units of ``Mdot c**2``.
 
     ``lamp_fraction`` is the fraction of the bolometric accretion luminosity
-    assigned to an isotropic lamppost, ``L_lamp = lamp_fraction * eta * Mdot
-    c**2``. The flat-space heating of one disk face is then
-    ``sigma dT**4 = L_lamp h / (4 pi d**3)``, which is this normalization times
-    the accretion temperature scale ``3 Mdot c**2 / (8 pi sigma r_g**2)`` and
-    the illumination ``(4/3) h / d**3``: ``lamp_fraction * eta / 2``. The
-    accretion temperature scale already carries the Eddington ratio, so the
-    normalization does not depend on it; ``eddington_ratio`` is only checked.
-    The radiative efficiency follows the selected viscous profile unless it is
-    overridden.
+    assigned to the lamppost, ``L_lamp = lamp_fraction * eta * Mdot c**2``, and
+    the disk absorbs ``1 - albedo`` of the light reaching it, so one face is
+    heated by ``sigma dT**4 = (1 - albedo) L_lamp h / (4 pi d**3)`` (Cackett,
+    Horne and Winkler 2007, Eq. 2). The accretion rate, and so the Eddington
+    ratio, enters through the temperature scale. The radiative efficiency
+    follows the selected viscous profile unless it is overridden.
     """
 
     if not math.isfinite(float(lamp_fraction)) or float(lamp_fraction) < 0.0:
         raise ValueError("lamp_fraction must be finite and non-negative")
     if not math.isfinite(float(eddington_ratio)) or float(eddington_ratio) <= 0.0:
         raise ValueError("eddington_ratio must be finite and positive")
+    if not 0.0 <= float(albedo) < 1.0:
+        raise ValueError("albedo must lie in [0, 1)")
     spin_tensor = torch.as_tensor(spin)
     if not spin_tensor.is_floating_point():
         spin_tensor = spin_tensor.to(torch.get_default_dtype())
@@ -144,7 +144,7 @@ def lamppost_irradiation_efficiency(
         spin_tensor,
         isco,
     )
-    return 0.5 * float(lamp_fraction) * efficiency
+    return (1.0 - float(albedo)) * float(lamp_fraction) * efficiency
 
 
 @dataclass(frozen=True)
@@ -276,19 +276,20 @@ class ThermalReprocessingSource:
         source_redshift,
         irradiation_efficiency: float | None = None,
         lamp_fraction: float | None = None,
+        lamp_albedo: float = 0.0,
         viscous_flux_profile: ViscousFluxProfile = _NOVIKOV_THORNE,
         radiative_efficiency: RadiativeEfficiency = None,
         **kwargs,
     ) -> ThermalReprocessingSource:
         """Construct a disk from a validated axial Kerr lamppost profile.
 
-        ``irradiation_efficiency`` multiplies the common accretion temperature
-        scale and the profile's conservative proper-area illumination. As a
-        physical convenience, ``lamp_fraction`` computes that coefficient
-        from the selected disk radiative efficiency and ``eddington_ratio``.
-        Supply at most one of the two. If neither is supplied, the coefficient
-        is one. No hidden rescaling to a requested variability amplitude is
-        performed.
+        ``irradiation_efficiency`` is the absorbed lamp luminosity in units of
+        ``Mdot c**2``; it multiplies ``Mdot c**2 / (sigma r_g**2)`` and the
+        profile's illumination. As a physical convenience, ``lamp_fraction``
+        (with ``lamp_albedo``) computes it from the selected disk radiative
+        efficiency. Supply at most one of the two. If neither is supplied, the
+        coefficient is one. No hidden rescaling to a requested variability
+        amplitude is performed.
         """
 
         if transfer.relative_delay_days is None:
@@ -300,6 +301,7 @@ class ThermalReprocessingSource:
                 lamp_fraction,
                 float(torch.as_tensor(eddington_ratio).detach().cpu()),
                 spin,
+                albedo=lamp_albedo,
                 viscous_flux_profile=viscous_flux_profile,
                 radiative_efficiency=radiative_efficiency,
             )
@@ -335,7 +337,7 @@ class ThermalReprocessingSource:
             raise ValueError("observer-coordinate and disk source redshifts must match")
         radius = transfer.radius_rg
         lamp_delay_rg, illumination, _ = profile.interpolate(radius)
-        coefficient, isco = _thin_disk_temperature4_coefficient(
+        scale, isco = _accretion_power_temperature4_scale(
             black_hole_mass_solar,
             eddington_ratio,
             spin,
@@ -344,7 +346,7 @@ class ThermalReprocessingSource:
             device=radius.device,
             dtype=radius.dtype,
         )
-        response_temperature4 = efficiency_tensor * coefficient * illumination
+        response_temperature4 = efficiency_tensor * scale * illumination
         mass = torch.as_tensor(
             black_hole_mass_solar,
             device=radius.device,
@@ -404,6 +406,7 @@ class ThermalReprocessingSource:
                 "lamp_fraction": (
                     None if lamp_fraction is None else float(lamp_fraction)
                 ),
+                "lamp_albedo": None if lamp_fraction is None else float(lamp_albedo),
                 "lamppost_hit_fraction": float(profile.hit_fraction.detach().cpu()),
             },
             **kwargs,

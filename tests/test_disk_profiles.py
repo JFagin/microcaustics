@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import microcaustics as mc
+from microcaustics.relativity.lamppost import _flat_lamppost_illumination
 
 
 def _custom_flux_factor(radius_rg, spin, isco_rg):
@@ -209,18 +210,34 @@ def test_lamppost_normalization_uses_selected_efficiency() -> None:
         0.0,
         viscous_flux_profile="shakura-sunyaev",
     )
+    reflected = mc.lamppost_irradiation_efficiency(0.1, 0.2, 0.0, albedo=0.25)
     torch.testing.assert_close(
         nt,
-        0.05 * mc.novikov_thorne_radiative_efficiency(0.0),
+        0.1 * mc.novikov_thorne_radiative_efficiency(0.0),
     )
     torch.testing.assert_close(
         ss,
-        0.05 * mc.shakura_sunyaev_radiative_efficiency(0.0),
+        0.1 * mc.shakura_sunyaev_radiative_efficiency(0.0),
     )
+    torch.testing.assert_close(reflected, 0.75 * nt)
+    with pytest.raises(ValueError, match="albedo"):
+        mc.lamppost_irradiation_efficiency(0.1, 0.2, 0.0, albedo=1.0)
 
 
-@pytest.mark.parametrize("eddington_ratio", [0.03, 0.1, 1.0])
-def test_lamppost_heating_absorbs_half_the_lamp_luminosity(eddington_ratio: float) -> None:
+def test_flat_lamppost_illumination_puts_half_the_photons_on_one_face() -> None:
+    height = 26.0
+    radius = torch.logspace(-6.0, 9.0, 200_001, dtype=torch.float64)
+    illumination = _flat_lamppost_illumination(radius, height)
+    total = torch.trapezoid(illumination * 2.0 * math.pi * radius, radius)
+    assert float(total) == pytest.approx(0.5, rel=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("eddington_ratio", "albedo"), [(0.03, 0.0), (0.1, 0.0), (1.0, 0.0), (0.1, 0.3)]
+)
+def test_lamppost_heating_absorbs_half_the_lamp_luminosity(
+    eddington_ratio: float, albedo: float
+) -> None:
     from microcaustics.sources.thin_disk import (
         _C,
         _G,
@@ -228,21 +245,51 @@ def test_lamppost_heating_absorbs_half_the_lamp_luminosity(eddington_ratio: floa
         _M_SUN,
         _SIGMA_SB,
         _SIGMA_T,
-        _thin_disk_temperature4_coefficient,
+        _accretion_power_temperature4_scale,
     )
 
     mass, lamp_fraction, height = 1.0e8, 0.1, 26.0
-    coefficient, _ = _thin_disk_temperature4_coefficient(
+    scale, _ = _accretion_power_temperature4_scale(
         mass, eddington_ratio, 0.0, device="cpu", dtype=torch.float64
     )
-    efficiency = mc.lamppost_irradiation_efficiency(lamp_fraction, eddington_ratio, 0.0)
+    efficiency = mc.lamppost_irradiation_efficiency(
+        lamp_fraction, eddington_ratio, 0.0, albedo=albedo
+    )
     radius = torch.logspace(-6.0, 9.0, 200_001, dtype=torch.float64)
-    heating = efficiency * coefficient * (4.0 / 3.0) * height / (radius.square() + height**2).pow(1.5)
+    heating = efficiency * scale * _flat_lamppost_illumination(radius, height)
     r_g = _G * _M_SUN * mass / _C**2
     absorbed = _SIGMA_SB * torch.trapezoid(heating * 2.0 * math.pi * radius, radius) * r_g**2
     eddington_luminosity = 4.0 * math.pi * _G * _M_SUN * mass * _M_PROTON * _C / _SIGMA_T
     lamp_luminosity = lamp_fraction * eddington_ratio * eddington_luminosity
-    assert float(absorbed) == pytest.approx(0.5 * lamp_luminosity, rel=2e-3)
+    assert float(absorbed) == pytest.approx(0.5 * (1.0 - albedo) * lamp_luminosity, rel=2e-3)
+
+
+def test_newtonian_lamppost_heating_follows_lamp_luminosity_and_albedo() -> None:
+    signal = mc.broken_power_law_driving_signal(
+        cadence_days=1.0, standard_deviation=0.3, seed=1, history_days=200.0
+    )
+
+    def response(eddington_ratio: float, albedo: float) -> torch.Tensor:
+        model = mc.ThinDiskModel(
+            black_hole_mass_solar=1.0e8,
+            eddington_ratio=eddington_ratio,
+            bands_angstrom={"i": 7550.0},
+            source_redshift=1.0,
+            driving_signal=signal,
+            lamp_fraction=0.1,
+            lamp_albedo=albedo,
+            source_grid_shape=64,
+        )
+        source = model.pixelate(
+            source_redshift=1.0, H0=70.0, Om0=0.3, grid=mc.PlaneGrid((64, 64), (1.0, 1.0))
+        )
+        return source.response_temperature4.double()
+
+    base = response(0.1, 0.0)
+    torch.testing.assert_close(response(0.1, 0.4), 0.6 * base, rtol=1e-5, atol=0.0)
+    # The lamp carries a fixed fraction of the accretion power, so its heating
+    # grows in proportion to the Eddington ratio.
+    torch.testing.assert_close(response(0.3, 0.0), 3.0 * base, rtol=1e-5, atol=0.0)
 
 
 @pytest.mark.cuda

@@ -1104,9 +1104,11 @@ class FoundationTests(unittest.TestCase):
             631.7539615678706,
             places=9,
         )
+        # Absorbed photon fraction per unit area: the former (4/3) h / d**3
+        # normalization times 3 / (16 pi), i.e. h / (4 pi d**3).
         self.assertAlmostEqual(
             float(profile.illumination.sum()),
-            0.1378213475719396,
+            0.1378213475719396 * 3.0 / (16.0 * math.pi),
             places=13,
         )
         self.assertAlmostEqual(
@@ -1330,7 +1332,7 @@ class FoundationTests(unittest.TestCase):
         )
         torch.testing.assert_close(
             lamppost_irradiation_efficiency(0.1, 0.34, spin),
-            0.5 * 0.1 * expected_efficiency,
+            0.1 * expected_efficiency,
         )
 
     def test_temperature_tilt_preserves_coordinate_area_luminosity(self) -> None:
