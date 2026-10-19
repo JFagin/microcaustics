@@ -31,6 +31,34 @@ available. They compare the fused kernels with the readable Torch paths for
 ray tracing, Taylor far-field approximation, scouting, polygon accumulation, caustics, labels, and
 temporal batching.
 
+## Apple GPU checks
+
+Tests marked `mps` run on an Apple GPU when `torch.backends.mps.is_available()`
+is true. Otherwise they skip automatically. They compare float32 results with
+CPU references for rasterization, far-field deflections and determinants,
+temporal maps, disk flux, light curves, and positive and signed CDF responses.
+They also check that high-precision work can use the CPU while the main runtime
+stays on MPS. No Apple-only dependency is added to the package.
+
+From the package directory on a Mac, run:
+
+```bash
+python -m pytest -q -m mps tests/test_mps.py tests/test_torch_ipm.py
+```
+
+Compilation is a separate opt-in check because Apple compiler support depends
+on the installed PyTorch version. It uses strict mode, so compilation failures
+are reported rather than silently falling back to eager execution:
+
+```bash
+MICROCAUSTICS_RUN_MPS_COMPILE=1 python -m pytest -q -m mps tests/test_mps.py tests/test_torch_ipm.py
+```
+
+Leave `PYTORCH_ENABLE_MPS_FALLBACK` unset for hardware validation so unsupported
+operations are not silently executed on the CPU. An all-skipped run, including
+on a macOS CI runner without MPS, does not validate Apple GPU support. Record the
+Mac model, macOS version, and PyTorch version when reporting results.
+
 ## Executable notebooks
 
 Notebook JSON, imports, and code syntax are checked in the ordinary suite.

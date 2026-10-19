@@ -116,6 +116,7 @@ pythonpath = ["src"]
 addopts = "-ra"
 markers = [
   "cuda: requires a CUDA device",
+  "mps: requires an Apple GPU with PyTorch MPS support",
   "external: compares against optional third-party or external research code",
   "slow: intentionally excluded from the ordinary fast test loop",
 ]

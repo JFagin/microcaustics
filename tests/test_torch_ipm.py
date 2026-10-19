@@ -27,7 +27,7 @@ from microcaustics.solvers.torch_ipm import (
 )
 
 DEVICES = ["cpu"] + (
-    ["mps"]
+    [pytest.param("mps", marks=pytest.mark.mps)]
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
     else []
 )
