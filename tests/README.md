@@ -31,6 +31,34 @@ available. They compare the fused kernels with the readable Torch paths for
 ray tracing, Taylor far-field approximation, scouting, polygon accumulation, caustics, labels, and
 temporal batching.
 
+## Apple GPU checks
+
+Tests marked `mps` run on an Apple GPU when `torch.backends.mps.is_available()`
+is true. Otherwise they skip automatically. They compare float32 results with
+CPU references for rasterization, far-field deflections and determinants,
+temporal maps, disk flux, light curves, and positive and signed CDF responses.
+They also check that high-precision work can use the CPU while the main runtime
+stays on MPS. No Apple-only dependency is added to the package.
+
+From the package directory on a Mac, run:
+
+```bash
+python -m pytest -q -m mps tests/test_mps.py tests/test_torch_ipm.py
+```
+
+Compilation is a separate opt-in check because Apple compiler support depends
+on the installed PyTorch version. It uses strict mode, so compilation failures
+are reported rather than silently falling back to eager execution:
+
+```bash
+MICROCAUSTICS_RUN_MPS_COMPILE=1 python -m pytest -q -m mps tests/test_mps.py tests/test_torch_ipm.py
+```
+
+Leave `PYTORCH_ENABLE_MPS_FALLBACK` unset for hardware validation so unsupported
+operations are not silently executed on the CPU. An all-skipped run, including
+on a macOS CI runner without MPS, does not validate Apple GPU support. Record the
+Mac model, macOS version, and PyTorch version when reporting results.
+
 ## Executable notebooks
 
 Notebook JSON, imports, and code syntax are checked in the ordinary suite.
@@ -55,25 +83,45 @@ python -m unittest tests.test_release_workflows.LongCudaStabilityTests -v
 
 ## Independent numerical oracles
 
+Macroimage tests exercise the native caustics finder against analytic lens
+solutions and optional independent codes. `tests/_legacy_macro_solver.py`
+holds a frozen pre-retirement solver for internal comparisons only. It is not
+part of the installed package and must not be imported by production code.
+It is a secondary check, not the reference truth, and can miss close pairs or
+faint central images.
+
 Install the optional validation dependencies with:
 
 ```powershell
-python -m pip install -e ".[test,validation]"
+python -m pip install -e ".[test,validation,macro]"
 ```
 
-NumPy, SciPy, and Astropy checks run automatically when installed. GitHub
-Actions installs lenstronomy and enables its comparisons in a dedicated oracle
-job. Keeping the environment gate prevents lenstronomy's expensive first import
-from slowing every operating-system and Python-version job. Run that same job
-locally with:
+NumPy, SciPy, and Astropy checks run automatically when installed. Dedicated
+CPU-only GitHub Actions jobs test the optional integrations on Linux, Windows,
+and macOS with Python 3.11. They install caustics, lenstronomy, SciPy, Astropy,
+and speclite through the existing extras and check that these libraries import
+successfully before running the tests. This prevents a missing integration
+from silently skipping its comparisons. Installed versions are printed in the
+job logs.
+
+These jobs cover native macroimage solving, rendering, the caustics adapter,
+precision settings, spectral integration, and independent numerical comparisons.
+The ordinary CI jobs remain separate. These additions do not change the
+package's required dependencies. The core-import test also checks that the
+package imports when optional libraries are unavailable.
+
+The lenstronomy environment gate keeps its first-import cost out of ordinary
+test runs. Run the optional integration suite locally with:
 
 ```powershell
 $env:MICROCAUSTICS_RUN_LENSTRONOMY = "1"
-python -m pytest -q tests/test_external_oracles.py
+python -m pytest -q tests/test_external_oracles.py tests/test_native_macroimages.py tests/test_legacy_macro_solver.py tests/test_caustics_adapter.py tests/test_rendering.py tests/test_high_precision_device.py tests/test_lamppost_numerics.py tests/test_response_rebin.py tests/test_lens_populations.py tests/test_spectra.py
 ```
 
-These libraries are validation-only dependencies. None is imported by the
-ordinary package import merely to support the comparisons.
+Lenstronomy and speclite are used for validation. Caustics, SciPy, and Astropy
+also support optional package features. None becomes a required dependency
+because it is used in CI. SIM5 and Weisenbach comparisons still require the
+separate local reference products described below and do not run in these jobs.
 
 ## Weisenbach IPM comparison
 

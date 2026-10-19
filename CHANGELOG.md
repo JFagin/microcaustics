@@ -4,6 +4,9 @@
 
 Initial release of `microcaustics`:
 
+- Apple GPU (MPS) IPM rasterization and batched far-field calculations, with chunked queries and Metal memory-budget reporting. Compilation follows the requested runtime settings.
+- MPS compatibility fixes for float64 host copies and faint-pixel flux accumulation, with CPU comparison tests.
+- Fewer Triton IPM recompilations when map bounds, pixel scales, or triangle weights change.
 - Static and dynamic inverse polygon mapping and inverse ray shooting, with fused Triton acceleration and portable PyTorch fallbacks.
 - Source-directed scouting, far-field acceleration, automatic memory tuning, and temporal and cross-system batching.
 - Critical curves, caustics, source-center labels, distance maps, and winding-map products.

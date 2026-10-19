@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import unittest
 from dataclasses import replace
 
@@ -104,53 +103,6 @@ class MultiImageTests(unittest.TestCase):
         self.assertEqual(local.shear, 0.52)
         self.assertEqual(mc.arrival_time_delay_mapping([solution]), {"A": 3.0})
 
-    @unittest.skipUnless(importlib.util.find_spec("scipy"), "requires scipy")
-    def test_general_callable_macro_model_is_not_profile_specific(self) -> None:
-        def raytrace(x, y):
-            return x, y
-
-        def jacobian(x, y):
-            identity = torch.eye(2, dtype=x.dtype, device=x.device)
-            return identity.expand(*x.shape, 2, 2)
-
-        def time_delay(x, y):
-            return 0.5 * (x.square() + y.square())
-
-        model = mc.CallableMacroModel(raytrace, jacobian, time_delay)
-        solutions = mc.solve_macroimages(
-            model,
-            0.0,
-            0.0,
-            initial_grid_size=41,
-            field_of_view_arcsec=1.0,
-        )
-        self.assertEqual(len(solutions), 1)
-        self.assertAlmostEqual(solutions[0].macro_magnification, 1.0)
-        self.assertAlmostEqual(solutions[0].convergence, 0.0)
-        self.assertAlmostEqual(solutions[0].shear, 0.0)
-
-    @unittest.skipUnless(importlib.util.find_spec("scipy"), "requires scipy")
-    def test_macroimage_solver_rejects_iteration_limited_candidates(self) -> None:
-        def raytrace(x, y):
-            return x, y
-
-        def jacobian(x, y):
-            identity = torch.eye(2, dtype=x.dtype, device=x.device)
-            return identity.expand(*x.shape, 2, 2)
-
-        def time_delay(x, y):
-            return 0.5 * (x.square() + y.square())
-
-        model = mc.CallableMacroModel(raytrace, jacobian, time_delay)
-        with self.assertRaisesRegex(RuntimeError, "did not produce a valid image"):
-            mc.solve_macroimages(
-                model,
-                0.123,
-                -0.087,
-                initial_grid_size=41,
-                field_of_view_arcsec=1.0,
-                maximum_function_evaluations=1,
-            )
 
     def test_resolved_light_curves_share_source_and_apply_distinct_delays(self) -> None:
         system = MultiImageSimulation.create([_image("A", 0.0), _image("B", 2.0)])

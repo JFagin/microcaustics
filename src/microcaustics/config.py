@@ -56,6 +56,25 @@ def normalize_dtype(value: str | torch.dtype) -> torch.dtype:
     raise ValueError("dtype must be float32 or float64")
 
 
+def normalize_high_precision_device(value: str | torch.device | None) -> str | None:
+    """Validate placement for supported auxiliary float64 calculations."""
+    if value is None or str(value) == "same":
+        return value
+    try:
+        device = torch.device(value)
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(
+            "high_precision_device must be None, 'cpu', 'cuda', 'cuda:N', or 'same'"
+        ) from error
+    if device.type not in {"cpu", "cuda"} or (
+        device.type == "cpu" and device.index is not None
+    ):
+        raise ValueError(
+            "high_precision_device must be None, 'cpu', 'cuda', 'cuda:N', or 'same'"
+        )
+    return str(device)
+
+
 @dataclass(frozen=True)
 class AutoTuningConfig:
     """Optional steady-state temporal, spatial, and memory autotuning.
@@ -166,6 +185,12 @@ class RuntimeConfig:
         ``"off"`` avoids timing-only accelerator barriers. ``"total"``
         synchronizes only around complete public calculations.
         ``"detailed"`` also synchronizes component boundaries.
+    high_precision_device:
+        Device for macroimage solving, Kerr coordinate repairs, and validation
+        metrics. ``None`` preserves each operation's default. Use ``"cpu"``,
+        ``"cuda"``, ``"cuda:N"``, or ``"same"`` for the main runtime device.
+        Explicit per-operation devices take precedence. This does not change
+        numerical precision or move the main simulation and CPU bookkeeping.
     """
 
     device: str | torch.device = "auto"
@@ -179,6 +204,7 @@ class RuntimeConfig:
     static_response_projection: bool = True
     response_reconstruction: str = "cdf"
     profiling: ProfilingLevel | str = ProfilingLevel.OFF
+    high_precision_device: str | torch.device | None = None
 
     def __post_init__(self) -> None:
         backend = Backend(self.backend)
@@ -206,6 +232,11 @@ class RuntimeConfig:
         object.__setattr__(self, "backend", backend)
         object.__setattr__(self, "dtype", dtype)
         object.__setattr__(self, "profiling", profiling)
+        object.__setattr__(
+            self,
+            "high_precision_device",
+            normalize_high_precision_device(self.high_precision_device),
+        )
 
 
 @dataclass(frozen=True)

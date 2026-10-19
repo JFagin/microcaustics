@@ -465,6 +465,7 @@ class LenstronomyOracleTests(unittest.TestCase):
             atol=3e-14,
         )
 
+    @unittest.skipUnless(importlib.util.find_spec("caustics"), "requires caustics")
     def test_public_macroimage_solver_matches_point_mass_oracle(self) -> None:
         """Validate image positions, magnifications, and relative delays."""
 
@@ -473,39 +474,20 @@ class LenstronomyOracleTests(unittest.TestCase):
         theta_e = 0.9
         beta_x, beta_y = 0.18, -0.07
 
-        def raytrace(x, y):
-            radius2 = (x.square() + y.square()).clamp_min(1.0e-30)
-            scale = theta_e**2 / radius2
-            return x * (1.0 - scale), y * (1.0 - scale)
+        import caustics
+        from astropy.cosmology import FlatLambdaCDM
 
-        def jacobian(x, y):
-            radius2 = (x.square() + y.square()).clamp_min(1.0e-30)
-            radius4 = radius2.square()
-            potential_xx = theta_e**2 * (y.square() - x.square()) / radius4
-            potential_xy = -2.0 * theta_e**2 * x * y / radius4
-            result = torch.empty((*x.shape, 2, 2), dtype=x.dtype, device=x.device)
-            result[..., 0, 0] = 1.0 - potential_xx
-            result[..., 0, 1] = -potential_xy
-            result[..., 1, 0] = -potential_xy
-            result[..., 1, 1] = 1.0 + potential_xx
-            return result
-
-        def delay(x, y):
-            radius = torch.hypot(x, y).clamp_min(1.0e-30)
-            return 0.5 * (
-                (x - beta_x).square() + (y - beta_y).square()
-            ) - theta_e**2 * torch.log(radius)
-
-        model = mc.CallableMacroModel(raytrace, jacobian, delay, name="point_mass")
-        solutions = mc.solve_macroimages(
-            model,
-            beta_x,
-            beta_y,
-            initial_grid_size=100,
-            field_of_view_arcsec=2.2,
-            source_tolerance_arcsec=0.045,
-            cluster_tolerance_arcsec=0.12,
-            deduplication_tolerance_arcsec=0.05,
+        cosmology = caustics.FlatLambdaCDM(
+            h0=torch.tensor(0.7, dtype=torch.float64),
+            Om0=torch.tensor(0.3, dtype=torch.float64),
+        ).to(dtype=torch.float64)
+        native_lens = caustics.Point(
+            cosmology, z_l=0.5, z_s=1.5, x0=0.0, y0=0.0,
+            Rein=torch.tensor(theta_e, dtype=torch.float64),
+        ).to(dtype=torch.float64)
+        solutions = mc.solve_caustics_macroimages(
+            native_lens, beta_x, beta_y,
+            initial_grid_size=100, field_of_view_arcsec=2.2,
         )
         self.assertEqual(len(solutions), 2)
 
@@ -525,7 +507,10 @@ class LenstronomyOracleTests(unittest.TestCase):
                 np.min(np.linalg.norm(actual_positions - expected, axis=1)), 2e-9
             )
 
-        lens = LensModel(lens_model_list=["POINT_MASS"])
+        lens = LensModel(
+            lens_model_list=["POINT_MASS"], z_lens=0.5, z_source=1.5,
+            cosmo=FlatLambdaCDM(H0=70.0, Om0=0.3),
+        )
         kwargs = [{"theta_E": theta_e, "center_x": 0.0, "center_y": 0.0}]
         x, y = actual_positions[:, 0], actual_positions[:, 1]
         source_x, source_y = lens.ray_shooting(x, y, kwargs)
@@ -538,13 +523,13 @@ class LenstronomyOracleTests(unittest.TestCase):
             rtol=2e-9,
             atol=2e-9,
         )
-        expected_delays = np.asarray(delay(torch.as_tensor(x), torch.as_tensor(y)))
+        expected_delays = np.asarray(lens.arrival_time(x, y, kwargs))
         expected_delays -= expected_delays.min()
         np.testing.assert_allclose(
             [solution.arrival_time_delay_days for solution in solutions],
             expected_delays,
-            rtol=0.0,
-            atol=2e-9,
+            rtol=2e-6,  # caustics interpolates cosmological distances
+            atol=1e-6,
         )
 
 

@@ -7,7 +7,7 @@
 | Linux | NVIDIA CUDA | Triton float32 | Upstream-supported fused IPM and Taylor far-field paths |
 | Windows | NVIDIA CUDA | Triton float32 | Fast fused paths through the community `triton-windows` distribution |
 | Windows or Linux | CPU | eager or compiled Torch | Portable reference and small jobs |
-| macOS | Apple MPS | compiled/eager Torch | Float32. Support follows PyTorch |
+| macOS | Apple MPS | compiled/eager Torch | Float32. IPM rasterization and far-field builds run batched on the GPU |
 | macOS | CPU | eager or compiled Torch | Portable fallback, including float64 |
 
 Use `RuntimeConfig(device="auto", backend="auto")` for portable scripts. For
@@ -15,9 +15,11 @@ benchmark claims, request the intended backend with `strict_backend=True` so a
 fallback cannot be mistaken for an accelerated timing.
 
 `Backend.TORCH_COMPILE` compiles the exact point-mass reductions, Taylor far-field
-queries, and IRS deposition. The portable exact IPM polygon clipper remains a
+queries, and IRS deposition. On CPU and CUDA without Triton, the exact IPM polygon clipper remains a
 Python reference implementation, so IPM results requested with this backend
-report `torch-compile-partial`. Their metadata lists ray tracing,
+report `torch-compile-partial`. Apple MPS rasterizes IPM maps on the GPU with a
+batched PyTorch port of the Triton direct-cell kernel (metadata
+`rasterizer="torch_direct_cell_scanline"`). Their metadata lists ray tracing,
 interpolation, and rasterization separately. CUDA float32 uses the fully fused
 Triton IPM rasterizer. On Windows CPU, compiled Torch requires a discoverable
 C++ compiler. Automatic selection uses eager Torch when that toolchain is not

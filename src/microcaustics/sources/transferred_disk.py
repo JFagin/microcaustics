@@ -27,6 +27,12 @@ from .thin_disk import (
 )
 from .triton_thermal_flux import triton_thermal_flux
 
+# MPS flushes float32 subnormals to zero, and the Jy m^-2 brightness of faint
+# pixels is subnormal (down to ~1e-43). The MPS flux kernel scales the solid
+# angle by this exact power of two and unscales the sums, which keeps faint
+# pixels normal. Other devices keep the original arithmetic.
+_MPS_FLUX_SCALE = 2.0**64
+
 
 def _planck_brightness(
     temperature4: torch.Tensor,
@@ -154,10 +160,17 @@ def _transferred_arguments(
     return arguments, compatible_runtime
 
 
-def _transferred_brightness_from_temperature4(temperature4, **kwargs):
-    """Evaluate Planck brightness with the physical source's compiled runtime."""
+def _transferred_brightness_from_temperature4(temperature4, *, scale=1.0, **kwargs):
+    """Evaluate Planck brightness with the physical source's compiled runtime.
+
+    ``scale`` multiplies the result through the solid angle. An exact power of
+    two such as ``_MPS_FLUX_SCALE`` keeps faint pixels out of the subnormal
+    range on devices that flush subnormals.
+    """
 
     arguments, compatible_runtime = _transferred_arguments(temperature4, **kwargs)
+    if scale != 1.0:
+        arguments = (*arguments[:2], arguments[2] * scale, *arguments[3:])
     if compatible_runtime is None:
         return _transferred_brightness_kernel(*arguments)
     brightness, _ = run_tensor_kernel(
@@ -185,6 +198,9 @@ def _transferred_flux_kernel(left, right, fraction, *arguments):
     # evaluate Planck emission in registers and write only partial fluxes.
     pixels = gfactor.numel()
     tile = 64 if pixels % 64 == 0 else 1
+    rescale = gfactor.device.type == "mps"
+    if rescale:
+        solid_angle = solid_angle * _MPS_FLUX_SCALE
     brightness = _planck_brightness(
         temperature4.reshape(temperature4.shape[0], 1, -1, tile),
         gfactor.reshape(1, 1, -1, tile),
@@ -198,7 +214,11 @@ def _transferred_flux_kernel(left, right, fraction, *arguments):
     left = left.expand(-1, *gfactor.shape).reshape(left.shape[0], 1, -1, tile)
     right = right.expand(-1, *gfactor.shape).reshape(right.shape[0], 1, -1, tile)
     magnification = left + fraction[:, None, None, None] * (right - left)
-    return (brightness * magnification).sum(-1).sum(-1), brightness.sum(-1).sum(-1)
+    lensed = (brightness * magnification).sum(-1).sum(-1)
+    intrinsic = brightness.sum(-1).sum(-1)
+    if rescale:
+        return lensed / _MPS_FLUX_SCALE, intrinsic / _MPS_FLUX_SCALE
+    return lensed, intrinsic
 
 
 def _transferred_flux_from_temperature4(temperature4, left, right, fraction, **kwargs):

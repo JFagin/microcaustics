@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .runtime import ResolvedRuntime, RuntimeConfig, _resolve_high_precision_device
+
 
 @dataclass(frozen=True)
 class MapComparison:
@@ -37,10 +39,28 @@ class LightCurveComparison:
     constant_offset_removed: bool = False
 
 
-def compare_magnification_maps(candidate, reference) -> MapComparison:
-    """Compare two magnification arrays without fitting an offset or scale."""
+def compare_magnification_maps(
+    candidate,
+    reference,
+    *,
+    runtime: RuntimeConfig | ResolvedRuntime | None = None,
+    device: str | torch.device | None = None,
+) -> MapComparison:
+    """Compare maps in float64 without fitting an offset or scale.
 
-    candidate_tensor = torch.as_tensor(candidate, dtype=torch.float64)
+    An explicit device overrides runtime.high_precision_device. Otherwise
+    retain the candidate device, as before. Inputs are not modified.
+    """
+
+    candidate_tensor = (
+        candidate
+        if isinstance(candidate, torch.Tensor)
+        else torch.as_tensor(candidate, dtype=torch.float64)
+    )
+    target = _resolve_high_precision_device(
+        runtime, device=device, default=candidate_tensor.device
+    )
+    candidate_tensor = candidate_tensor.to(device=target, dtype=torch.float64)
     reference_tensor = torch.as_tensor(
         reference,
         device=candidate_tensor.device,
@@ -67,7 +87,9 @@ def compare_magnification_maps(candidate, reference) -> MapComparison:
     absolute = magnitude_mmag.abs()
     return MapComparison(
         linear_nrmse=float(linear_nrmse.detach().cpu()),
-        fractional_nrmse=float(torch.sqrt(torch.mean(fractional.square())).detach().cpu()),
+        fractional_nrmse=float(
+            torch.sqrt(torch.mean(fractional.square())).detach().cpu()
+        ),
         rmse_mmag=float(torch.sqrt(torch.mean(magnitude_mmag.square())).detach().cpu()),
         bias_mmag=float(torch.mean(magnitude_mmag).detach().cpu()),
         p95_absolute_mmag=float(torch.quantile(absolute, 0.95).detach().cpu()),
@@ -80,15 +102,27 @@ def compare_light_curves(
     reference_flux,
     *,
     remove_constant_offset: bool = False,
+    runtime: RuntimeConfig | ResolvedRuntime | None = None,
+    device: str | torch.device | None = None,
 ) -> LightCurveComparison:
     """Compare positive fluxes in millimagnitudes.
 
     By default a constant magnification offset is retained. Set
     ``remove_constant_offset=True`` only for an explicitly shape-only audit;
     the median magnitude residual is then removed before calculating errors.
+    An explicit ``device`` overrides ``runtime.high_precision_device``.
+    Without either, computation remains on the candidate tensor's device.
     """
 
-    candidate = torch.as_tensor(candidate_flux, dtype=torch.float64)
+    candidate = (
+        candidate_flux
+        if isinstance(candidate_flux, torch.Tensor)
+        else torch.as_tensor(candidate_flux, dtype=torch.float64)
+    )
+    target = _resolve_high_precision_device(
+        runtime, device=device, default=candidate.device
+    )
+    candidate = candidate.to(device=target, dtype=torch.float64)
     reference = torch.as_tensor(
         reference_flux,
         device=candidate.device,

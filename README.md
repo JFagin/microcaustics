@@ -6,11 +6,12 @@ validated in the accompanying methods paper.
 
 ![Ten-year Q2237 image-B-like dynamic magnification map with source-plane caustics](docs/assets/q2237_image_b_dynamic_magnification.gif)
 
-The animation is a complete 147-frame output of the
+The animation uses the physical setup from the
 [Q2237 light-curve tutorial](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb).
-It shows a ten-year, $10^7$-ray, $1024^2$ dynamic IPM calculation with the
-caustic network overlaid. Its map normalization, colorbar, and indexed GIF
-palette are fixed globally across all frames. This stellar realization was
+This higher-resolution version uses $4\times10^7$ rays and $2048^2$ maps,
+with 366 frames covering ten years at ten-day intervals, played at 20 frames
+per second. The caustic network is overlaid. Its map normalization, colorbar,
+and indexed GIF palette are fixed globally across all frames. This stellar realization was
 selected to illustrate a dense caustic network and source-center crossings.
 
 ### Fast CUDA production path
@@ -157,8 +158,9 @@ importable Triton package. This path is significantly faster than compiled PyTor
   and then follow the Linux path above. This stays within upstream Triton's
   supported operating system.
 - **macOS or CPU.** Triton is not used. The package selects its portable
-  eager/compiled PyTorch implementation. Apple MPS is supported where PyTorch
-  supports the requested operations.
+  eager/compiled PyTorch implementation. On Apple MPS, IPM maps are rasterized
+  on the GPU by a batched PyTorch port of the Triton direct-cell kernel, so
+  `RuntimeConfig(device="auto")` runs the whole map pipeline on the Apple GPU.
 
 Check the detected runtime.
 
@@ -829,8 +831,9 @@ an advanced experiment needs an explicit numerical configuration.
 Both use `N=10_000_000, r=2, v=4` by default. These are not fixed constants. The implementation
 supports arbitrary sensible ray budgets and scout ratios, as well as
 `virtual_refinement >= refinement >= 1`. CUDA float32 automatically uses the
-direct-cell Triton rasterizer for `v <= 16`. CPU, Apple, float64, and larger
-`v` use the same numerical method through the exact portable rasterizer. See
+direct-cell Triton rasterizer for `v <= 16`. Apple MPS uses a batched PyTorch
+port of that rasterizer on the GPU. CPU, CUDA without Triton, and larger `v` on
+CUDA use the same numerical method through the exact portable rasterizer. See
 [`docs/ipm.md`](docs/ipm.md) for the meaning and tradeoffs of `N`, `k`, `r`,
 and `v`.
 The validated scout uses `scout_halo_pixels=0` and

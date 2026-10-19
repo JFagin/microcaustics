@@ -41,9 +41,19 @@ jobs:
       - name: Build distributions
         run: python -m build
 
-  lenstronomy-oracle:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  optional-integrations:
+    name: Optional integrations / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      MICROCAUSTICS_RUN_LENSTRONOMY: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -51,8 +61,22 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install independent validation dependencies
-        run: python -m pip install -e ".[test,validation]"
-      - name: Compare against lenstronomy
-        run: python -m pytest -q tests/test_external_oracles.py
-        env:
-          MICROCAUSTICS_RUN_LENSTRONOMY: "1"
+        run: python -m pip install -e ".[test,validation,macro]"
+      - name: Check dependency compatibility
+        run: python -m pip check
+      - name: Require optional integrations for this job
+        run: >-
+          python -c "import caustics, scipy, astropy; from lenstronomy.LensModel.lens_model import LensModel; from speclite.filters import load_filters; from importlib.metadata import version; print({name: version(name) for name in ('torch', 'caustics', 'lenstronomy', 'scipy', 'astropy', 'speclite')})"
+      - name: Test optional integrations and independent comparisons
+        run: >-
+          python -m pytest -q
+          tests/test_external_oracles.py
+          tests/test_native_macroimages.py
+          tests/test_legacy_macro_solver.py
+          tests/test_caustics_adapter.py
+          tests/test_rendering.py
+          tests/test_high_precision_device.py
+          tests/test_lamppost_numerics.py
+          tests/test_response_rebin.py
+          tests/test_lens_populations.py
+          tests/test_spectra.py

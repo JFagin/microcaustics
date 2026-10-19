@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from functools import partial
 from time import perf_counter
 from typing import TYPE_CHECKING
 
@@ -14,7 +15,7 @@ import torch.nn.functional as torch_functional
 from ..config import Backend, IPMConfig
 from ..geometry import PlaneGrid, PlaneRegion
 from ..results import MagnificationMap, TimingBreakdown
-from ..runtime import warn_backend_fallback, warn_compilation
+from ..runtime import portable_accelerator, warn_backend_fallback, warn_compilation
 
 _PREPARED_TRITON_IPM_SPECIALIZATIONS: set[tuple[object, ...]] = set()
 
@@ -736,7 +737,8 @@ def rasterize_triangles_exact_eager(
         raise ValueError("triangles must have shape [triangle, 3, 2]")
     if lens_area_per_triangle_uas2 <= 0:
         raise ValueError("lens_area_per_triangle_uas2 must be positive")
-    triangle_array = triangles.detach().to(device="cpu", dtype=torch.float64).numpy()
+    # Copy before casting: a single MPS -> CPU float64 .to() returns zeros.
+    triangle_array = triangles.detach().cpu().to(torch.float64).numpy()
     ny, nx = grid.shape
     dy, dx = grid.pixel_scale_uas
     xmin, xmax, ymin, ymax = grid.bounds_uas
@@ -793,6 +795,22 @@ def rasterize_triangles_exact_eager(
                 )
                 output[row, column] += density * _polygon_area(polygon)
     return torch.as_tensor(output, device=triangles.device, dtype=triangles.dtype)
+
+
+def _tensor_rasterizer(runtime) -> bool:
+    """Whether non-Triton maps use the batched tensor rasterizer.
+
+    Accelerators without Triton (Apple MPS) rasterize on the device. The CPU
+    and CUDA without Triton keep the exact Python reference.
+    """
+
+    return portable_accelerator(runtime.device)
+
+
+def _rasterization_label(use_triton: bool, runtime) -> str:
+    if use_triton:
+        return "triton"
+    return "torch-tensor" if _tensor_rasterizer(runtime) else "python-exact-reference"
 
 
 @torch.no_grad()
@@ -923,6 +941,7 @@ def full_field_ipm(
     trace_backends: set[str] = set()
 
     def _calculate_map(accelerated: bool) -> torch.Tensor:
+        from .torch_ipm import TorchRasterWorkspace, accumulate_cells_torch
         from .triton_ipm import (
             TritonRasterWorkspace,
             accumulate_cells_triton,
@@ -933,11 +952,18 @@ def full_field_ipm(
             device=runtime.device,
             dtype=runtime.dtype,
         )
-        workspace = (
-            TritonRasterWorkspace.create(source_grid.shape, device=runtime.device)
-            if accelerated
-            else None
-        )
+        if accelerated:
+            workspace = TritonRasterWorkspace.create(
+                source_grid.shape, device=runtime.device
+            )
+            accumulate = accumulate_cells_triton
+        elif _tensor_rasterizer(runtime):
+            workspace = TorchRasterWorkspace.create(
+                source_grid.shape, device=runtime.device, dtype=runtime.dtype
+            )
+            accumulate = partial(accumulate_cells_torch, runtime=runtime)
+        else:
+            workspace = None
         source_dy, source_dx = source_grid.pixel_scale_uas
         source_xmin, _, source_ymin, _ = source_grid.bounds_uas
         selected_count = int(cell_indices.numel())
@@ -1004,7 +1030,7 @@ def full_field_ipm(
                     virtual_refinement=side,
                 )
             if workspace is not None:
-                accumulate_cells_triton(
+                accumulate(
                     workspace,
                     virtual_x,
                     virtual_y,
@@ -1115,11 +1141,13 @@ def full_field_ipm(
                     if use_triton and refinement == 2 and side == 4
                     else "torch-eager"
                 ),
-                "rasterization": ("triton" if use_triton else "python-exact-reference"),
+                "rasterization": _rasterization_label(use_triton, runtime),
             },
             "rasterizer": (
                 "triton_direct_cell_scanline"
                 if use_triton
+                else "torch_direct_cell_scanline"
+                if _tensor_rasterizer(runtime)
                 else "exact_sutherland_hodgman_reference"
             ),
             **scout_metadata,
@@ -1379,6 +1407,7 @@ def temporal_batch_ipm(
             )
 
     def calculate(accelerated: bool) -> torch.Tensor:
+        from .torch_ipm import TorchRasterWorkspace, accumulate_cells_torch
         from .triton_ipm import TritonRasterWorkspace, accumulate_cells_triton
 
         output = torch.zeros(
@@ -1386,15 +1415,23 @@ def temporal_batch_ipm(
             device=runtime.device,
             dtype=runtime.dtype,
         )
-        workspace = (
-            TritonRasterWorkspace.create(
+        if accelerated:
+            workspace = TritonRasterWorkspace.create(
                 source_grid.shape,
                 device=runtime.device,
                 frames=total_frames,
             )
-            if accelerated
-            else None
-        )
+            accumulate = accumulate_cells_triton
+        elif _tensor_rasterizer(runtime):
+            workspace = TorchRasterWorkspace.create(
+                source_grid.shape,
+                device=runtime.device,
+                dtype=runtime.dtype,
+                frames=total_frames,
+            )
+            accumulate = partial(accumulate_cells_torch, runtime=runtime)
+        else:
+            workspace = None
         selected_count = int(cell_indices.numel())
         compact_traced_x = compact_traced_y = None
         if compact_sparse_nodes:
@@ -1529,7 +1566,7 @@ def temporal_batch_ipm(
             )
             virtual_y = virtual_y.reshape_as(virtual_x)
             if workspace is not None:
-                accumulate_cells_triton(
+                accumulate(
                     workspace,
                     virtual_x,
                     virtual_y,
@@ -1655,13 +1692,13 @@ def temporal_batch_ipm(
                             if use_triton and refinement == 2 and virtual == 4
                             else "torch-eager"
                         ),
-                        "rasterization": (
-                            "triton" if use_triton else "python-exact-reference"
-                        ),
+                        "rasterization": _rasterization_label(use_triton, runtime),
                     },
                     "rasterizer": (
                         "triton_direct_cell_temporal_batch"
                         if use_triton
+                        else "torch_direct_cell_temporal_batch"
+                        if _tensor_rasterizer(runtime)
                         else "exact_sutherland_hodgman_temporal_reference"
                     ),
                     "temporal_solver_fused": bool(use_triton),

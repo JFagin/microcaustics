@@ -132,6 +132,9 @@ class CDFResponseRebinner:
         runtime_device = runtime.device
         if runtime_device.type == "cuda" and runtime_device.index is None:
             runtime_device = torch.device("cuda", torch.cuda.current_device())
+        elif runtime_device.type == "mps" and runtime_device.index is None:
+            # MPS tensors report mps:0 even when the runtime requests mps.
+            runtime_device = torch.device("mps", 0)
         if runtime_device != edges.device or runtime.dtype != edges.dtype:
             raise ValueError("rebin runtime must match the delay-grid device and dtype")
         self.runtime = runtime

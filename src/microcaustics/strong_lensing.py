@@ -3,115 +3,16 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping, Sequence
+import warnings
+from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
 
-import numpy as np
 import torch
+from torch.overrides import TorchFunctionMode
 
 from .lens import MacroLens
-
-
-@runtime_checkable
-class MacroModel(Protocol):
-    """Minimal global lens-model contract used by the image solver.
-
-    Coordinates are angular arcseconds and delays are observer-frame days.
-    Implementations may use ``caustics``, analytic expressions, another
-    lensing package, or arbitrary user callables.
-    """
-
-    def raytrace(
-        self,
-        x_arcsec: torch.Tensor,
-        y_arcsec: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Map image-plane coordinates into the source plane."""
-
-        ...
-
-    def jacobian_lens_equation(
-        self,
-        x_arcsec: torch.Tensor,
-        y_arcsec: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return ``d beta / d theta`` with trailing shape ``[2, 2]``."""
-
-        ...
-
-    def time_delay_days(
-        self,
-        x_arcsec: torch.Tensor,
-        y_arcsec: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return consistently normalized arrival times in days."""
-
-        ...
-
-
-@dataclass(frozen=True)
-class CallableMacroModel:
-    """Adapt three user callables to the general :class:`MacroModel` API."""
-
-    raytrace_function: Callable
-    jacobian_function: Callable
-    time_delay_function: Callable
-    name: str = "callable_macro_model"
-    user_metadata: Mapping[str, object] | None = None
-
-    def raytrace(self, x_arcsec, y_arcsec):
-        """Evaluate and validate the user ray-tracing callable."""
-
-        output = self.raytrace_function(x_arcsec, y_arcsec)
-        if not isinstance(output, tuple) or len(output) != 2:
-            raise ValueError("raytrace_function must return an (x, y) tuple")
-        beta_x = torch.as_tensor(
-            output[0],
-            device=x_arcsec.device,
-            dtype=x_arcsec.dtype,
-        )
-        beta_y = torch.as_tensor(
-            output[1],
-            device=x_arcsec.device,
-            dtype=x_arcsec.dtype,
-        )
-        if beta_x.shape != x_arcsec.shape or beta_y.shape != y_arcsec.shape:
-            raise ValueError("raytrace_function outputs must match the inputs")
-        return beta_x, beta_y
-
-    def jacobian_lens_equation(self, x_arcsec, y_arcsec):
-        """Evaluate and validate the user Jacobian callable."""
-
-        value = torch.as_tensor(
-            self.jacobian_function(x_arcsec, y_arcsec),
-            device=x_arcsec.device,
-            dtype=x_arcsec.dtype,
-        )
-        if value.shape != (*x_arcsec.shape, 2, 2):
-            raise ValueError("jacobian_function must return shape [*input, 2, 2]")
-        return value
-
-    def time_delay_days(self, x_arcsec, y_arcsec):
-        """Evaluate and validate the user time-delay callable."""
-
-        value = torch.as_tensor(
-            self.time_delay_function(x_arcsec, y_arcsec),
-            device=x_arcsec.device,
-            dtype=x_arcsec.dtype,
-        )
-        if value.shape != x_arcsec.shape:
-            raise ValueError("time_delay_function output must match the input")
-        return value
-
-    def metadata(self) -> Mapping[str, object]:
-        """Return user-supplied model provenance."""
-
-        return {
-            "type": "callable",
-            "name": self.name,
-            **dict(self.user_metadata or {}),
-        }
+from .runtime import _resolve_high_precision_device
 
 
 @dataclass(frozen=True)
@@ -136,6 +37,8 @@ class CausticsMacroModel:
 
         if parameters is None:
             return False
+        if isinstance(parameters, Mapping):
+            return True
         try:
             return int(torch.as_tensor(parameters).numel()) > 0
         except (TypeError, ValueError):
@@ -181,7 +84,11 @@ class CausticsMacroModel:
 
 @dataclass(frozen=True)
 class MacroImageSolution:
-    """One solved macroimage and its local microlensing approximation."""
+    """One solved macroimage and its local microlensing approximation.
+
+    ``local_microlensing_supported`` is false for multi-plane lenses or
+    rotating Jacobians that cannot be represented by convergence and shear.
+    """
 
     name: str
     x_arcsec: float
@@ -196,6 +103,7 @@ class MacroImageSolution:
     shear_gamma2: float
     shear_angle_deg: float
     source_residual_arcsec: float
+    local_microlensing_supported: bool = True
 
     @property
     def shear_angle_rad(self) -> float:
@@ -210,6 +118,15 @@ class MacroImageSolution:
     ) -> MacroLens:
         """Return the local convergence/shear model for microlensing."""
 
+        if not self.local_microlensing_supported:
+            warnings.warn(
+                "Conversion of multi-plane lenses or rotating Jacobians to a "
+                "local microlensing model is not currently supported. The "
+                "returned convergence/shear approximation omits lens-plane "
+                "coupling and any image rotation.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return MacroLens(
             convergence=self.convergence,
             shear=self.shear,
@@ -218,162 +135,56 @@ class MacroImageSolution:
         )
 
 
-@torch.no_grad()
-def solve_macroimages(
-    model: MacroModel,
-    source_x_arcsec: float,
-    source_y_arcsec: float,
-    *,
-    image_names: Sequence[str] | None = None,
-    initial_grid_size: int = 200,
-    field_of_view_arcsec: float = 3.0,
-    source_tolerance_arcsec: float | None = None,
-    cluster_tolerance_arcsec: float | None = None,
-    deduplication_tolerance_arcsec: float | None = None,
-    maximum_function_evaluations: int = 200,
-    refinement_tolerance_arcsec: float = 1.0e-8,
-    dtype: torch.dtype = torch.float64,
-    device: torch.device | str = "cpu",
-) -> tuple[MacroImageSolution, ...]:
-    """Solve macroimages for any model implementing :class:`MacroModel`.
 
-    A regular grid supplies robust seeds and SciPy refines roots of the lens
-    equation. The model's Jacobian supplies magnification and local
-    convergence/shear. Its arrival-time function supplies relative delays.
-    A candidate is retained only when SciPy reports convergence and its
-    source-plane residual is no larger than ``refinement_tolerance_arcsec``.
-    Results are sorted by arrival time before names are assigned.
-    """
 
-    try:
-        from scipy.optimize import least_squares
-    except ImportError as error:
-        raise ImportError("macroimage root solving requires scipy>=1.10") from error
-    if not isinstance(model, MacroModel):
-        raise TypeError("model must implement the MacroModel protocol")
-    if initial_grid_size < 8 or field_of_view_arcsec <= 0:
-        raise ValueError("initial_grid_size and field_of_view_arcsec are too small")
-    if not math.isfinite(source_x_arcsec) or not math.isfinite(source_y_arcsec):
-        raise ValueError("source position must be finite")
-    if maximum_function_evaluations < 1:
-        raise ValueError("maximum_function_evaluations must be positive")
-    resolved_device = torch.device(device)
+def _macroimage_solutions(
+    model, x, y, residual, image_names, *, include_central_images=False
+):
+    """Convert lens-supplied derivatives and delays to the public result."""
 
-    def tensor(value):
-        return torch.as_tensor(value, dtype=dtype, device=resolved_device)
-
-    beta_x, beta_y = tensor(source_x_arcsec), tensor(source_y_arcsec)
-    pixel = 2.0 * field_of_view_arcsec / (initial_grid_size - 1)
-    source_tolerance = (
-        0.75 * pixel
-        if source_tolerance_arcsec is None
-        else float(source_tolerance_arcsec)
-    )
-    cluster_tolerance = (
-        2.5 * pixel
-        if cluster_tolerance_arcsec is None
-        else float(cluster_tolerance_arcsec)
-    )
-    deduplication_tolerance = (
-        3.0 * pixel
-        if deduplication_tolerance_arcsec is None
-        else float(deduplication_tolerance_arcsec)
-    )
-    if (
-        min(
-            source_tolerance,
-            cluster_tolerance,
-            deduplication_tolerance,
-            refinement_tolerance_arcsec,
-        )
-        <= 0
-    ):
-        raise ValueError("image-finding tolerances must be positive")
-
-    axis = torch.linspace(
-        -field_of_view_arcsec,
-        field_of_view_arcsec,
-        initial_grid_size,
-        dtype=dtype,
-        device=resolved_device,
-    )
-    grid_x, grid_y = torch.meshgrid(axis, axis, indexing="xy")
-    flat_x, flat_y = grid_x.reshape(-1), grid_y.reshape(-1)
-    traced_x, traced_y = model.raytrace(flat_x, flat_y)
-    residual = torch.hypot(traced_x - beta_x, traced_y - beta_y)
-    # The grid is only a robust seed finder. Nearby selected pixels are merged
-    # before continuous root refinement so one image does not launch many fits.
-    selected = residual < source_tolerance
-    if not bool(torch.any(selected)):
-        raise RuntimeError("no macroimage seeds found. Enlarge the field or tolerance")
-    candidates = torch.stack((flat_x[selected], flat_y[selected]), dim=1)
-    candidates = candidates.detach().cpu().numpy()
-    clusters: list[list[np.ndarray]] = []
-    for point in candidates:
-        for cluster in clusters:
-            if np.linalg.norm(point - np.mean(cluster, axis=0)) < cluster_tolerance:
-                cluster.append(point)
-                break
-        else:
-            clusters.append([point])
-    guesses = [np.mean(cluster, axis=0) for cluster in clusters]
-
-    def residual_function(position):
-        x, y = tensor([position[0]]), tensor([position[1]])
-        traced = model.raytrace(x, y)
-        return np.array(
-            [float(traced[0][0] - beta_x), float(traced[1][0] - beta_y)],
-            dtype=np.float64,
-        )
-
-    def jacobian_function(position):
-        x, y = tensor([position[0]]), tensor([position[1]])
-        jacobian = model.jacobian_lens_equation(x, y)[0]
-        return jacobian.detach().cpu().numpy().astype(np.float64)
-
-    refined = []
-    for guess in guesses:
-        fit = least_squares(
-            residual_function,
-            np.asarray(guess, dtype=np.float64),
-            jac=jacobian_function,
-            method="trf",
-            ftol=1.0e-10,
-            xtol=1.0e-10,
-            gtol=1.0e-10,
-            max_nfev=maximum_function_evaluations,
-        )
-        fit_residual = float(np.linalg.norm(fit.fun))
-        if (
-            fit.success
-            and np.isfinite(fit_residual)
-            and fit_residual <= refinement_tolerance_arcsec
-        ):
-            refined.append((fit_residual, float(fit.x[0]), float(fit.x[1])))
-    refined.sort(key=lambda value: value[0])
-    # Keep the lowest-residual representative of each converged image. This
-    # second deduplication is required because separate seed clusters can flow
-    # to the same nonlinear root.
-    unique = []
-    for candidate in refined:
-        if all(
-            math.hypot(candidate[1] - other[1], candidate[2] - other[2])
-            >= deduplication_tolerance
-            for other in unique
-        ):
-            unique.append(candidate)
-    if not unique:
-        raise RuntimeError("macroimage root refinement did not produce a valid image")
-
-    x = tensor([value[1] for value in unique])
-    y = tensor([value[2] for value in unique])
     jacobian = model.jacobian_lens_equation(x, y)
-    if jacobian.shape != (len(unique), 2, 2):
+    if jacobian.shape != (x.numel(), 2, 2):
         raise ValueError("macro-model Jacobian must have shape [image, 2, 2]")
     determinant = torch.linalg.det(jacobian)
     singular = ~torch.isfinite(determinant) | (determinant.abs() <= 1.0e-10)
     if bool(torch.any(singular)):
         raise RuntimeError("macroimage solution contains a singular Jacobian")
+    is_multiplane = False
+    if isinstance(model, CausticsMacroModel):
+        try:
+            from caustics.lenses.base import ThickLens
+        except ImportError:
+            pass
+        else:
+            # A multi-plane arrival-time Hessian is not just the 2x2 source
+            # Jacobian, even when that Jacobian happens to be symmetric.
+            is_multiplane = isinstance(model.lens, ThickLens)
+    tolerance = (
+        64 * torch.finfo(jacobian.dtype).eps
+        * jacobian.abs().amax(dim=(-1, -2)).clamp_min(1.0)
+    )
+    symmetric = (
+        (jacobian - jacobian.transpose(-1, -2)).abs().amax(dim=(-1, -2))
+        <= tolerance
+    )
+    local_supported = symmetric & (not is_multiplane)
+    classify_maxima = not include_central_images and not is_multiplane
+    if classify_maxima:
+        # For a single-plane lens J is the arrival-time Hessian up to a
+        # positive factor. Two negative eigenvalues identify a maximum, not
+        # a minimum or saddle. Do not apply this test to rotating/asymmetric
+        # multi-plane Jacobians, or force an arbitrary two/four-image count.
+        symmetric_part = 0.5 * (jacobian + jacobian.transpose(-1, -2))
+        maximum = symmetric & (torch.linalg.eigvalsh(symmetric_part)[:, -1] < -tolerance)
+        keep = ~maximum
+        if not bool(keep.any()):
+            raise RuntimeError(
+                "all solved macroimages are central arrival-time maxima. "
+                "Use include_central_images=True to retain them"
+            )
+        x, y, residual = x[keep], y[keep], residual[keep]
+        jacobian, determinant = jacobian[keep], determinant[keep]
+        local_supported = local_supported[keep]
     a_xx, a_xy = jacobian[:, 0, 0], jacobian[:, 0, 1]
     a_yx, a_yy = jacobian[:, 1, 0], jacobian[:, 1, 1]
     convergence = 1.0 - 0.5 * (a_xx + a_yy)
@@ -417,10 +228,168 @@ def solve_macroimages(
                 shear_gamma1=float(gamma1[solution_index]),
                 shear_gamma2=float(gamma2[solution_index]),
                 shear_angle_deg=math.degrees(float(angle[solution_index])),
-                source_residual_arcsec=float(unique[solution_index][0]),
+                source_residual_arcsec=float(residual[solution_index]),
+                local_microlensing_supported=bool(local_supported[solution_index]),
             )
         )
     return tuple(solutions)
+
+
+class _CausticsGridPrecision(TorchFunctionMode):
+    """Keep untyped caustics search grids in the requested precision.
+
+    Caustics 1.7.1 creates its initial linspace without a dtype. This scoped,
+    thread-local context avoids changing either caustics or torch defaults.
+    Explicitly typed factories are left alone.
+    """
+
+    def __init__(self, dtype, device, *, recover_singular=False):
+        super().__init__()
+        self.dtype = dtype
+        self.device = device
+        self.recover_singular = recover_singular
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = dict(kwargs or {})
+        if func is torch.linspace and kwargs.get("dtype") is None:
+            kwargs["dtype"] = self.dtype
+            kwargs.setdefault("device", self.device)
+        if (
+            self.recover_singular
+            and func is torch.linalg.solve
+            and len(args) == 2
+            and not kwargs
+            and args[0].shape == (2, 2)
+            and args[1].shape == (2,)
+        ):
+            # Native LM solves two-dimensional normal equations under vmap.
+            # Its absolute damping can round away near a singular lens centre.
+            # Keep nonsingular steps unchanged. For failed steps only, use the
+            # minimum-norm solution; native refinement and our residual checks
+            # still decide whether a trial point is an acceptable image.
+            matrix, rhs = args
+            step, info = torch.linalg.solve_ex(matrix, rhs, check_errors=False)
+            failed = info != 0
+            repair_matrix = torch.where(
+                failed, matrix, torch.eye(2, dtype=matrix.dtype, device=matrix.device)
+            )
+            repair = torch.linalg.pinv(repair_matrix) @ rhs
+            return torch.where(failed, repair, step)
+        return func(*args, **kwargs)
+
+
+def _solve_native_caustics_macroimages(
+    model,
+    source_x_arcsec,
+    source_y_arcsec,
+    *,
+    image_names=None,
+    include_central_images=False,
+    initial_grid_size=100,
+    field_of_view_arcsec=3.0,
+    refinement_tolerance_arcsec=1.0e-8,
+    max_depth=25,
+    warn_on_nonconvergence=True,
+    dtype=torch.float64,
+    device=None,
+    runtime=None,
+):
+    """Delegate image finding to caustics, then check the returned roots."""
+
+    if not callable(getattr(model.lens, "forward_raytrace", None)):
+        raise TypeError("lens must provide caustics forward_raytrace")
+    if not isinstance(initial_grid_size, int) or initial_grid_size < 8:
+        raise ValueError("initial_grid_size must be an integer of at least 8")
+    if not math.isfinite(field_of_view_arcsec) or field_of_view_arcsec <= 0:
+        raise ValueError("field_of_view_arcsec must be finite and positive")
+    if not math.isfinite(source_x_arcsec) or not math.isfinite(source_y_arcsec):
+        raise ValueError("source position must be finite")
+    if (
+        not math.isfinite(refinement_tolerance_arcsec)
+        or refinement_tolerance_arcsec <= 0
+    ):
+        raise ValueError("refinement_tolerance_arcsec must be finite and positive")
+    if not isinstance(max_depth, int) or max_depth < 1:
+        raise ValueError("max_depth must be a positive integer")
+    if dtype not in (torch.float32, torch.float64):
+        raise ValueError("macroimage dtype must be torch.float32 or torch.float64")
+    resolved_device = _resolve_high_precision_device(runtime, device=device)
+    beta_x = torch.as_tensor(source_x_arcsec, dtype=dtype, device=resolved_device)
+    beta_y = torch.as_tensor(source_y_arcsec, dtype=dtype, device=resolved_device)
+    parameters = (
+        {"params": model.parameters}
+        if model._has_parameters(model.parameters)
+        else {}
+    )
+    try:
+        warning_context = (
+            nullcontext() if warn_on_nonconvergence else warnings.catch_warnings()
+        )
+        with warning_context:
+            if not warn_on_nonconvergence:
+                warnings.filterwarnings(
+                    "ignore",
+                    message=(
+                        r"^Forward raytrace unable to converge reliably, reached "
+                        r"maximum depth of \d+ iterations\."
+                    ),
+                    category=UserWarning,
+                    module=r"^caustics\.lenses\.func\.base$",
+                )
+            # Retry only a singular native solve, with scoped recovery for that
+            # small linear system. No dependency functions or globals are patched.
+            for retry in range(2):
+                try:
+                    with _CausticsGridPrecision(
+                        dtype, resolved_device, recover_singular=bool(retry)
+                    ):
+                        x, y = model.lens.forward_raytrace(
+                            beta_x,
+                            beta_y,
+                            fov=2.0 * field_of_view_arcsec,
+                            divisions=initial_grid_size,
+                            epsilon=refinement_tolerance_arcsec,
+                            max_depth=max_depth,
+                            **parameters,
+                        )
+                    break
+                except torch.linalg.LinAlgError as error:
+                    if "singular" not in str(error).lower() or retry == 1:
+                        raise
+                    if retry == 0:
+                        warnings.warn(
+                            "caustics encountered a singular matrix during image "
+                            "refinement. Retrying its native search with "
+                            "singular-step recovery and the same residual tolerance.",
+                            RuntimeWarning,
+                            stacklevel=3,
+                        )
+    except (RuntimeError, IndexError, UnboundLocalError) as error:
+        raise RuntimeError(
+            "caustics macroimage search failed. Check the search field and "
+            "lens/parameter device and dtype (float64 is recommended). "
+            "The original caustics error is chained below."
+        ) from error
+    valid_coordinates = (
+        isinstance(x, torch.Tensor)
+        and isinstance(y, torch.Tensor)
+        and x.ndim == 1
+        and y.shape == x.shape
+        and x.numel() > 0
+        and bool(torch.all(torch.isfinite(x) & torch.isfinite(y)))
+    )
+    if not valid_coordinates:
+        raise RuntimeError("caustics returned no valid macroimage coordinates")
+    traced_x, traced_y = model.raytrace(x, y)
+    residual = torch.hypot(traced_x - beta_x, traced_y - beta_y)
+    if residual.shape != x.shape or not bool(
+        torch.all(torch.isfinite(residual) & (residual <= refinement_tolerance_arcsec))
+    ):
+        raise RuntimeError("caustics macroimage roots exceed the source residual tolerance")
+    return _macroimage_solutions(
+        model, x, y, residual, image_names,
+        include_central_images=include_central_images,
+    )
 
 
 def solve_caustics_macroimages(
@@ -430,13 +399,32 @@ def solve_caustics_macroimages(
     *,
     parameters=None,
     time_delay_parameters=None,
+    include_central_images: bool = False,
     **solver_options,
 ) -> tuple[MacroImageSolution, ...]:
-    """Solve images for any compatible lens built with ``caustics``.
+    """Solve images using the native ``caustics.forward_raytrace`` method.
 
     The lens may be a single analytic profile, a ``SinglePlane`` composite, or
     a multiplane system. Static models commonly use an empty parameter tensor;
     dynamic models can pass the parameter structure required by ``caustics``.
+    The default search uses float64, 100 initial grid divisions and a maximum
+    depth of 25. ``field_of_view_arcsec`` is the search half-width.
+    ``refinement_tolerance_arcsec`` is passed as the native ``epsilon``, which
+    also controls image deduplication. Native search warnings remain visible
+    unless ``warn_on_nonconvergence=False`` silences the specific maximum-depth
+    warning. This opt-out does not establish completeness or bypass checks.
+    A small residual verifies a root, not completeness of the image set.
+
+    Central arrival-time maxima are excluded by default. Set
+    ``include_central_images=True`` to retain them. The filter uses negative
+    eigenvalues of a symmetric Jacobian, not image brightness, proximity to
+    the origin, or a fixed image count. Multi-plane models and asymmetric
+    Jacobians are left alone.
+    Names and relative delays are assigned after filtering.
+
+    ``device`` overrides ``runtime.high_precision_device`` and otherwise
+    defaults to CPU. Supplied lenses and parameters must already match the
+    selected device and dtype. The main simulation precision is unchanged.
     """
 
     model = CausticsMacroModel(
@@ -444,10 +432,11 @@ def solve_caustics_macroimages(
         parameters=parameters,
         time_delay_parameters=time_delay_parameters,
     )
-    return solve_macroimages(
+    return _solve_native_caustics_macroimages(
         model,
         source_x_arcsec,
         source_y_arcsec,
+        include_central_images=include_central_images,
         **solver_options,
     )
 
@@ -486,7 +475,7 @@ def solve_epl_shear_macroimages(
     source_y_arcsec: float,
     **solver_options,
 ) -> tuple[MacroImageSolution, ...]:
-    """Build an EPL plus external-shear lens, then use the general solver."""
+    """Build an EPL plus external-shear lens and use the native caustics solver."""
 
     try:
         import caustics
@@ -495,7 +484,9 @@ def solve_epl_shear_macroimages(
             "EPL+shear requires the 'macro' optional dependencies"
         ) from error
     dtype = solver_options.get("dtype", torch.float64)
-    device = torch.device(solver_options.get("device", "cpu"))
+    device = _resolve_high_precision_device(
+        solver_options.get("runtime"), device=solver_options.get("device")
+    )
 
     def tensor(value):
         return torch.as_tensor(value, dtype=dtype, device=device)

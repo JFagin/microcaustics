@@ -118,10 +118,13 @@ def lamppost_irradiation_efficiency(
 ) -> torch.Tensor:
     """Return the dimensionless lamppost heating normalization.
 
-    ``lamp_fraction`` is the fraction of the bolometric accretion luminosity
-    assigned to the lamppost. Dividing by the Eddington ratio converts that
-    fraction to the temperature-scale normalization used by
-    :meth:`ThermalReprocessingSource.from_axis_lamppost`. The radiative
+    ``lamp_fraction`` is the albedo-weighted X-ray luminosity in Eddington
+    units, ``(1 - albedo) * L_X / L_Edd``, not a fraction of the bolometric
+    accretion luminosity. The factor ``efficiency / eddington_ratio`` converts
+    it to the accretion-rate temperature scale used by
+    :meth:`ThermalReprocessingSource.from_axis_lamppost`. Its Eddington-ratio
+    dependence cancels that of the temperature scale, so the absolute heating
+    stays fixed at fixed ``lamp_fraction``, mass, and geometry. The radiative
     efficiency follows the selected viscous profile unless it is overridden.
     """
 
@@ -475,12 +478,17 @@ class ThermalReprocessingSource:
         state = self._brightness_state(times_days, device=device, dtype=dtype)
         return self._brightness_from_state(state)
 
-    def _brightness_from_state(self, state):
-        """Materialize a single cached static frame, or explicitly requested images."""
+    def _brightness_from_state(self, state, *, scale=1.0):
+        """Materialize a single cached static frame, or explicitly requested images.
+
+        ``scale`` is an internal exact multiplier; see
+        :func:`_transferred_brightness_from_temperature4`.
+        """
 
         temperature4, transfer, output_count = state
         brightness = _transferred_brightness_from_temperature4(
             temperature4,
+            scale=scale,
             geometry=self.geometry,
             transfer=transfer,
             source_redshift=self.source_redshift,
