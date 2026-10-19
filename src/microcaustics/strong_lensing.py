@@ -314,15 +314,34 @@ def _solve_native_caustics_macroimages(
                     category=UserWarning,
                     module=r"^caustics\.lenses\.func\.base$",
                 )
-            x, y = model.lens.forward_raytrace(
-                beta_x,
-                beta_y,
-                fov=2.0 * field_of_view_arcsec,
-                divisions=initial_grid_size,
-                epsilon=refinement_tolerance_arcsec,
-                max_depth=max_depth,
-                **parameters,
-            )
+            # A trial root close to a singular lens centre can make the native
+            # LM refinement singular even in float64. Restart the same native
+            # search with a different tiling, not a different lens or tolerance.
+            # Successful searches incur no additional solve. Retries are bounded
+            # and never replace caustics' root finder or alter its linear algebra.
+            for retry in range(3):
+                try:
+                    x, y = model.lens.forward_raytrace(
+                        beta_x,
+                        beta_y,
+                        fov=2.0 * field_of_view_arcsec,
+                        divisions=initial_grid_size + retry,
+                        epsilon=refinement_tolerance_arcsec,
+                        max_depth=max_depth,
+                        **parameters,
+                    )
+                    break
+                except torch.linalg.LinAlgError as error:
+                    if "singular" not in str(error).lower() or retry == 2:
+                        raise
+                    if retry == 0:
+                        warnings.warn(
+                            "caustics encountered a singular matrix during image "
+                            "refinement. Retrying its native search with a "
+                            "different initial grid and the same residual tolerance.",
+                            RuntimeWarning,
+                            stacklevel=3,
+                        )
     except (RuntimeError, IndexError, UnboundLocalError) as error:
         raise RuntimeError(
             "caustics macroimage search failed. Check the search field and "

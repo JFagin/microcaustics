@@ -81,7 +81,10 @@ def test_native_images_and_caustics_properties(kind, count, device):
             field_of_view_arcsec=2.0,
             image_names=tuple(f"image{i}" for i in range(count)),
         )
-    native.assert_called_once()
+    assert 1 <= native.call_count <= 3
+    assert [call.kwargs["divisions"] for call in native.call_args_list] == list(
+        range(100, 100 + native.call_count)
+    )
     assert len(solutions) == count
     assert [s.name for s in solutions] == [f"image{i}" for i in range(count)]
     assert max(s.source_residual_arcsec for s in solutions) <= 1e-8
@@ -328,6 +331,107 @@ def test_native_options_and_separate_delay_parameters(parameters):
     assert {key: value for key, value in options.items() if key == "params"} == expected
     assert lens.delay_parameters == {"params": delay_parameters}
     assert solutions[0].macro_magnification == 1
+
+
+@pytest.mark.parametrize("failed_attempts", [1, 2])
+def test_singular_native_refinement_retries_only_the_initial_grid(failed_attempts):
+    lens = IdentityLens()
+    native = lens.forward_raytrace
+    attempts = []
+    filters = warnings.filters[:]
+    default_dtype = torch.get_default_dtype()
+
+    def search(bx, by, **kwargs):
+        attempts.append(kwargs.copy())
+        if len(attempts) <= failed_attempts:
+            # Produce the same public exception as the native LM solve.
+            torch.linalg.solve(torch.zeros(2, 2), torch.ones(2))
+        return native(bx, by, **kwargs)
+
+    with (
+        patch.object(lens, "forward_raytrace", side_effect=search),
+        pytest.warns(RuntimeWarning, match="Retrying its native search"),
+    ):
+        result = mc.solve_caustics_macroimages(
+            lens, 0.1, 0.2, initial_grid_size=50, field_of_view_arcsec=2.0,
+            max_depth=30, warn_on_nonconvergence=False,
+        )
+    assert [a["divisions"] for a in attempts] == list(range(50, 51 + failed_attempts))
+    for attempt in attempts:
+        assert attempt["fov"] == 4.0
+        assert attempt["epsilon"] == 1e-8
+        assert attempt["max_depth"] == 30
+    assert result[0].source_residual_arcsec == 0
+    assert warnings.filters == filters
+    assert torch.get_default_dtype() == default_dtype
+
+
+@pytest.mark.parametrize("failure,count", [("singular", 3), ("other", 1)])
+def test_native_refinement_retries_are_bounded_and_do_not_hide_other_errors(failure, count):
+    lens = IdentityLens()
+    error = torch.linalg.LinAlgError(
+        "input matrix is singular" if failure == "singular" else "invalid solve"
+    )
+    with (
+        patch.object(lens, "forward_raytrace", side_effect=error) as native,
+        warnings.catch_warnings(record=True),
+        pytest.raises(RuntimeError, match="caustics macroimage search failed") as caught,
+    ):
+        mc.solve_caustics_macroimages(lens, 0.1, 0.2)
+    assert native.call_count == count
+    assert caught.value.__cause__ is error
+
+
+def test_successful_retry_still_must_meet_original_residual_tolerance():
+    lens = IdentityLens()
+    with (
+        patch.object(lens, "forward_raytrace", side_effect=[
+            torch.linalg.LinAlgError("input matrix is singular"),
+            (torch.tensor([0.2], dtype=torch.float64), torch.tensor([0.2], dtype=torch.float64)),
+        ]) as native,
+        pytest.warns(RuntimeWarning, match="Retrying its native search"),
+        pytest.raises(RuntimeError, match="residual tolerance"),
+    ):
+        mc.solve_caustics_macroimages(lens, 0.1, 0.2)
+    assert native.call_count == 2
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_restarted_epl_search_preserves_images_and_native_implementation(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    lens, _, source = make_lens("epl_shear", device)
+    import caustics.lenses.func.base as native_base
+    import caustics.utils as native_utils
+
+    native = lens.forward_raytrace
+    original_search = native_base.forward_raytrace
+    original_refine = native_base.forward_raytrace_rootfind
+    original_lm = native_utils.batch_lm
+    reference = mc.solve_caustics_macroimages(lens, *source, device=device)
+    attempts = 0
+
+    def search(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise torch.linalg.LinAlgError("input matrix is singular")
+        return native(*args, **kwargs)
+
+    with (
+        patch.object(lens, "forward_raytrace", side_effect=search),
+        pytest.warns(RuntimeWarning, match="Retrying its native search"),
+    ):
+        result = mc.solve_caustics_macroimages(lens, *source, device=device)
+    assert len(result) == len(reference) == 4
+    for actual, expected in zip(result, reference, strict=True):
+        assert actual.parity == expected.parity
+        assert actual.source_residual_arcsec <= 1e-8
+        for field in ("x_arcsec", "y_arcsec", "macro_magnification", "arrival_time_delay_days"):
+            assert getattr(actual, field) == pytest.approx(getattr(expected, field), abs=1e-6)
+    assert native_base.forward_raytrace is original_search
+    assert native_base.forward_raytrace_rootfind is original_refine
+    assert native_utils.batch_lm is original_lm
 
 
 def test_scoped_precision_is_thread_local_and_restored_after_error():
