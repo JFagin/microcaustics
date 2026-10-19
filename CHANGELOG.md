@@ -1,14 +1,12 @@
 # Changelog
 
-## Unreleased
-
-- Apple GPU (MPS) support. IPM maps are rasterized on the device by a batched PyTorch port of the Triton direct-cell kernel (its elementwise math fused with `torch.compile`), far-field coefficients are built for all cells in one batch, and far-field queries are chunked to a fixed memory budget, so `RuntimeConfig(device="auto")` runs the whole map pipeline on the Apple GPU without exhausting unified memory. The runtime now reports Metal's recommended working set as the MPS memory budget. CUDA/Triton and CPU paths are unchanged.
-- Fixed MPS light curves: PyTorch MPS returns zeros for a combined MPS-to-CPU float64 copy, which emptied every IPM map, and flushes the subnormal brightness of faint disk pixels. MPS now matches CPU within float32 tolerance.
-
 ## 1.0.0
 
 Initial release of `microcaustics`:
 
+- Apple GPU (MPS) IPM rasterization and batched far-field calculations, with chunked queries and Metal memory-budget reporting. Compilation follows the requested runtime settings.
+- MPS compatibility fixes for float64 host copies and faint-pixel flux accumulation, with CPU comparison tests.
+- Fewer Triton IPM recompilations when map bounds, pixel scales, or triangle weights change.
 - Static and dynamic inverse polygon mapping and inverse ray shooting, with fused Triton acceleration and portable PyTorch fallbacks.
 - Source-directed scouting, far-field acceleration, automatic memory tuning, and temporal and cross-system batching.
 - Critical curves, caustics, source-center labels, distance maps, and winding-map products.

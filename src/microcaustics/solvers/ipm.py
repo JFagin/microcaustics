@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from functools import partial
 from time import perf_counter
 from typing import TYPE_CHECKING
 
@@ -960,7 +961,7 @@ def full_field_ipm(
             workspace = TorchRasterWorkspace.create(
                 source_grid.shape, device=runtime.device, dtype=runtime.dtype
             )
-            accumulate = accumulate_cells_torch
+            accumulate = partial(accumulate_cells_torch, runtime=runtime)
         else:
             workspace = None
         source_dy, source_dx = source_grid.pixel_scale_uas
@@ -1428,7 +1429,7 @@ def temporal_batch_ipm(
                 dtype=runtime.dtype,
                 frames=total_frames,
             )
-            accumulate = accumulate_cells_torch
+            accumulate = partial(accumulate_cells_torch, runtime=runtime)
         else:
             workspace = None
         selected_count = int(cell_indices.numel())

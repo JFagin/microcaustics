@@ -108,7 +108,7 @@ def masked_complex_taylor_coefficients(
     """:func:`complex_taylor_coefficients` for every center in one batch.
 
     ``local_mask[center, star]`` marks stars excluded from that center's far
-    field. Excluded stars get zero mass instead of being gathered per center,
+    field. Excluded stars get zero inverse-distance terms instead of being gathered per center,
     so accelerators avoid one host synchronization per center. Returns
     tensors of shape ``[center, order + 1]``.
     """
@@ -125,6 +125,9 @@ def masked_complex_taylor_coefficients(
         dx = center_x[:, None] - star_x[None, start:stop]
         dy = center_y[:, None] - star_y[None, start:stop]
         inverse_r2 = (dx.square() + dy.square()).clamp_min(minimum).reciprocal()
+        # Mask before taking powers. Zero mass alone permits 0 * inf -> NaN
+        # when a nearby excluded star overflows a high-order inverse power.
+        inverse_r2 = torch.where(local_mask[:, start:stop], 0.0, inverse_r2)
         inverse_real = dx * inverse_r2
         inverse_imag = dy * inverse_r2
         power_real = inverse_real

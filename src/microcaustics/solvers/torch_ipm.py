@@ -15,6 +15,9 @@ from dataclasses import dataclass
 
 import torch
 
+from ..compile import run_tensor_kernel
+from ..runtime import ResolvedRuntime
+
 _TINY = 1.1754944e-38
 _SEGMENT_EPSILON = 1.9073486328125e-6
 _FULL_EPSILON = 3.814697265625e-6
@@ -254,34 +257,17 @@ def _boundary_area(lane, left_count, bbox0, full, full1, first, second, valid0, 
     return column, (overlap(first, valid0) + overlap(second, valid1)).clamp_min(0.0)
 
 
-_COMPILED: dict[str, object] = {}
+def _kernel(name: str, function, runtime: ResolvedRuntime | None):
+    """Use the caller's compilation, warning, and fallback settings."""
 
-
-def _kernel(name: str, function, device: torch.device):
-    """Fuse the elementwise strip math with ``torch.compile`` on accelerators.
-
-    Dozens of small elementwise launches dominate otherwise. A failed
-    compilation falls back to eager PyTorch for the rest of the process.
-    """
-
-    if device.type == "cpu":
-        return function
-    compiled = _COMPILED.get(name)
-    if compiled is None:
-        compiled = torch.compile(function, dynamic=True)
-        _COMPILED[name] = compiled
-    if compiled is function:
+    if runtime is None:
         return function
 
     def run(*arguments):
-        try:
-            return compiled(*arguments)
-        except Exception as error:  # pragma: no cover - depends on the toolchain
-            from ..runtime import warn_backend_fallback
-
-            warn_backend_fallback(f"compiled tensor IPM {name}", error)
-            _COMPILED[name] = function
-            return function(*arguments)
+        result, _ = run_tensor_kernel(
+            runtime, f"tensor IPM {name}", function, *arguments
+        )
+        return result
 
     return run
 
@@ -297,6 +283,7 @@ def _rasterize_strips(
     *,
     rows: int,
     columns: int,
+    runtime: ResolvedRuntime | None,
 ) -> None:
     """Deposit kept triangles, already in pixel units, one row strip at a time."""
 
@@ -323,7 +310,7 @@ def _rasterize_strips(
         bbox0,
         boundary_count,
         left_count,
-    ) = _kernel("strip geometry", _strip_geometry, device)(
+    ) = _kernel("strip geometry", _strip_geometry, runtime)(
         row, *(value[owner] for value in (ax, ay, bx, by, cx, cy)), columns
     )
 
@@ -340,7 +327,7 @@ def _rasterize_strips(
         return
     lane_starts = torch.cumsum(boundary_count, 0) - boundary_count
     lane = torch.arange(strip.numel(), device=device) - lane_starts[strip]
-    column, area = _kernel("boundary area", _boundary_area, device)(
+    column, area = _kernel("boundary area", _boundary_area, runtime)(
         lane,
         left_count[strip],
         bbox0[strip],
@@ -370,11 +357,13 @@ def accumulate_cells_torch(
     lens_area_per_triangle_uas2: float,
     cell_frame_index: torch.Tensor | None = None,
     max_strips: int = 1 << 20,
+    runtime: ResolvedRuntime | None = None,
 ) -> None:
     """Add one chunk of mapped cell lattices to a persistent workspace.
 
     Arguments match :func:`accumulate_cells_triton`. ``max_strips`` bounds the
     temporary (triangle, row) expansion to keep peak memory predictable.
+    Without a runtime, this low-level function uses eager PyTorch.
     """
 
     if node_x.shape != node_y.shape or node_x.ndim not in (3, 4):
@@ -487,4 +476,5 @@ def accumulate_cells_torch(
             row_count[part],
             rows=rows,
             columns=columns,
+            runtime=runtime,
         )

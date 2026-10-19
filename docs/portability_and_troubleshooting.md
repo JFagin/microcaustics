@@ -15,7 +15,7 @@ benchmark claims, request the intended backend with `strict_backend=True` so a
 fallback cannot be mistaken for an accelerated timing.
 
 `Backend.TORCH_COMPILE` compiles the exact point-mass reductions, Taylor far-field
-queries, and IRS deposition. On the CPU the exact IPM polygon clipper remains a
+queries, and IRS deposition. On CPU and CUDA without Triton, the exact IPM polygon clipper remains a
 Python reference implementation, so IPM results requested with this backend
 report `torch-compile-partial`. Apple MPS rasterizes IPM maps on the GPU with a
 batched PyTorch port of the Triton direct-cell kernel (metadata
