@@ -243,16 +243,38 @@ class _CausticsGridPrecision(TorchFunctionMode):
     Explicitly typed factories are left alone.
     """
 
-    def __init__(self, dtype, device):
+    def __init__(self, dtype, device, *, recover_singular=False):
         super().__init__()
         self.dtype = dtype
         self.device = device
+        self.recover_singular = recover_singular
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = dict(kwargs or {})
         if func is torch.linspace and kwargs.get("dtype") is None:
             kwargs["dtype"] = self.dtype
             kwargs.setdefault("device", self.device)
+        if (
+            self.recover_singular
+            and func is torch.linalg.solve
+            and len(args) == 2
+            and not kwargs
+            and args[0].shape == (2, 2)
+            and args[1].shape == (2,)
+        ):
+            # Native LM solves two-dimensional normal equations under vmap.
+            # Its absolute damping can round away near a singular lens centre.
+            # Keep nonsingular steps unchanged. For failed steps only, use the
+            # minimum-norm solution; native refinement and our residual checks
+            # still decide whether a trial point is an acceptable image.
+            matrix, rhs = args
+            step, info = torch.linalg.solve_ex(matrix, rhs, check_errors=False)
+            failed = info != 0
+            repair_matrix = torch.where(
+                failed, matrix, torch.eye(2, dtype=matrix.dtype, device=matrix.device)
+            )
+            repair = torch.linalg.pinv(repair_matrix) @ rhs
+            return torch.where(failed, repair, step)
         return func(*args, **kwargs)
 
 
@@ -303,7 +325,7 @@ def _solve_native_caustics_macroimages(
         warning_context = (
             nullcontext() if warn_on_nonconvergence else warnings.catch_warnings()
         )
-        with warning_context, _CausticsGridPrecision(dtype, resolved_device):
+        with warning_context:
             if not warn_on_nonconvergence:
                 warnings.filterwarnings(
                     "ignore",
@@ -314,31 +336,31 @@ def _solve_native_caustics_macroimages(
                     category=UserWarning,
                     module=r"^caustics\.lenses\.func\.base$",
                 )
-            # A trial root close to a singular lens centre can make the native
-            # LM refinement singular even in float64. Restart the same native
-            # search with a different tiling, not a different lens or tolerance.
-            # Successful searches incur no additional solve. Retries are bounded
-            # and never replace caustics' root finder or alter its linear algebra.
-            for retry in range(3):
+            # Retry only a singular native solve, with scoped recovery for that
+            # small linear system. No dependency functions or globals are patched.
+            for retry in range(2):
                 try:
-                    x, y = model.lens.forward_raytrace(
-                        beta_x,
-                        beta_y,
-                        fov=2.0 * field_of_view_arcsec,
-                        divisions=initial_grid_size + retry,
-                        epsilon=refinement_tolerance_arcsec,
-                        max_depth=max_depth,
-                        **parameters,
-                    )
+                    with _CausticsGridPrecision(
+                        dtype, resolved_device, recover_singular=bool(retry)
+                    ):
+                        x, y = model.lens.forward_raytrace(
+                            beta_x,
+                            beta_y,
+                            fov=2.0 * field_of_view_arcsec,
+                            divisions=initial_grid_size,
+                            epsilon=refinement_tolerance_arcsec,
+                            max_depth=max_depth,
+                            **parameters,
+                        )
                     break
                 except torch.linalg.LinAlgError as error:
-                    if "singular" not in str(error).lower() or retry == 2:
+                    if "singular" not in str(error).lower() or retry == 1:
                         raise
                     if retry == 0:
                         warnings.warn(
                             "caustics encountered a singular matrix during image "
-                            "refinement. Retrying its native search with a "
-                            "different initial grid and the same residual tolerance.",
+                            "refinement. Retrying its native search with "
+                            "singular-step recovery and the same residual tolerance.",
                             RuntimeWarning,
                             stacklevel=3,
                         )

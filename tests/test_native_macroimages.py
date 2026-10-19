@@ -81,10 +81,8 @@ def test_native_images_and_caustics_properties(kind, count, device):
             field_of_view_arcsec=2.0,
             image_names=tuple(f"image{i}" for i in range(count)),
         )
-    assert 1 <= native.call_count <= 3
-    assert [call.kwargs["divisions"] for call in native.call_args_list] == list(
-        range(100, 100 + native.call_count)
-    )
+    assert 1 <= native.call_count <= 2
+    assert all(call.kwargs["divisions"] == 100 for call in native.call_args_list)
     assert len(solutions) == count
     assert [s.name for s in solutions] == [f"image{i}" for i in range(count)]
     assert max(s.source_residual_arcsec for s in solutions) <= 1e-8
@@ -333,8 +331,7 @@ def test_native_options_and_separate_delay_parameters(parameters):
     assert solutions[0].macro_magnification == 1
 
 
-@pytest.mark.parametrize("failed_attempts", [1, 2])
-def test_singular_native_refinement_retries_only_the_initial_grid(failed_attempts):
+def test_singular_native_refinement_retries_with_identical_search_settings():
     lens = IdentityLens()
     native = lens.forward_raytrace
     attempts = []
@@ -343,9 +340,8 @@ def test_singular_native_refinement_retries_only_the_initial_grid(failed_attempt
 
     def search(bx, by, **kwargs):
         attempts.append(kwargs.copy())
-        if len(attempts) <= failed_attempts:
-            # Produce the same public exception as the native LM solve.
-            torch.linalg.solve(torch.zeros(2, 2), torch.ones(2))
+        # The native LM call fails first, then succeeds under scoped recovery.
+        torch.linalg.solve(torch.zeros(2, 2, dtype=bx.dtype), torch.ones(2, dtype=bx.dtype))
         return native(bx, by, **kwargs)
 
     with (
@@ -356,7 +352,7 @@ def test_singular_native_refinement_retries_only_the_initial_grid(failed_attempt
             lens, 0.1, 0.2, initial_grid_size=50, field_of_view_arcsec=2.0,
             max_depth=30, warn_on_nonconvergence=False,
         )
-    assert [a["divisions"] for a in attempts] == list(range(50, 51 + failed_attempts))
+    assert [a["divisions"] for a in attempts] == [50, 50]
     for attempt in attempts:
         assert attempt["fov"] == 4.0
         assert attempt["epsilon"] == 1e-8
@@ -366,7 +362,7 @@ def test_singular_native_refinement_retries_only_the_initial_grid(failed_attempt
     assert torch.get_default_dtype() == default_dtype
 
 
-@pytest.mark.parametrize("failure,count", [("singular", 3), ("other", 1)])
+@pytest.mark.parametrize("failure,count", [("singular", 2), ("other", 1)])
 def test_native_refinement_retries_are_bounded_and_do_not_hide_other_errors(failure, count):
     lens = IdentityLens()
     error = torch.linalg.LinAlgError(
@@ -432,6 +428,48 @@ def test_restarted_epl_search_preserves_images_and_native_implementation(device)
     assert native_base.forward_raytrace is original_search
     assert native_base.forward_raytrace_rootfind is original_refine
     assert native_utils.batch_lm is original_lm
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_singular_step_recovery_under_vmap_keeps_regular_steps_unchanged(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    matrix = torch.tensor(
+        [[[3., 1.], [1., 2.]], [[1., 1.], [1., 1.]],
+         [[1e17, 1e17], [1e17, 1e17]], [[0., 0.], [0., 0.]]],
+        dtype=torch.float64, device=device,
+    )
+    rhs = torch.tensor([[1., 2.], [1., 2.], [1e17, 2e17], [1., 2.]],
+                       dtype=matrix.dtype, device=device)
+    solve = torch.vmap(torch.linalg.solve)
+    original_solve = torch.linalg.solve
+    with pytest.raises(torch.linalg.LinAlgError):
+        solve(matrix, rhs)
+    regular = torch.linalg.solve(matrix[0], rhs[0])
+    with _CausticsGridPrecision(matrix.dtype, matrix.device, recover_singular=True):
+        actual = solve(matrix, rhs)
+    assert torch.equal(actual[0], regular)
+    torch.testing.assert_close(actual[1:3], torch.full_like(actual[1:3], 0.75))
+    assert torch.equal(actual[3], torch.zeros_like(actual[3]))
+    assert torch.isfinite(actual).all()
+    assert torch.linalg.solve is original_solve
+    with pytest.raises(torch.linalg.LinAlgError):
+        solve(matrix, rhs)
+
+
+def test_singular_recovery_is_thread_local_and_restored_after_exception():
+    matrix, rhs = torch.zeros(2, 2, dtype=torch.float64), torch.ones(2, dtype=torch.float64)
+    with (
+        ThreadPoolExecutor(max_workers=1) as pool,
+        pytest.raises(ValueError, match="test failure"),
+        _CausticsGridPrecision(matrix.dtype, matrix.device, recover_singular=True),
+    ):
+        assert torch.equal(torch.linalg.solve(matrix, rhs), torch.zeros_like(rhs))
+        with pytest.raises(torch.linalg.LinAlgError):
+            pool.submit(torch.linalg.solve, matrix, rhs).result()
+        raise ValueError("test failure")
+    with pytest.raises(torch.linalg.LinAlgError):
+        torch.linalg.solve(matrix, rhs)
 
 
 def test_scoped_precision_is_thread_local_and_restored_after_error():

@@ -236,11 +236,12 @@ varying the field and initial grid, especially near caustics. A small residual
 checks a returned image, not whether every image was found.
 
 If native root refinement encounters a singular matrix, the adapter retries
-the same search with one, then two additional initial grid divisions. This
-changes the trial points, not the lens, search field, or accuracy tolerance.
-A warning reports the retry. Persistent failures still raise an error, and
-all returned images must pass the original residual check. No caustics code
-or global PyTorch settings are modified.
+once with a minimum-norm solution for singular two-dimensional refinement
+steps. Nonsingular steps are unchanged. Caustics still performs the search
+and iterative refinement, with the same lens, grid, and accuracy tolerance.
+A warning reports the retry, and all returned images must pass the original
+residual check. Persistent failures still raise an error. The recovery is
+scoped to this call without modifying caustics or global PyTorch settings.
 
 Central arrival-time maxima are excluded by default. Use
 `include_central_images=True` to retain them, for example when studying the
