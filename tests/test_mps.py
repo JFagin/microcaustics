@@ -204,9 +204,10 @@ def _cdf_response(device: str, *, signed: bool):
 
 
 @pytest.mark.parametrize("signed", [False, True], ids=["linear", "signed-quadratic"])
-def test_cdf_response_matches_cpu_and_conserves_mass(signed):
+@pytest.mark.parametrize("device", ["mps", "mps:0"])
+def test_cdf_response_matches_cpu_and_conserves_mass(signed, device):
     _, expected = _cdf_response("cpu", signed=signed)
-    mass, actual = _cdf_response("mps", signed=signed)
+    mass, actual = _cdf_response(device, signed=signed)
     assert actual.device.type == "mps"
     assert torch.isfinite(actual).all()
     if not signed:
