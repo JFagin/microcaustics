@@ -6,13 +6,10 @@ validated in the accompanying methods paper.
 
 ![Ten-year Q2237 image-B-like dynamic magnification map with source-plane caustics](docs/assets/q2237_image_b_dynamic_magnification.gif)
 
-The animation uses the physical setup from the
-[Q2237 light-curve tutorial](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb).
-This higher-resolution version uses $4\times10^7$ rays and $2048^2$ maps,
-with 366 frames covering ten years at ten-day intervals, played at 20 frames
-per second. The caustic network is overlaid. Its map normalization, colorbar,
-and indexed GIF palette are fixed globally across all frames. This stellar realization was
-selected to illustrate a dense caustic network and source-center crossings.
+The animation above shows how stellar motions reshape the microlensing
+magnification map and caustic network. See the
+[Q2237 light-curve tutorial](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb)
+for the source code.
 
 ### Fast CUDA production path
 
@@ -965,10 +962,10 @@ Contributors include the following authors.
 - [Sophia Miskiewicz](https://orcid.org/0000-0003-0631-9701) contributed to bug fixing.
 - [Henry Best](https://orcid.org/0009-0009-6932-6379) contributed to the relativistic quasar source model.
 - [Paras Sharma](https://orcid.org/0000-0002-6909-205X) contributed to bug fixing.
-- [Matthew O'Dowd](https://orcid.org/0009-0000-4476-5003)
-- [Laurence Perreault-Levasseur](https://orcid.org/0000-0003-3544-3939)
-- [Yashar Hezaveh](https://orcid.org/0000-0002-8669-5733)
-- [Simon Birrer](https://orcid.org/0000-0003-3195-5507)
+- [Matthew O'Dowd](https://orcid.org/0009-0000-4476-5003) supervised method development and contributed to manuscript drafting.
+- [Laurence Perreault-Levasseur](https://orcid.org/0000-0003-3544-3939) supervised method development and contributed to manuscript drafting.
+- [Yashar Hezaveh](https://orcid.org/0000-0002-8669-5733) supervised method development and contributed to manuscript drafting.
+- [Simon Birrer](https://orcid.org/0000-0003-3195-5507) supervised method development and contributed to manuscript drafting.
 
 ## Acknowledgments
 
