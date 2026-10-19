@@ -19,7 +19,6 @@ from ..compile import run_tensor_kernel
 from ..runtime import ResolvedRuntime
 
 _TINY = 1.1754944e-38
-_SEGMENT_EPSILON = 1.9073486328125e-6
 _FULL_EPSILON = 3.814697265625e-6
 
 
@@ -151,8 +150,10 @@ def _strip_geometry(row, ax, ay, bx, by, cx, cy, columns: int):
     lower = torch.maximum(row0, sorted_low)
     upper = torch.minimum(row1, sorted_high)
     middle = torch.minimum(upper, torch.maximum(lower, sorted_mid))
-    valid0 = middle > lower + _SEGMENT_EPSILON
-    valid1 = upper > middle + _SEGMENT_EPSILON
+    # A thin mapped triangle can still carry a full lens-plane triangle's
+    # flux. Reject only zero-height segments, not small positive intervals.
+    valid0 = middle > lower
+    valid1 = upper > middle
     left00, left01, right00, right01, valid0 = _segment_edges(
         ax, ay, bx, by, cx, cy, lower, middle, valid0
     )
@@ -272,31 +273,151 @@ def _kernel(name: str, function, runtime: ResolvedRuntime | None):
     return run
 
 
+def _expanded_chunks(counts: torch.Tensor, budget: int):
+    """Yield bounded owner/lane arrays without first expanding the full queue."""
+
+    ends = torch.cumsum(counts, 0)
+    total = int(ends[-1]) if ends.numel() else 0
+    starts = ends - counts
+    for start in range(0, total, budget):
+        entry = torch.arange(start, min(start + budget, total), device=counts.device)
+        if total <= budget:
+            owner = torch.repeat_interleave(
+                torch.arange(counts.numel(), device=counts.device), counts
+            )
+        else:
+            owner = torch.searchsorted(ends, entry, right=True)
+        yield owner, entry - starts[owner]
+
+
+def _difference_of_products(a, b, c, d):
+    """Compensated determinant for nearly collinear float32 edges."""
+
+    ab, cd = a * b, c * d
+
+    def product_error(x, y, product):
+        split = 4097.0 if x.dtype == torch.float32 else 134217729.0
+        sx, sy = split * x, split * y
+        hx, hy = sx - (sx - x), sy - (sy - y)
+        lx, ly = x - hx, y - hy
+        return ((hx * hy - product) + hx * ly + lx * hy) + lx * ly
+
+    return (ab - cd) + (product_error(a, b, ab) - product_error(c, d, cd))
+
+
+def _triangle_pixel_fraction(ax, ay, bx, by, cx, cy, xlo, xhi, ylo, yhi):
+    """Clip in unit-triangle coordinates, avoiding division by a tiny area.
+
+    A point is A + u(B-A) + v(C-A). Clipping this unit triangle against the
+    pixel's four half-planes gives the fraction of the original triangle's
+    flux directly, even when its mapped area is very small.
+    """
+
+    u = torch.zeros((ax.numel(), 8), device=ax.device, dtype=ax.dtype)
+    v = torch.zeros_like(u)
+    u[:, 1] = 1.0
+    v[:, 2] = 1.0
+    count = torch.full_like(ax, 3, dtype=torch.long)
+    slot = torch.arange(8, device=ax.device)[None, :]
+    for origin, edge_b, edge_c, boundary, sign in (
+        (ax, bx - ax, cx - ax, xlo, 1.0),
+        (ax, bx - ax, cx - ax, xhi, -1.0),
+        (ay, by - ay, cy - ay, ylo, 1.0),
+        (ay, by - ay, cy - ay, yhi, -1.0),
+    ):
+        previous = torch.where(slot == 0, (count - 1)[:, None], slot - 1).clamp_min(0)
+        pu, pv = u.gather(1, previous), v.gather(1, previous)
+        distance = sign * ((origin - boundary)[:, None] + u * edge_b[:, None] + v * edge_c[:, None])
+        prior_distance = distance.gather(1, previous)
+        active = slot < count[:, None]
+        inside = distance >= 0.0
+        crossing = active & (inside != (prior_distance >= 0.0))
+        denominator = prior_distance - distance
+        fraction = prior_distance / torch.where(crossing, denominator, torch.ones_like(denominator))
+        iu = pu + fraction * (u - pu)
+        iv = pv + fraction * (v - pv)
+        emit = torch.stack((crossing, active & inside), dim=-1).flatten(1)
+        out_slot = (emit.long().cumsum(1) - 1).clamp(0, 7)
+        candidate_u = torch.stack((iu, u), dim=-1).flatten(1)
+        candidate_v = torch.stack((iv, v), dim=-1).flatten(1)
+        u = torch.zeros_like(u).scatter_add(1, out_slot, torch.where(emit, candidate_u, 0.0))
+        v = torch.zeros_like(v).scatter_add(1, out_slot, torch.where(emit, candidate_v, 0.0))
+        count = emit.sum(1)
+    following = torch.where(slot + 1 < count[:, None], slot + 1, 0)
+    cross = u * v.gather(1, following) - v * u.gather(1, following)
+    # The unit triangle has area 1/2, so its doubled clipped area is the fraction.
+    return torch.where(slot < count[:, None], cross, 0.0).sum(1).abs().clamp(0.0, 1.0)
+
+
+def _rasterize_thin_triangles(
+    workspace, raw, frame, *, xmin, ymin, pixel_size_x, pixel_size_y,
+    mass, budget, runtime,
+):
+    """Use bounded pixel clipping only for triangles ill-conditioned in scanlines."""
+
+    ax, ay, bx, by, cx, cy = raw
+    rows, columns = workspace.shape
+    xs, ys = torch.stack((ax, bx, cx)), torch.stack((ay, by, cy))
+
+    def pixel_index(value, lower, step, size):
+        index = torch.floor((value - lower) / step).long()
+        # A global pixel coordinate can round onto the next integer. Compare
+        # in native coordinates before choosing which side of that edge to use.
+        edge = lower + index.to(value.dtype) * step
+        next_edge = lower + (index + 1).to(value.dtype) * step
+        index = index - (value < edge).long() + (value >= next_edge).long()
+        return index.clamp(0, size - 1)
+
+    col0 = pixel_index(xs.amin(0), xmin, pixel_size_x, columns)
+    col1 = pixel_index(xs.amax(0), xmin, pixel_size_x, columns)
+    row0 = pixel_index(ys.amin(0), ymin, pixel_size_y, rows)
+    row1 = pixel_index(ys.amax(0), ymin, pixel_size_y, rows)
+    width = col1 - col0 + 1
+    counts = width * (row1 - row0 + 1)
+    contained = (
+        (counts == 1)
+        & (xs.amin(0) >= xmin) & (xs.amax(0) <= xmin + columns * pixel_size_x)
+        & (ys.amin(0) >= ymin) & (ys.amax(0) <= ymin + rows * pixel_size_y)
+    )
+    # Tiny triangles usually lie in one pixel. Deposit their entire mass
+    # directly, reserving clipping for those that actually cross a boundary.
+    workspace.histogram.reshape(-1).index_add_(
+        0, ((frame * rows + row0) * columns + col0)[contained],
+        torch.full_like(ax[contained], mass),
+    )
+    counts = torch.where(contained, 0, counts)
+    kernel = _kernel("thin triangle clipping", _triangle_pixel_fraction, runtime)
+    for owner, lane in _expanded_chunks(counts, budget):
+        column = col0[owner] + lane % width[owner]
+        row = row0[owner] + lane // width[owner]
+        xlo = xmin + column.to(ax.dtype) * pixel_size_x
+        xhi = xmin + (column + 1).to(ax.dtype) * pixel_size_x
+        ylo = ymin + row.to(ay.dtype) * pixel_size_y
+        yhi = ymin + (row + 1).to(ay.dtype) * pixel_size_y
+        fraction = kernel(*(value[owner] for value in raw), xlo, xhi, ylo, yhi)
+        workspace.histogram.reshape(-1).index_add_(
+            0, (frame[owner] * rows + row) * columns + column, mass * fraction,
+        )
+
+
 def _rasterize_strips(
     histogram: torch.Tensor,
     row_difference: torch.Tensor,
     frame: torch.Tensor,
     ax, ay, bx, by, cx, cy,
     density: torch.Tensor,
-    first_row: torch.Tensor,
-    row_count: torch.Tensor,
+    owner: torch.Tensor,
+    row: torch.Tensor,
     *,
     rows: int,
     columns: int,
+    max_boundary_entries: int,
     runtime: ResolvedRuntime | None,
 ) -> None:
     """Deposit kept triangles, already in pixel units, one row strip at a time."""
 
-    device = ax.device
-    owner = torch.repeat_interleave(
-        torch.arange(ax.numel(), device=device), row_count
-    )
     if owner.numel() == 0:
         return
-    starts = torch.cumsum(row_count, 0) - row_count
-    row = first_row[owner] + (
-        torch.arange(owner.numel(), device=device) - starts[owner]
-    )
     density = density[owner]
     frame = frame[owner]
     (
@@ -320,29 +441,27 @@ def _rasterize_strips(
     difference.index_add_(0, (row_base + full0)[full], full_density)
     difference.index_add_(0, (row_base + full1 + 1)[full], -full_density)
 
-    strip = torch.repeat_interleave(
-        torch.arange(row.numel(), device=device), boundary_count
-    )
-    if strip.numel() == 0:
-        return
-    lane_starts = torch.cumsum(boundary_count, 0) - boundary_count
-    lane = torch.arange(strip.numel(), device=device) - lane_starts[strip]
-    column, area = _kernel("boundary area", _boundary_area, runtime)(
-        lane,
-        left_count[strip],
-        bbox0[strip],
-        full[strip],
-        full1[strip],
-        first[:, strip],
-        second[:, strip],
-        valid0[strip],
-        valid1[strip],
-    )
-    histogram.reshape(-1).index_add_(
-        0,
-        (frame[strip] * rows + row[strip]) * columns + column,
-        density[strip] * area,
-    )
+    # One shallow strip can touch thousands of boundary pixels. Bound this
+    # expansion separately from the triangle-row queue, including a single
+    # strip whose boundary alone exceeds the budget.
+    boundary_kernel = _kernel("boundary area", _boundary_area, runtime)
+    for strip, lane in _expanded_chunks(boundary_count, max_boundary_entries):
+        column, area = boundary_kernel(
+            lane,
+            left_count[strip],
+            bbox0[strip],
+            full[strip],
+            full1[strip],
+            first[:, strip],
+            second[:, strip],
+            valid0[strip],
+            valid1[strip],
+        )
+        histogram.reshape(-1).index_add_(
+            0,
+            (frame[strip] * rows + row[strip]) * columns + column,
+            density[strip] * area,
+        )
 
 
 def accumulate_cells_torch(
@@ -357,12 +476,14 @@ def accumulate_cells_torch(
     lens_area_per_triangle_uas2: float,
     cell_frame_index: torch.Tensor | None = None,
     max_strips: int = 1 << 20,
+    max_boundary_entries: int = 1 << 20,
     runtime: ResolvedRuntime | None = None,
 ) -> None:
     """Add one chunk of mapped cell lattices to a persistent workspace.
 
     Arguments match :func:`accumulate_cells_triton`. ``max_strips`` bounds the
     temporary (triangle, row) expansion to keep peak memory predictable.
+    ``max_boundary_entries`` separately bounds the boundary-pixel expansion.
     Without a runtime, this low-level function uses eager PyTorch.
     """
 
@@ -375,6 +496,8 @@ def accumulate_cells_torch(
         raise ValueError("node lattices must be square with at least two nodes")
     if float(pixel_size_x) <= 0 or float(pixel_size_y) <= 0:
         raise ValueError("pixel sizes must be positive")
+    if int(max_strips) < 1 or int(max_boundary_entries) < 1:
+        raise ValueError("rasterization chunk limits must be positive")
     device = workspace.histogram.device
     if node_x.device != device:
         raise ValueError("workspace and mapped nodes must share a device")
@@ -418,10 +541,24 @@ def accumulate_cells_torch(
 
     ax, bx, cx = corners(x)
     ay, by, cy = corners(y)
+    raw_ax, raw_bx, raw_cx = corners(node_x.reshape(-1, side, side).to(dtype))
+    raw_ay, raw_by, raw_cy = corners(node_y.reshape(-1, side, side).to(dtype))
     triangles_per_cell = 2 * (side - 1) * (side - 1)
     frame = cell_frame.repeat_interleave(triangles_per_cell)
 
     twice_area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    ebx, eby = raw_bx - raw_ax, raw_by - raw_ay
+    ecx, ecy = raw_cx - raw_ax, raw_cy - raw_ay
+    product0, product1 = ebx * ecy, eby * ecx
+    native_area = product0 - product1
+    uncertain = torch.nonzero(
+        native_area.abs() <= 8 * torch.finfo(dtype).eps * (product0.abs() + product1.abs())
+    ).reshape(-1)
+    if uncertain.numel():
+        native_area[uncertain] = _difference_of_products(
+            ebx[uncertain], ecy[uncertain], eby[uncertain], ecx[uncertain]
+        )
+    native_area = native_area / (pixel_size_x * pixel_size_y)
     stacked_x = torch.stack((ax, bx, cx))
     stacked_y = torch.stack((ay, by, cy))
     minimum_x, maximum_x = stacked_x.amin(0), stacked_x.amax(0)
@@ -429,12 +566,33 @@ def accumulate_cells_torch(
     keep = (
         torch.isfinite(stacked_x).all(0)
         & torch.isfinite(stacked_y).all(0)
-        & (twice_area.abs() > _TINY)
-        & (maximum_x > 0.0)
-        & (minimum_x < columns)
-        & (maximum_y > 0.0)
-        & (minimum_y < rows)
+        & (native_area.abs() > _TINY)
+        & (torch.maximum(torch.maximum(raw_ax, raw_bx), raw_cx) > xmin)
+        & (torch.minimum(torch.minimum(raw_ax, raw_bx), raw_cx) < xmin + columns * pixel_size_x)
+        & (torch.maximum(torch.maximum(raw_ay, raw_by), raw_cy) > ymin)
+        & (torch.minimum(torch.minimum(raw_ay, raw_by), raw_cy) < ymin + rows * pixel_size_y)
     )
+    mass = float(lens_area_per_triangle_uas2) / (
+        float(pixel_size_x) * float(pixel_size_y)
+    )
+    # Very narrow triangles amplify scanline subtraction error. Compare area
+    # with the squared longest extent, and also catch precision lost when
+    # converting physical coordinates to global pixel coordinates.
+    extent = torch.maximum(maximum_x - minimum_x, maximum_y - minimum_y)
+    thin = keep & (
+        (native_area.abs() < 1e-3 * extent.square())
+        | ((twice_area - native_area).abs() > 1e-3 * native_area.abs())
+    )
+    thin_index = torch.nonzero(thin).reshape(-1)
+    if thin_index.numel():
+        _rasterize_thin_triangles(
+            workspace,
+            tuple(value[thin_index] for value in (raw_ax, raw_ay, raw_bx, raw_by, raw_cx, raw_cy)),
+            frame[thin_index], xmin=xmin, ymin=ymin,
+            pixel_size_x=pixel_size_x, pixel_size_y=pixel_size_y, mass=mass,
+            budget=min(int(max_boundary_entries), 1 << 15), runtime=runtime,
+        )
+    keep = keep & ~thin
     kept = torch.nonzero(keep).reshape(-1)
     if kept.numel() == 0:
         return
@@ -444,37 +602,24 @@ def accumulate_cells_torch(
     minimum_y, maximum_y, twice_area = (
         value[kept] for value in (minimum_y, maximum_y, twice_area)
     )
-    mass = float(lens_area_per_triangle_uas2) / (
-        float(pixel_size_x) * float(pixel_size_y)
-    )
     density = mass / (0.5 * twice_area.abs()).clamp_min(_TINY)
     first_row = torch.floor(minimum_y.clamp(0.0, rows - 1.0)).long()
     last_row = torch.floor(maximum_y.clamp(0.0, rows - 1.0)).long()
     row_count = last_row - first_row + 1
 
-    # Split the triangles so no chunk expands into more than ``max_strips``
-    # strips; one triangle never spans more than ``rows`` strips.
-    budget = max(int(max_strips), rows)
-    cumulative = torch.cumsum(row_count, 0)
-    total = int(cumulative[-1])
-    boundaries = [0]
-    if total > budget:
-        targets = torch.arange(budget, total, budget, device=device)
-        boundaries += torch.searchsorted(cumulative, targets).tolist()
-    boundaries.append(kept.numel())
-    for start, stop in zip(boundaries[:-1], boundaries[1:], strict=True):
-        if stop <= start:
-            continue
-        part = slice(start, stop)
+    # Bound the expanded row queue itself, even if a single triangle spans
+    # more rows than the requested budget.
+    for owner, lane in _expanded_chunks(row_count, int(max_strips)):
         _rasterize_strips(
             workspace.histogram,
             workspace.row_difference,
-            frame[part],
-            ax[part], ay[part], bx[part], by[part], cx[part], cy[part],
-            density[part],
-            first_row[part],
-            row_count[part],
+            frame,
+            ax, ay, bx, by, cx, cy,
+            density,
+            owner,
+            first_row[owner] + lane,
             rows=rows,
             columns=columns,
+            max_boundary_entries=int(max_boundary_entries),
             runtime=runtime,
         )

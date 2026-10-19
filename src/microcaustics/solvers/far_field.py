@@ -493,9 +493,10 @@ class TaylorFarFieldApproximation:
         """Run a compiled query kernel on gathered ``[query, local star]`` packs.
 
         On accelerators without Triton the gather is split into fixed-size
-        query chunks (the last one padded) so its temporaries stay within a
-        bounded budget instead of scaling with every query at once. Fixed
-        chunk shapes avoid recompiling the kernel.
+        query chunks (the last one padded) so estimated temporary memory stays
+        within a bounded budget instead of scaling with every query at once.
+        Fixed chunk shapes avoid recompiling the kernel. A single query whose
+        estimated memory exceeds the budget raises before gathering local stars.
         """
 
         runtime = self.simulation.runtime
@@ -503,8 +504,17 @@ class TaylorFarFieldApproximation:
         width = max(1, int(self.local_x.shape[-1]))
         element = self.local_x.element_size()
         # Gathered packs plus the kernel's dx, dy and weight temporaries.
-        rows = max(1024, _PORTABLE_QUERY_BYTES // (6 * element * width))
-        if not portable_accelerator(runtime.device) or count <= rows:
+        bytes_per_query = 6 * element * width
+        rows = _PORTABLE_QUERY_BYTES // bytes_per_query
+        portable = portable_accelerator(runtime.device)
+        if portable and count and rows < 1:
+            raise MemoryError(
+                f"{name}: a single far-field query with local-star pack width "
+                f"{width} requires an estimated {bytes_per_query} temporary bytes, "
+                f"exceeding the portable query budget of {_PORTABLE_QUERY_BYTES} "
+                "bytes. Reduce the packed local-star width before querying."
+            )
+        if not portable or count <= rows:
             return run_tensor_kernel(
                 runtime,
                 name,

@@ -1,4 +1,0 @@
--r base.txt
-astropy>=5.3
-lenstronomy>=1.11
-scipy>=1.10

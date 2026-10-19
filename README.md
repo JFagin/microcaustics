@@ -6,11 +6,12 @@ validated in the accompanying methods paper.
 
 ![Ten-year Q2237 image-B-like dynamic magnification map with source-plane caustics](docs/assets/q2237_image_b_dynamic_magnification.gif)
 
-The animation is a complete 147-frame output of the
+The animation uses the physical setup from the
 [Q2237 light-curve tutorial](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb).
-It shows a ten-year, $10^7$-ray, $1024^2$ dynamic IPM calculation with the
-caustic network overlaid. Its map normalization, colorbar, and indexed GIF
-palette are fixed globally across all frames. This stellar realization was
+This higher-resolution version uses $4\times10^7$ rays and $2048^2$ maps,
+with 366 frames covering ten years at ten-day intervals, played at 20 frames
+per second. The caustic network is overlaid. Its map normalization, colorbar,
+and indexed GIF palette are fixed globally across all frames. This stellar realization was
 selected to illustrate a dense caustic network and source-center crossings.
 
 ### Fast CUDA production path

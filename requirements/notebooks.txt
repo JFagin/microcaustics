@@ -1,9 +1,0 @@
--r base.txt
-jupyterlab>=4
-ipywidgets>=8
-matplotlib>=3.7
-nbclient>=0.10
-nbformat>=5.9
-pillow>=10
-scipy>=1.10
-scikit-image>=0.22

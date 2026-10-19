@@ -189,7 +189,7 @@ def test_temporal_maps_match_cpu_and_stay_on_mps():
     assert not torch.equal(expected[0].values, expected[-1].values)
     for value, reference in zip(actual, expected, strict=True):
         assert value.values.device.type == "mps"
-        assert value.metadata["rasterizer"] == "torch_direct_cell_scanline"
+        assert value.metadata["rasterizer"] == "torch_direct_cell_temporal_batch"
         torch.testing.assert_close(value.values.cpu(), reference.values, rtol=3e-4, atol=3e-5)
 
 
