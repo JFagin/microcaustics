@@ -166,11 +166,18 @@ system = mc.MultiImageSystem.from_macroimage_solutions(
 )
 ```
 
-This works with individual profiles, composite single-plane lenses, and
-multiplane models as long as the object exposes the standard `caustics`
-`raytrace`, `jacobian_lens_equation`, and `time_delay` methods. Models from
-other packages can implement `MacroModel` directly or use
-`CallableMacroModel` with three callables.
+Image solving works with individual profiles, composite single-plane lenses,
+and multiplane models as long as the object exposes the standard `caustics`
+`forward_raytrace`, `raytrace`, `jacobian_lens_equation`, and `time_delay`
+methods. For additional mass profiles, implement a custom caustics lens.
+Results from other solvers can be supplied as `MacroImageSolution` records
+without rerunning the image search.
+
+Converting multi-plane solutions into local microlensing models is not
+currently supported. `local_macro_lens()` and `from_macroimage_solutions()`
+warn but still return the convergence/shear approximation, which omits
+lens-plane coupling and any image rotation. Native image positions and delays
+are unaffected.
 
 For an EPL plus external-shear macro model, the package
 also includes a convenience builder. Install the optional dependencies and
@@ -181,6 +188,8 @@ pip install "microcaustics[macro]"
 ```
 
 ```python
+import torch
+
 macro = mc.EPLShearConfig(
     lens_redshift=0.0394,
     source_redshift=1.695,
@@ -194,6 +203,8 @@ solutions = mc.solve_epl_shear_macroimages(
     macro,
     source_x_arcsec=0.01,
     source_y_arcsec=-0.015,
+    device="cpu",          # Use "cuda" to solve on the GPU instead.
+    dtype=torch.float64,
     # Names correspond to the arrival-time-sorted solutions.
     image_names=("D", "A", "C", "B"),
 )
@@ -211,6 +222,65 @@ Each solution provides position, parity, signed macro magnification, and local
 convergence/shear. `solution.local_macro_lens()` converts those quantities to
 the microlensing model. Users may ignore global solving entirely and supply
 measured delays and local lens parameters directly.
+
+`solve_caustics_macroimages` and the EPL builder now use the native caustics
+`forward_raytrace` image finder by default. Caustics also evaluates the lens
+Jacobian and time delays. We derive signed magnification and local lens
+properties from that Jacobian, then sort the results by arrival time.
+The native search uses `initial_grid_size=100`, `max_depth=25`, and
+`refinement_tolerance_arcsec=1e-8`. The last value is passed to caustics as
+`epsilon` and also sets its image-deduplication tolerance.
+`field_of_view_arcsec` remains the **half-width** of the initial search field.
+Check image completeness by
+varying the field and initial grid, especially near caustics. A small residual
+checks a returned image, not whether every image was found.
+
+Central arrival-time maxima are excluded by default. Use
+`include_central_images=True` to retain them, for example when studying the
+faint central image of a softened lens. The filter identifies maxima from the
+negative eigenvalues of a symmetric lens Jacobian. It does not impose a
+brightness cut or force every lens to have two or four images. Multi-plane
+models and asymmetric Jacobians are left unfiltered. Image names and relative
+delays refer to the
+retained images.
+
+Caustics can issue a maximum-depth warning when a search triangle straddles
+the singular centre of an EPL lens, even when the outer images have converged.
+The warning remains on by default because the native API does not distinguish
+that case from other search failures. After checking your configuration, pass
+`warn_on_nonconvergence=False` to silence only this specific native warning.
+Other warnings, solver exceptions, and checks on image residuals and lens
+properties remain active. Suppressing the warning does not certify image
+completeness or speed up the search.
+
+Macroimage solving defaults to CPU and `dtype=torch.float64`.
+Set `device="cuda"` to use the GPU while retaining double precision. These
+settings apply only to the global image search, independently of the device
+and precision used for microlensing. A GPU is not necessarily faster for this
+small setup calculation, so compare timings on your hardware.
+
+Alternatively, pass `runtime=mc.RuntimeConfig(high_precision_device="cpu")`
+to share the high-precision device choice with source setup and validation.
+An explicit solver `device` takes precedence. The main runtime dtype does
+not change the macroimage solver's float64 default. See the
+[tuning guide](tuning.md#device-for-high-precision-setup-and-checks) for scope
+and defaults.
+
+The EPL builder places its lens parameters on the selected device and dtype.
+When supplying your own lens to `solve_caustics_macroimages`, move it with
+`lens.to(device=..., dtype=...)` and move any supplied parameter tensors to
+the same device and dtype before solving. The adapter does not move them
+automatically. Lower precision requires a suitable
+`refinement_tolerance_arcsec` and separate accuracy checks, especially near
+caustics.
+
+Both wrappers use only the native caustics image finder. Unsupported options
+raise rather than being ignored. There is no separate root solver or fallback
+in the package.
+
+The adapter leaves the installed caustics package unchanged. A scoped PyTorch
+context ensures that untyped search grids in caustics 1.7.1 use the requested
+precision without changing PyTorch's global default dtype.
 
 ## Multi-rate resolved-quasar workflow
 

@@ -188,15 +188,12 @@ from .spectra import (
     QuasarSpectrumPopulation,
 )
 from .strong_lensing import (
-    CallableMacroModel,
     CausticsMacroModel,
     EPLShearConfig,
     MacroImageSolution,
-    MacroModel,
     arrival_time_delay_mapping,
     solve_caustics_macroimages,
     solve_epl_shear_macroimages,
-    solve_macroimages,
 )
 from .system import IntegrationDomain, MicrolensingRealization, MicrolensingSystem
 from .trajectories import LinearTrajectory, SourceTrajectory, TabulatedTrajectory
@@ -241,7 +238,6 @@ __all__ = [
     "BrokenPowerLawPSD",
     "CallableBenchmark",
     "CallableDrivingSignal",
-    "CallableMacroModel",
     "CallableSource",
     "CompilationWarning",
     "CausticField",
@@ -278,7 +274,6 @@ __all__ = [
     "LightCurveComparison",
     "LensingDistances",
     "MacroLens",
-    "MacroModel",
     "MacroImageLightCurve",
     "MacroImageSolution",
     "MacroImageTransferFunctions",
@@ -410,7 +405,6 @@ __all__ = [
     "sample_uniform_circular_point_masses",
     "solve_caustics_macroimages",
     "solve_epl_shear_macroimages",
-    "solve_macroimages",
     "benchmark_callable",
     "batched_magnification_maps",
     "batched_system_light_curves",

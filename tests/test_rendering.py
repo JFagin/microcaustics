@@ -214,6 +214,8 @@ class CausticsRenderingTests(unittest.TestCase):
             initial_grid_size=31,
             field_of_view_arcsec=1.2,
         )
+        # The native finder recovers a faint central maximum, which is
+        # excluded from the default observable-image selection.
         self.assertEqual(len(solutions), 2)
         positions = sorted(solution.x_arcsec for solution in solutions)
         self.assertAlmostEqual(positions[0], -0.5883, places=3)

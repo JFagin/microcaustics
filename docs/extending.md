@@ -40,7 +40,10 @@ mixed populations require no solver changes.
 
 Known image properties may be supplied through the advanced
 `microcaustics.multi_image.MacroImageConfig` interface.
-External macro solvers can implement `MacroModel` or use `CallableMacroModel`.
+Build or extend a lens in `caustics`, then call `solve_caustics_macroimages`
+to obtain image positions, local lens properties, and delays. Results from
+external solvers can instead be supplied as `MacroImageSolution` records to
+`MultiImageSystem.from_macroimage_solutions`, without rerunning image finding.
 
 ## Instruments and outputs
 

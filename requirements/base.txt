@@ -1,0 +1,4 @@
+# ``pyproject.toml`` is the canonical dependency declaration. This file is a
+# convenience for environments that still consume requirements files.
+numpy>=1.24
+torch>=2.4

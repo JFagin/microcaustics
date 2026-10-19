@@ -338,6 +338,12 @@ Compilation warnings are enabled by default. Set `warn_on_compile=False` on
 `RuntimeConfig(warn_on_compile=False)` also suppresses compilation warnings
 during high-level Kerr source construction.
 
+`RuntimeConfig(high_precision_device="cpu")` or `"cuda"` selects where the
+float64 observer-coordinate repairs run, without moving the main source
+calculation. The default preserves CPU repairs. An explicit
+`KerrDiskModel(observer_coordinate_repair_device=...)` overrides the runtime
+choice. See the [tuning guide](tuning.md#device-for-high-precision-setup-and-checks).
+
 `ObserverScreen` uses pixel-center sampling and calculates each pixel's true
 solid angle from its impact-parameter extent, physical gravitational radius,
 and source angular-diameter distance. `TransferredThinDiskSource` then applies

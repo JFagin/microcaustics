@@ -1,5 +1,46 @@
 # Choosing batch and chunk sizes automatically
 
+## Device for high-precision setup and checks
+
+Use one runtime configuration to keep the main simulation on GPU while
+running selected high-precision work on CPU:
+
+```python
+runtime = mc.RuntimeConfig(
+    device="cuda",
+    dtype="float32",
+    high_precision_device="cpu",
+)
+```
+
+Pass this runtime to the source or system constructor, to
+`solve_caustics_macroimages` or
+`solve_epl_shear_macroimages`, and to `compare_magnification_maps` or
+`compare_light_curves` as needed. It is a shared configuration, not a
+process-wide switch. Independent calls must receive it explicitly.
+
+The setting controls macroimage solving, the float64 repair of difficult Kerr
+observer-coordinate rays, and validation metrics. It does not change the main
+compute dtype, lamp tracing, random sampling, plotting, CPU bookkeeping, or
+individual operations inside GPU kernels. Supplied macro lens models and
+parameter tensors must already match the selected device and solver dtype.
+The EPL convenience builder handles its own placement.
+
+`high_precision_device=None` is the default and preserves existing behavior.
+Macroimage solving and Kerr repairs use CPU, while validation retains the
+candidate tensor's device. Choose `"cuda"` or an indexed device such as
+`"cuda:0"` to use GPU double precision, or `"same"` to follow the main runtime
+device. Unsupported or unavailable devices raise an error when the operation
+uses them. A GPU is not necessarily faster for small setup calculations.
+
+An explicit solver or validation `device` overrides the shared choice.
+For a Kerr source, `observer_coordinate_repair_device` provides the same
+override. Its default `None` inherits the runtime choice, falling back to CPU.
+Existing explicit `"cpu"` and `"same"` choices still work. Repair results return
+to the source's original device and dtype.
+
+## Automatic batch and chunk selection
+
 Automatic tuning is opt-in. It tests how many epochs and spatial cells to
 process together. It never changes the physical lens, map field,
 resolution, ray budget, or IPM values `k`, `r`, and `v`.

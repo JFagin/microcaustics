@@ -13,7 +13,12 @@ from pathlib import Path
 
 import torch
 
-from .config import Backend, ProfilingLevel, RuntimeConfig
+from .config import (
+    Backend,
+    ProfilingLevel,
+    RuntimeConfig,
+    normalize_high_precision_device,
+)
 
 _WARNED_BACKEND_FALLBACKS: set[tuple[str, type[BaseException], str]] = set()
 _WARNED_RUNTIME_DOWNGRADES: set[tuple[Backend, Backend]] = set()
@@ -224,6 +229,7 @@ class ResolvedRuntime:
     capabilities: RuntimeCapabilities
     fallback_reason: str | None = None
     response_reconstruction: str = "cdf"
+    high_precision_device: str | None = None
 
     @property
     def available_memory_bytes(self) -> int | None:
@@ -270,6 +276,43 @@ def _auto_device(capabilities: RuntimeCapabilities) -> torch.device:
     if capabilities.mps_available:
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def _resolve_high_precision_device(
+    runtime: RuntimeConfig | ResolvedRuntime | None = None,
+    *,
+    device: str | torch.device | None = None,
+    default: str | torch.device = "cpu",
+    same_device: str | torch.device | None = None,
+) -> torch.device:
+    """Resolve an auxiliary device without selecting or compiling a backend."""
+    choice = (
+        device
+        if device is not None
+        else getattr(runtime, "high_precision_device", None)
+    )
+    choice = normalize_high_precision_device(choice)
+    if choice == "same":
+        choice = (
+            same_device
+            if same_device is not None
+            else getattr(runtime, "device", default)
+        )
+        if str(choice) == "auto":
+            choice = _auto_device(RuntimeCapabilities.detect())
+    target = torch.device(default if choice is None else choice)
+    if target.type not in {"cpu", "cuda"}:
+        raise RuntimeError(
+            "High-precision calculations require CPU or CUDA with float64 support"
+        )
+    if target.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested for a high-precision calculation but is not available"
+            )
+        if target.index is not None and target.index >= torch.cuda.device_count():
+            raise RuntimeError(f"High-precision device {target} is not available")
+    return target
 
 
 def _torch_compile_supported(
@@ -399,6 +442,7 @@ def resolve_runtime(
         thermal_flux_block_pixels=config.thermal_flux_block_pixels,
         static_response_projection=config.static_response_projection,
         response_reconstruction=config.response_reconstruction,
+        high_precision_device=config.high_precision_device,
         profiling=config.profiling,
         capabilities=capabilities,
         fallback_reason=reason,

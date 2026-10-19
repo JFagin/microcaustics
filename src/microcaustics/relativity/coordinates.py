@@ -10,7 +10,12 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from ..runtime import RuntimeCapabilities, _torch_compile_supported, warn_compilation
+from ..runtime import (
+    RuntimeCapabilities,
+    _resolve_high_precision_device,
+    _torch_compile_supported,
+    warn_compilation,
+)
 from .elliptic import _elliptic_f_principal, carlson_rd, carlson_rf, carlson_rj
 from .geodesics import (
     _radial_four_real,
@@ -1030,7 +1035,7 @@ def add_observer_coordinates(
     float32_repair_tolerance: float = 1.0e-6,
     repair_chunk_size: int = 16_384,
     repair_quadrature_order: int = 32,
-    repair_device: str = "cpu",
+    repair_device: str | torch.device = "cpu",
     _prepared_arrays: _PreparedCoordinateArrays | None = None,
 ) -> ObserverCoordinateTrace:
     """Add finite-observer delay and optionally emission azimuth.
@@ -1057,14 +1062,15 @@ def add_observer_coordinates(
         raise ValueError("repair_chunk_size must be positive")
     if int(repair_quadrature_order) < 8:
         raise ValueError("repair_quadrature_order must be at least 8")
-    if repair_device not in {"cpu", "same"}:
-        raise ValueError("repair_device must be 'cpu' or 'same'")
     if (
         not math.isfinite(float(float32_repair_tolerance))
         or float(float32_repair_tolerance) <= 0.0
     ):
         raise ValueError("float32_repair_tolerance must be finite and positive")
     device = primary.transfer.radius_rg.device
+    repair_target = _resolve_high_precision_device(
+        device=repair_device, same_device=device
+    )
     output_dtype = primary.transfer.radius_rg.dtype
     work_dtype = output_dtype if coordinate_dtype is None else coordinate_dtype
     if work_dtype not in (torch.float32, torch.float64):
@@ -1273,11 +1279,6 @@ def add_observer_coordinates(
                             repair_start : repair_start + int(repair_chunk_size)
                         ]
                         repair_index = padded_index[local]
-                        repair_target = (
-                            torch.device("cpu")
-                            if repair_device == "cpu"
-                            else device
-                        )
                         repair_spin = spin_tensor.to(
                             device=repair_target, dtype=torch.float64
                         )
@@ -1612,7 +1613,7 @@ def add_observer_coordinates_batch(
     float32_repair_tolerance: float = 1.0e-6,
     repair_chunk_size: int = 16_384,
     repair_quadrature_order: int = 32,
-    repair_device: str = "cpu",
+    repair_device: str | torch.device = "cpu",
 ) -> tuple[ObserverCoordinateTrace, ...]:
     """Pool hit rays from compatible Kerr disks through one compiled shape.
 
@@ -1637,6 +1638,9 @@ def add_observer_coordinates_batch(
         raise ValueError("batched observer-coordinate inputs must have equal length")
     first = primaries[0]
     device = first.transfer.radius_rg.device
+    repair_target = _resolve_high_precision_device(
+        device=repair_device, same_device=device
+    )
     dtype = first.transfer.radius_rg.dtype
     compatible = (
         device.type == "cuda"
@@ -1837,7 +1841,7 @@ def add_observer_coordinates_batch(
     repair = (~valid_p) | (error_p > tolerance)
     repair_index = torch.nonzero(repair, as_tuple=False).reshape(-1)
     if repair_index.numel() and repair_float32:
-        target = torch.device("cpu") if repair_device == "cpu" else device
+        target = repair_target
         # The general quadrature repair expects one inclination scalar. Keep
         # its tiny queues separated by disk while the dense GPU work remains
         # pooled across all physical parameters.

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 import torch
 
+from ..config import normalize_high_precision_device
 from ..geometry import PlaneGrid
 from ..lens import LensingDistances
 from ..lens.models import _source_distances_from_redshift
@@ -24,7 +25,12 @@ from ..relativity import (
     trace_primary_equatorial,
 )
 from ..relativity.coordinates import add_observer_coordinates_batch
-from ..runtime import ResolvedRuntime, RuntimeConfig, resolve_runtime
+from ..runtime import (
+    ResolvedRuntime,
+    RuntimeConfig,
+    _resolve_high_precision_device,
+    resolve_runtime,
+)
 from .analytic import GaussianSource
 from .base import PixelatedSource, SourceGeometry
 from .reprocessing import (
@@ -622,7 +628,7 @@ class KerrDiskModel:
     warn_on_compile: bool = True
     primary_repair_max_passes: int = 8
     observer_coordinate_chunk_size: int = 524_288
-    observer_coordinate_repair_device: str = "cpu"
+    observer_coordinate_repair_device: str | torch.device | None = None
     compute_emission_azimuth: bool = False
     lamppost_nalpha: int = 1024
     lamppost_radial_bins: int = 512
@@ -679,10 +685,11 @@ class KerrDiskModel:
             raise ValueError("primary_repair_max_passes must be non-negative")
         if self.observer_coordinate_chunk_size < 1:
             raise ValueError("observer_coordinate_chunk_size must be positive")
-        if self.observer_coordinate_repair_device not in {"cpu", "same"}:
-            raise ValueError(
-                "observer_coordinate_repair_device must be 'cpu' or 'same'"
-            )
+        object.__setattr__(
+            self,
+            "observer_coordinate_repair_device",
+            normalize_high_precision_device(self.observer_coordinate_repair_device),
+        )
         if self.lamppost_nalpha < 16:
             raise ValueError("lamppost_nalpha must be at least 16")
         if self.lamppost_radial_bins < 16:
@@ -924,11 +931,16 @@ def _finish_kerr_pixelation(
             coordinate_dtype=plan.runtime.dtype,
             compute_emission_azimuth=model.compute_emission_azimuth,
             chunk_size=model.observer_coordinate_chunk_size,
-            compile_solver=(model.compile_solver and plan.runtime.device.type == "cuda"),
+            compile_solver=(
+                model.compile_solver and plan.runtime.device.type == "cuda"
+            ),
             compile_mode=(plan.runtime.torch_compile_mode or "reduce-overhead"),
             fallback_to_eager=not plan.runtime.strict_backend,
             warn_on_compile=(model.warn_on_compile and plan.runtime.warn_on_compile),
-            repair_device=model.observer_coordinate_repair_device,
+            repair_device=_resolve_high_precision_device(
+                plan.runtime,
+                device=model.observer_coordinate_repair_device,
+            ),
         )
     profile = axis_lamppost_profile(
         spin=model.spin,
@@ -1029,6 +1041,7 @@ def batched_pixelate_sources(
                     plan.runtime.dtype,
                     model.observer_coordinate_chunk_size,
                     model.observer_coordinate_repair_device,
+                    plan.runtime.high_precision_device,
                     _observer_radius_rg(plan.half_width_rg),
                     plan.runtime.torch_compile_mode,
                     model.compile_solver,
@@ -1071,7 +1084,10 @@ def batched_pixelate_sources(
                             first.model.warn_on_compile
                             and first.runtime.warn_on_compile
                         ),
-                        repair_device=first.model.observer_coordinate_repair_device,
+                        repair_device=_resolve_high_precision_device(
+                            first.runtime,
+                            device=first.model.observer_coordinate_repair_device,
+                        ),
                     )
                 for member, plan, coordinate in zip(
                     members, member_plans, coordinates, strict=True

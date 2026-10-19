@@ -46,7 +46,7 @@ class PackagingContractTests(unittest.TestCase):
         core = tuple(metadata["dependencies"])
         self.assertTrue(any(value.startswith("numpy") for value in core))
         self.assertTrue(any(value.startswith("torch") for value in core))
-        for external in ("astropy", "lenstronomy", "scipy", "pytest", "hypothesis"):
+        for external in ("astropy", "caustics", "lenstronomy", "scipy", "pytest", "hypothesis"):
             self.assertFalse(
                 any(value.lower().startswith(external) for value in core),
                 f"{external} must not be a mandatory runtime dependency",
@@ -55,6 +55,11 @@ class PackagingContractTests(unittest.TestCase):
         self.assertTrue(any(value.startswith("astropy") for value in validation))
         self.assertTrue(any(value.startswith("lenstronomy") for value in validation))
         self.assertTrue(any(value.startswith("scipy") for value in validation))
+
+    def test_source_distribution_excludes_tutorials_and_internal_tests(self) -> None:
+        manifest = (PACKAGE_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+        for directory in ("docs", "examples", "tests"):
+            self.assertIn(f"prune {directory}", manifest.splitlines())
 
     def test_release_version_and_license_metadata_are_consistent(self) -> None:
         metadata = tomllib.loads(
