@@ -66,7 +66,12 @@ class FoundationTests(unittest.TestCase):
         conservative = production_ipm_config(scout_trace_centers=True)
         self.assertEqual(static.scout_ratio, 1)
         self.assertFalse(static.dual_scout_scalar_correction)
-        self.assertTrue(static.scout_trace_centers)
+        self.assertFalse(static.scout_trace_centers)
+        self.assertFalse(IPMConfig().scout_trace_centers)
+        self.assertTrue(IPMConfig(scout_trace_centers=True).scout_trace_centers)
+        self.assertTrue(
+            _production_static_ipm_config(scout_trace_centers=True).scout_trace_centers
+        )
         self.assertTrue(conservative.scout_trace_centers)
         self.assertEqual(dynamic.scout_ratio, 2)
         self.assertTrue(dynamic.dual_scout_scalar_correction)

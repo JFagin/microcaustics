@@ -171,7 +171,7 @@ class CDFResponseRebinner:
 
         Positive and negative native-bin masses are reconstructed separately.
         This cannot recover cancellation already lost inside a native bin.
-        It is deliberately NOT used by linear/quadratic light-curve evolution.
+        It is not used by the response-based light-curve calculations.
         """
         if validate and not bool(torch.isfinite(mass).all()):
             raise ValueError("signed response masses must be finite")

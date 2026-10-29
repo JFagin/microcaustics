@@ -68,8 +68,9 @@ def _quadratic_response_weight_kernel(
     pixel_area,
     driver_amplitude,
     quadratic=True,
+    cubic=False,
 ):
-    """Share the temperature and Planck evaluation between both derivatives."""
+    """Share Planck terms across derivatives, optionally returning cubic and mean."""
 
     total4 = (static + driver_amplitude * response).clamp_min(1.0e-30)
     temperature = total4.pow(0.25)
@@ -97,7 +98,7 @@ def _quadratic_response_weight_kernel(
         / pixel_area
     )
     first = torch.where(hit[..., None] & torch.isfinite(first), first, 0.0)
-    if not quadratic:
+    if not quadratic and not cubic:
         return first, None
     second = (
         first
@@ -105,6 +106,20 @@ def _quadratic_response_weight_kernel(
         * (exponent * (1.0 + 2.0 / excess) - 5.0)
     )
     second = torch.where(hit[..., None] & torch.isfinite(second), second, 0.0)
+    if cubic:
+        # For r=Q/(4*T^4) and q=x*coth(x/2), S'''=S'*r^2*
+        # [q^2-15*q+45+2*x^2*exp(x)/(exp(x)-1)^2]. No autodiff
+        # or extra Planck evaluation is needed. Return the mean in this pass too.
+        q = exponent * (1.0 + 2.0 / excess)
+        third = first * (response / (4.0 * total4)).square()[..., None] * (
+            q.square() - 15.0 * q + 45.0
+            + 2.0 * exponent.square() * exponential / excess.square()
+        )
+        third = torch.where(hit[..., None] & torch.isfinite(third), third, 0.0)
+        mean = (prefactor / excess * solid_angle[..., None]
+                / (1.0 + redshift).pow(3) * 1.0e26 / pixel_area)
+        mean = torch.where(hit[..., None], mean, 0.0)
+        return mean, first, second, third
     return first, second
 
 

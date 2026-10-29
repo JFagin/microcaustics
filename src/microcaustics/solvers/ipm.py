@@ -385,7 +385,6 @@ def _source_scout_union_temporal(
     if (
         not far_fields
         or any(item is None for item in far_fields)
-        or config.scout_trace_centers
         or runtime.backend is not Backend.TRITON
         or runtime.device.type != "cuda"
         or runtime.dtype != torch.float32
@@ -429,6 +428,24 @@ def _source_scout_union_temporal(
     corner_x = corner_x.reshape(corner_shape)
     corner_y = corner_y.reshape(corner_shape)
 
+    # The conservative centre check uses the same temporal query as the
+    # corners. It need not force every endpoint through the scalar scout.
+    mapped_center_x = mapped_center_y = None
+    center_count = 0
+    if config.scout_trace_centers:
+        center_x = 0.5 * (x_edges[:-1] + x_edges[1:])
+        center_y = 0.5 * (y_edges[:-1] + y_edges[1:])
+        center_count = coarse_ny * coarse_nx
+        linear = torch.arange(center_count, device=runtime.device)
+        row = torch.div(linear, coarse_nx, rounding_mode="floor")
+        column = linear - row * coarse_nx
+        mapped_center_x, mapped_center_y = batched.raytrace(
+            center_x[column], center_y[row]
+        )
+        shape = (len(far_fields), coarse_ny, coarse_nx)
+        mapped_center_x = mapped_center_x.reshape(shape)
+        mapped_center_y = mapped_center_y.reshape(shape)
+
     source_xmin, source_xmax, source_ymin, source_ymax = source_grid.bounds_uas
     source_dy, source_dx = source_grid.pixel_scale_uas
     halo_x = float(config.scout_halo_pixels) * source_dx
@@ -442,6 +459,8 @@ def _source_scout_union_temporal(
             source_ymin - halo_y,
             source_ymax + halo_y,
         ),
+        center_x=mapped_center_x,
+        center_y=mapped_center_y,
     )
     selected_before = selected.sum(dim=(-2, -1), dtype=torch.int64)
     selected = dilate_source_tiles_triton(
@@ -474,8 +493,8 @@ def _source_scout_union_temporal(
             "scout_grid_rows": coarse_ny,
             "scout_grid_columns": coarse_nx,
             "scout_corner_traces": vertex_count,
-            "scout_center_traces": 0,
-            "scout_trace_centers": False,
+            "scout_center_traces": center_count,
+            "scout_trace_centers": bool(config.scout_trace_centers),
             "scout_selector": "triton_temporal_fused",
             "scout_selected_before_dilation": int(counts[0, frame]),
             "scout_selected_tiles": int(counts[1, frame]),
@@ -826,6 +845,7 @@ def full_field_ipm(
     _selected_cell_shape: tuple[int, int] | None = None,
     _selection_metadata: dict[str, object] | None = None,
     _scalar_correction: float | torch.Tensor | None = None,
+    _microimages=None,
 ) -> MagnificationMap:
     """Generate a full-field or nested-scout IPM magnification map.
 
@@ -939,6 +959,17 @@ def full_field_ipm(
             dtype=runtime.dtype,
         )
     trace_backends: set[str] = set()
+    source_pixels = source_prefix = cell_flux = None
+    if _microimages is not None:
+        from ..microimages import prepare_microimages
+
+        source_pixels, source_prefix = prepare_microimages(
+            _microimages, source_grid, time_days, runtime
+        )
+        if source_pixels is not None:
+            cell_flux = source_pixels.new_zeros(
+                (cell_indices.numel(), source_pixels.shape[-1])
+            )
 
     def _calculate_map(accelerated: bool) -> torch.Tensor:
         from .torch_ipm import TorchRasterWorkspace, accumulate_cells_torch
@@ -957,7 +988,7 @@ def full_field_ipm(
                 source_grid.shape, device=runtime.device
             )
             accumulate = accumulate_cells_triton
-        elif _tensor_rasterizer(runtime):
+        elif _tensor_rasterizer(runtime) or _microimages is not None:
             workspace = TorchRasterWorkspace.create(
                 source_grid.shape, device=runtime.device, dtype=runtime.dtype
             )
@@ -966,6 +997,8 @@ def full_field_ipm(
             workspace = None
         source_dy, source_dx = source_grid.pixel_scale_uas
         source_xmin, _, source_ymin, _ = source_grid.bounds_uas
+        if cell_flux is not None:
+            cell_flux.zero_()
         selected_count = int(cell_indices.numel())
         compact_source_x = compact_source_y = None
         if compact_sparse_nodes:
@@ -1030,6 +1063,15 @@ def full_field_ipm(
                     virtual_refinement=side,
                 )
             if workspace is not None:
+                render_kwargs = (
+                    {}
+                    if cell_flux is None
+                    else {
+                        "source_pixels": source_pixels,
+                        "source_prefix": source_prefix,
+                        "cell_flux": cell_flux[start:stop],
+                    }
+                )
                 accumulate(
                     workspace,
                     virtual_x,
@@ -1039,6 +1081,7 @@ def full_field_ipm(
                     pixel_size_x=source_dx,
                     pixel_size_y=source_dy,
                     lens_area_per_triangle_uas2=triangle_lens_area,
+                    **render_kwargs,
                 )
             else:
                 triangles = triangles_from_node_lattices(virtual_x, virtual_y)
@@ -1108,10 +1151,35 @@ def full_field_ipm(
             else "torch-eager"
         )
     )
+    microimage_frame = None
+    if cell_flux is not None:
+        from ..microimages import MicroimageFrame
+
+        microimage_frame = MicroimageFrame(
+            cell_indices,
+            cell_flux,
+            PlaneGrid(
+                (cell_ny, cell_nx),
+                lens_region.field_of_view_uas,
+                center_uas=lens_region.center_uas,
+            ),
+            float(time_days),
+            float(time_days - _microimages.macro_delay_days),
+            _microimages.wavelengths_angstrom,
+            (
+                source_pixels.new_zeros(source_pixels.shape[-1])
+                if scalar_correction is None
+                else source_pixels.sum(dim=(0, 1)) * scalar_correction
+            ),
+        )
     return MagnificationMap(
         output,
         source_grid,
         time_days=float(time_days),
+        microimages=microimage_frame,
+        _source_photometry=(
+            None if _microimages is None else _microimages.photometry(time_days, output)
+        ),
         method=(
             "tiled_interpolated_ipm" if config.tiled else "full_field_interpolated_ipm"
         ),
@@ -1141,17 +1209,20 @@ def full_field_ipm(
                     if use_triton and refinement == 2 and side == 4
                     else "torch-eager"
                 ),
-                "rasterization": _rasterization_label(use_triton, runtime),
+                "rasterization": "torch-tensor"
+                if cell_flux is not None and not use_triton
+                else _rasterization_label(use_triton, runtime),
             },
             "rasterizer": (
                 "triton_direct_cell_scanline"
                 if use_triton
                 else "torch_direct_cell_scanline"
-                if _tensor_rasterizer(runtime)
+                if _tensor_rasterizer(runtime) or cell_flux is not None
                 else "exact_sutherland_hodgman_reference"
             ),
             **scout_metadata,
             **correction_diagnostics,
+            **({"microimage_output": True} if cell_flux is not None else {}),
         },
         timing=TimingBreakdown(
             collected=runtime.profiling_enabled,
@@ -1183,6 +1254,7 @@ def temporal_batch_ipm(
     selection_metadata: dict[str, object] | None = None,
     scalar_correction: float | torch.Tensor | None = None,
     real_frame_count: int | None = None,
+    _microimages=None,
 ) -> tuple[MagnificationMap, ...]:
     """Generate a temporal IPM batch with shared or ragged cell queues.
 
@@ -1204,6 +1276,10 @@ def temporal_batch_ipm(
     times = tuple(float(value) for value in times_days)
     if not times:
         return ()
+    if _microimages is not None and selected_cell_indices_by_frame is not None:
+        raise ValueError(
+            "Experimental microimage batches require a shared cell selection"
+        )
     total_frames = len(times)
     real_frames = total_frames if real_frame_count is None else int(real_frame_count)
     if not 1 <= real_frames <= total_frames:
@@ -1228,9 +1304,9 @@ def temporal_batch_ipm(
         if len(far_fields) != total_frames:
             raise ValueError("far_fields must match the padded temporal batch")
     batched_far_field = None
-    if (
-        total_frames > 1 or selected_cell_indices_by_frame is not None
-    ) and all(item is not None for item in far_fields):
+    if (total_frames > 1 or selected_cell_indices_by_frame is not None) and all(
+        item is not None for item in far_fields
+    ):
         from .far_field import BatchedTaylorFarFieldApproximation
 
         batched_far_field = BatchedTaylorFarFieldApproximation(far_fields)
@@ -1257,8 +1333,10 @@ def temporal_batch_ipm(
         if len(rows) != total_frames:
             raise ValueError("per-frame selected cells must match the temporal batch")
         lengths = tuple(int(value.numel()) for value in rows)
-        cell_indices = torch.cat(rows) if rows else torch.empty(
-            0, device=runtime.device, dtype=torch.long
+        cell_indices = (
+            torch.cat(rows)
+            if rows
+            else torch.empty(0, device=runtime.device, dtype=torch.long)
         )
         cell_frame_index = torch.repeat_interleave(
             torch.arange(total_frames, device=runtime.device, dtype=torch.int32),
@@ -1395,15 +1473,25 @@ def temporal_batch_ipm(
         else:
             # The unique-node plan is spatial and shared across all temporal
             # frames; only mapped coordinates vary with the moving stars.
-            compact_node_x, compact_node_y, compact_inverse = (
-                _compact_sparse_node_plan(
-                    cell_indices,
-                    cell_ny=cell_ny,
-                    cell_nx=cell_nx,
-                    refinement=refinement,
-                    lens_region=lens_region,
-                    dtype=runtime.dtype,
-                )
+            compact_node_x, compact_node_y, compact_inverse = _compact_sparse_node_plan(
+                cell_indices,
+                cell_ny=cell_ny,
+                cell_nx=cell_nx,
+                refinement=refinement,
+                lens_region=lens_region,
+                dtype=runtime.dtype,
+            )
+
+    source_pixels = source_prefix = cell_flux = None
+    if _microimages is not None:
+        from ..microimages import prepare_microimage_batch
+
+        source_pixels, source_prefix = prepare_microimage_batch(
+            _microimages, source_grid, times, runtime
+        )
+        if source_pixels is not None:
+            cell_flux = source_pixels.new_zeros(
+                (total_frames, cell_indices.numel(), source_pixels.shape[-1])
             )
 
     def calculate(accelerated: bool) -> torch.Tensor:
@@ -1422,7 +1510,7 @@ def temporal_batch_ipm(
                 frames=total_frames,
             )
             accumulate = accumulate_cells_triton
-        elif _tensor_rasterizer(runtime):
+        elif _tensor_rasterizer(runtime) or cell_flux is not None:
             workspace = TorchRasterWorkspace.create(
                 source_grid.shape,
                 device=runtime.device,
@@ -1544,9 +1632,7 @@ def temporal_batch_ipm(
                         mapped_y.append(source_y)
                     traced_x = torch.stack(mapped_x)
                     traced_y = torch.stack(mapped_y)
-            chunk_cells = int(
-                traced_x.shape[0] if ragged_cells else traced_x.shape[1]
-            )
+            chunk_cells = int(traced_x.shape[0] if ragged_cells else traced_x.shape[1])
             raw_x = traced_x.reshape(-1, refinement + 1, refinement + 1)
             raw_y = traced_y.reshape(-1, refinement + 1, refinement + 1)
             if accelerated and refinement == 2 and virtual == 4:
@@ -1565,20 +1651,63 @@ def temporal_batch_ipm(
                 virtual + 1,
             )
             virtual_y = virtual_y.reshape_as(virtual_x)
+            render_kwargs = {}
+            if cell_flux is not None:
+                chunk_flux = source_pixels.new_zeros(
+                    (total_frames * chunk_cells, source_pixels.shape[-1])
+                )
+                render_kwargs = dict(
+                    source_pixels=source_pixels,
+                    source_prefix=source_prefix,
+                    cell_flux=chunk_flux,
+                )
             if workspace is not None:
-                accumulate(
-                    workspace,
-                    virtual_x,
-                    virtual_y,
+                geometry_kwargs = dict(
                     xmin=source_xmin,
                     ymin=source_ymin,
                     pixel_size_x=source_dx,
                     pixel_size_y=source_dy,
                     lens_area_per_triangle_uas2=triangle_lens_area,
-                    cell_frame_index=(
-                        chunk_frame_index if ragged_cells else None
-                    ),
                 )
+                if cell_flux is not None and (
+                    not accelerated or not all(_microimages.includes(t) for t in times)
+                ):
+                    for frame in range(total_frames):
+                        workspace_type = TritonRasterWorkspace if accelerated else TorchRasterWorkspace
+                        single_workspace = workspace_type(
+                            workspace.histogram[frame]
+                            if total_frames > 1
+                            else workspace.histogram,
+                            workspace.row_difference[frame]
+                            if total_frames > 1
+                            else workspace.row_difference,
+                        )
+                        accumulate(
+                            single_workspace,
+                            virtual_x[frame],
+                            virtual_y[frame],
+                            **geometry_kwargs,
+                            **(dict(
+                                source_pixels=source_pixels[frame],
+                                source_prefix=source_prefix[frame],
+                                cell_flux=chunk_flux[
+                                    frame * chunk_cells : (frame + 1) * chunk_cells
+                                ],
+                            ) if _microimages.includes(times[frame]) else {}),
+                        )
+                else:
+                    accumulate(
+                        workspace,
+                        virtual_x,
+                        virtual_y,
+                        **geometry_kwargs,
+                        cell_frame_index=chunk_frame_index if ragged_cells else None,
+                        **render_kwargs,
+                    )
+                if cell_flux is not None:
+                    cell_flux[:, start:stop] = chunk_flux.reshape(
+                        total_frames, chunk_cells, -1
+                    )
             else:
                 for frame in range(total_frames):
                     frame_x = (
@@ -1660,11 +1789,37 @@ def temporal_batch_ipm(
     )
     maps = []
     for frame in range(real_frames):
+        microimage_frame = None
+        if cell_flux is not None and _microimages.includes(times[frame]):
+            from ..microimages import MicroimageFrame
+
+            microimage_frame = MicroimageFrame(
+                cell_indices,
+                cell_flux[frame],
+                PlaneGrid(
+                    (cell_ny, cell_nx),
+                    lens_region.field_of_view_uas,
+                    center_uas=lens_region.center_uas,
+                ),
+                times[frame],
+                times[frame] - _microimages.macro_delay_days,
+                _microimages.wavelengths_angstrom,
+                (
+                    source_pixels.new_zeros(source_pixels.shape[-1])
+                    if scalar_correction is None
+                    else source_pixels[frame].sum((0, 1)) * scalar_correction
+                ),
+            )
         maps.append(
             MagnificationMap(
                 output[frame],
                 source_grid,
                 time_days=times[frame],
+                microimages=microimage_frame,
+                _source_photometry=(
+                    None if _microimages is None
+                    else _microimages.photometry(times[frame], output[frame])
+                ),
                 method=(
                     "tiled_interpolated_ipm"
                     if config.tiled

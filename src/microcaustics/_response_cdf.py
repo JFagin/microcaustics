@@ -176,10 +176,14 @@ def deposit_response(sampled, response, index, fraction, bins):
 
 
 def project_deposited_response(
-    sampled, brightness, response, index, fraction, bins, bands, quadratic
+    sampled, brightness, response, index, fraction, bins, bands, quadratic, cubic=False
 ):
-    """Project mean flux and fractionally deposited linear or quadratic weights."""
-    if quadratic:
+    """Project mean flux and fractionally deposited response weights through cubic order."""
+    if cubic:
+        first, second, third = response.split(bands, dim=1)
+        response = torch.cat((first, second.clamp_min(0), (-second).clamp_min(0),
+                              third.clamp_min(0), (-third).clamp_min(0)), 1)
+    elif quadratic:
         first, second = response[:, :bands], response[:, bands:]
         response = torch.cat((first, second.clamp_min(0), (-second).clamp_min(0)), 1)
     return sampled @ brightness, deposit_response(
@@ -303,7 +307,36 @@ def _piece_integrals(a, b, low, high, quadratic):
     return torch.cat((6 * (j1 - j2), j0 - 4 * j1 + 3 * j2, 3 * j2 - 2 * j1), 1)
 
 
-def driver_integrals(times, edges, sample_times, sample_values, baseline, quadratic):
+def _cubic_piece_integrals(a, b, low, high):
+    """All three driver powers in one pass, sharing interval moments."""
+    delta = high - low
+    lo2, hi2 = low.square(), high.square()
+    lo3, hi3 = lo2 * low, hi2 * high
+    i0 = delta
+    i1 = delta * (high + low) / 2
+    i2 = delta * (hi2 + high * low + lo2) / 3
+    i3 = delta * (high + low) * (hi2 + lo2) / 4
+    i4 = delta * (hi2.square() + hi3 * low + hi2 * lo2 + high * lo3 + lo2.square()) / 5
+    i5 = delta * (hi3 * hi2 + hi2.square() * low + hi3 * lo2
+                  + hi2 * lo3 + high * lo2.square() + lo3 * lo2) / 6
+    a2, b2 = a.square(), b.square()
+    ab = 2 * a * b
+    a3, aab, abb, b3 = a2 * a, 3 * a2 * b, 3 * a * b2, b2 * b
+
+    def basis(j0, j1, j2):
+        return torch.cat((6 * (j1 - j2), j0 - 4 * j1 + 3 * j2, 3 * j2 - 2 * j1), 1)
+
+    return (
+        basis(a * i0 + b * i1, a * i1 + b * i2, a * i2 + b * i3),
+        basis(a2 * i0 + ab * i1 + b2 * i2, a2 * i1 + ab * i2 + b2 * i3,
+              a2 * i2 + ab * i3 + b2 * i4),
+        basis(a3 * i0 + aab * i1 + abb * i2 + b3 * i3,
+              a3 * i1 + aab * i2 + abb * i3 + b3 * i4,
+              a3 * i2 + aab * i3 + abb * i4 + b3 * i5),
+    )
+
+
+def driver_integrals(times, edges, sample_times, sample_values, baseline, quadratic, cubic=False):
     """Integrate exactly across the (at most one) driver knot in each bin."""
     step = edges[1] - edges[0]
     query = times[:, None] - edges[None, :-1]
@@ -324,6 +357,10 @@ def driver_integrals(times, edges, sample_times, sample_values, baseline, quadra
     b2 = -step * slope2
     a2 = sample_values[left] - baseline - b2 * cut
     zeros, ones = torch.zeros_like(cut), torch.ones_like(cut)
+    if cubic:
+        before = _cubic_piece_integrals(start, b1, zeros, cut)
+        after = _cubic_piece_integrals(a2, b2, cut, ones)
+        return tuple(a + b for a, b in zip(before, after, strict=True))
     first = _piece_integrals(start, b1, zeros, cut, False)
     first = first + _piece_integrals(a2, b2, cut, ones, False)
     if not quadratic:
@@ -341,7 +378,7 @@ def contract(mean, linear_driver, linear, quadratic_driver=None, quadratic=None)
     return result
 
 
-def callable_driver_integrals(signal, times, edges, baseline, quadratic):
+def callable_driver_integrals(signal, times, edges, baseline, quadratic, cubic=False):
     """Three-point Gaussian integration for a general scalar callable driver."""
     x = edges.new_tensor([0.1127016653792583, 0.5, 0.8872983346207417])
     w = edges.new_tensor([5 / 18, 4 / 9, 5 / 18])
@@ -358,6 +395,8 @@ def callable_driver_integrals(signal, times, edges, baseline, quadratic):
     def integral(value):
         return torch.einsum("tkq,bq->tbk", value, basis).reshape(len(times), -1)
 
+    if cubic:
+        return integral(delta), integral(delta.square()), integral(delta.pow(3))
     return integral(delta), integral(delta.square()) if quadratic else None
 
 
@@ -473,6 +512,7 @@ class NativeCDFGrid:
         coordinate = (delay / self.deposition_step - 0.5).clamp_min(0)
         self.index = coordinate.long().clamp(max=self.deposition_count - 2)
         self.fraction = (coordinate - self.index).clamp(0, 1)
+        self._deposition_groups = None
 
     def run(self, name, function, *args):
         """Evaluate a tensor kernel eagerly or through the cached runtime backend."""
@@ -487,8 +527,37 @@ class NativeCDFGrid:
         )
         return result
 
-    def project(self, sampled, brightness, response, bands, quadratic):
+    def project(self, sampled, brightness, response, bands, quadratic, cubic=False):
         """Return mean flux and phase-averaged CDF coefficients for one map."""
+        from .config import Backend
+
+        grouped = (
+            self.runtime is not None and self.runtime.backend == Backend.TRITON
+            and response.device.type == "cuda" and response.dtype == torch.float32
+            and (quadratic or cubic) and sampled.is_contiguous()
+            and self.fraction.is_contiguous()
+            and response.shape[0] >= 4096 and response.stride(1) == 1
+            and response.shape[0] <= self.deposition_count * 1024
+            and not (torch.is_grad_enabled() and any(
+                t.requires_grad for t in (sampled, brightness, response, self.fraction)))
+        )
+        if grouped:
+            from .sources.triton_response import grouped_deposit, prepare_groups
+
+            if self._deposition_groups is None:
+                self._deposition_groups = prepare_groups(self.index, self.deposition_count)
+            mean = sampled @ brightness
+            mass = grouped_deposit(sampled, response, self.fraction,
+                self._deposition_groups, self.deposition_count, bands,
+                3 if cubic else 2 if quadratic else 1, self.runtime)
+        else:
+            mean, mass = self._deposit(sampled, brightness, response, bands, quadratic, cubic)
+        coeff = self.run(
+            "phase-averaged CDF polynomials", phase_cdf_coefficients, mass, self.count
+        )
+        return mean, coeff
+
+    def _deposit(self, sampled, brightness, response, bands, quadratic, cubic):
         mean, mass = self.run(
             "CDF response projection",
             project_deposited_response,
@@ -500,11 +569,9 @@ class NativeCDFGrid:
             self.deposition_count,
             bands,
             quadratic,
+            cubic,
         )
-        coeff = self.run(
-            "phase-averaged CDF polynomials", phase_cdf_coefficients, mass, self.count
-        )
-        return mean, coeff
+        return mean, mass
 
     def rebin(self, coefficients, output_edges):
         """Integrate response polynomials over the requested delay-bin edges."""

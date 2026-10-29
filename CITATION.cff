@@ -4,7 +4,7 @@ message: >-
   methods paper listed as the preferred citation below.
 title: microcaustics
 type: software
-version: 1.0.0
+version: 1.0.1
 license: MIT
 repository-code: https://github.com/JFagin/microcaustics
 authors:

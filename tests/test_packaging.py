@@ -58,7 +58,7 @@ class PackagingContractTests(unittest.TestCase):
 
     def test_source_distribution_excludes_tutorials_and_internal_tests(self) -> None:
         manifest = (PACKAGE_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
-        for directory in ("docs", "examples", "tests"):
+        for directory in ("docs", "examples", "tests", "internal_reference"):
             self.assertIn(f"prune {directory}", manifest.splitlines())
 
     def test_release_version_and_license_metadata_are_consistent(self) -> None:
@@ -69,7 +69,7 @@ class PackagingContractTests(unittest.TestCase):
 
         citation = (PACKAGE_ROOT / "CITATION.cff").read_text(encoding="utf-8")
         license_text = (PACKAGE_ROOT / "LICENSE").read_text(encoding="utf-8")
-        self.assertEqual(metadata["version"], "1.0.0")
+        self.assertEqual(metadata["version"], "1.0.1")
         self.assertEqual(microcaustics.__version__, metadata["version"])
         self.assertIn(f"version: {metadata['version']}", citation)
         self.assertEqual(metadata["license"], "MIT")

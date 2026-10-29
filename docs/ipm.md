@@ -42,9 +42,10 @@ The scout safety controls act in different coordinate spaces:
   after selection. The production default is one layer. At `k=2`, that layer
   is two fine cells wide.
 - `scout_trace_centers` supplements mapped scout-corner tests with cell-center
-  queries. The fast dynamic preset disables it after validation found a
-  sub-mmag effect with a measurable runtime cost. Set it to `True` for an
-  explicitly conservative center-assisted scout.
+  queries. It is disabled by default in `IPMConfig` and both static and dynamic
+  presets. Set it to `True` for an additional interior sample when checking
+  scout coverage. This check can recover cells missed by their mapped corners,
+  but it does not guarantee complete coverage.
 
 These controls are independent of `scout_ratio` (`k`) and remain configurable.
 Increasing either halo is more conservative but retains more cells. Setting
@@ -76,7 +77,7 @@ boundaries smoother, but cannot recover information absent from the true
 ## Suggested starting points
 
 - **Independent static map.** The high-level static operation selects
-  `N=10_000_000, k=1, r=2, v=4` by default.
+  `N=10_000_000, k=1, r=2, v=4` with corner-only scouting by default.
 - **Dynamic production sequence.** The high-level dynamic operation selects
   `N=10_000_000, k=2, r=2, v=4`, uses mapped cell corners for selection,
   retains one layer of neighboring scout cells, and computes the initial

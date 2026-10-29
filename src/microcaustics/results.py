@@ -6,11 +6,15 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from functools import cached_property
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from .geometry import ImagePlaneGrid, PlaneGrid
+
+if TYPE_CHECKING:
+    from .microimages import MicroimageFrame
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,13 @@ class MagnificationMap:
     method: str = ""
     metadata: Mapping[str, object] = field(default_factory=dict)
     timing: TimingBreakdown = field(default_factory=TimingBreakdown)
+
+    # Optional microimage output, absent unless explicitly requested.
+    microimages: MicroimageFrame | None = None
+    # Shared-source microimage calculations use this transient pair.
+    _source_photometry: tuple[torch.Tensor, torch.Tensor] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         values = torch.as_tensor(self.values)

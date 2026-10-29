@@ -18,6 +18,7 @@ animations are visible on GitHub. Each performance-sensitive notebook prints
 the runtime that produced its results. Larger standalone figures, animations,
 and numerical products are written to local output directories. These do not
 all need to be committed because the notebooks embed their display outputs.
+Every notebook must remain below 25 MB, including its embedded outputs.
 
 The current tutorial code uses seed 0, with subsequent integer seeds for
 independent realizations. Changing the seed changes the physical realization,
@@ -87,6 +88,12 @@ sequence shown below.
   combined NPZ archive.
 - `validation/` contains the independent Weisenbach and SIM5 comparisons,
   convergence/performance studies, and the analytic single-point-lens test.
+- `microimage_motion` generates Q2237 B microimages, centroid
+  motion, six-band light curves, caustic-crossing markers, and an animation.
+  It uses the optional image callback and requires CUDA for its full example.
+- `source_models/06_source_evolution_comparison` compares exact, linear,
+  quadratic, and cubic source evolution. It includes full-spectrum
+  timings and accuracy checks at three driving amplitudes.
 
 The primary Q2237, end-to-end, streaming, and performance notebooks should be
 run on CUDA before a performance-sensitive study. They select strict Triton

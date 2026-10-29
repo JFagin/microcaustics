@@ -352,6 +352,7 @@ def _triangle_pixel_fraction(ax, ay, bx, by, cx, cy, xlo, xhi, ylo, yhi):
 def _rasterize_thin_triangles(
     workspace, raw, frame, *, xmin, ymin, pixel_size_x, pixel_size_y,
     mass, budget, runtime,
+    source_pixels=None, cell_flux=None, cell_id=None,
 ):
     """Use bounded pixel clipping only for triangles ill-conditioned in scanlines."""
 
@@ -385,6 +386,9 @@ def _rasterize_thin_triangles(
         0, ((frame * rows + row0) * columns + col0)[contained],
         torch.full_like(ax[contained], mass),
     )
+    if cell_flux is not None:
+        cell_flux.index_add_(0, cell_id[contained],
+                            mass * source_pixels[row0[contained], col0[contained]])
     counts = torch.where(contained, 0, counts)
     kernel = _kernel("thin triangle clipping", _triangle_pixel_fraction, runtime)
     for owner, lane in _expanded_chunks(counts, budget):
@@ -398,6 +402,9 @@ def _rasterize_thin_triangles(
         workspace.histogram.reshape(-1).index_add_(
             0, (frame[owner] * rows + row) * columns + column, mass * fraction,
         )
+        if cell_flux is not None:
+            cell_flux.index_add_(0, cell_id[owner],
+                                (mass * fraction)[:, None] * source_pixels[row, column])
 
 
 def _rasterize_strips(
@@ -413,6 +420,7 @@ def _rasterize_strips(
     columns: int,
     max_boundary_entries: int,
     runtime: ResolvedRuntime | None,
+    source_pixels=None, source_prefix=None, cell_flux=None, cell_id=None,
 ) -> None:
     """Deposit kept triangles, already in pixel units, one row strip at a time."""
 
@@ -440,6 +448,11 @@ def _rasterize_strips(
     full_density = density[full]
     difference.index_add_(0, (row_base + full0)[full], full_density)
     difference.index_add_(0, (row_base + full1 + 1)[full], -full_density)
+    if cell_flux is not None:
+        strip_cells = cell_id[owner]
+        cell_flux.index_add_(0, strip_cells[full], full_density[:, None] * (
+            source_prefix[row[full], full1[full] + 1] - source_prefix[row[full], full0[full]]
+        ))
 
     # One shallow strip can touch thousands of boundary pixels. Bound this
     # expansion separately from the triangle-row queue, including a single
@@ -462,6 +475,9 @@ def _rasterize_strips(
             (frame[strip] * rows + row[strip]) * columns + column,
             density[strip] * area,
         )
+        if cell_flux is not None:
+            cell_flux.index_add_(0, strip_cells[strip],
+                                (density[strip] * area)[:, None] * source_pixels[row[strip], column])
 
 
 def accumulate_cells_torch(
@@ -478,6 +494,9 @@ def accumulate_cells_torch(
     max_strips: int = 1 << 20,
     max_boundary_entries: int = 1 << 20,
     runtime: ResolvedRuntime | None = None,
+    source_pixels: torch.Tensor | None = None,
+    source_prefix: torch.Tensor | None = None,
+    cell_flux: torch.Tensor | None = None,
 ) -> None:
     """Add one chunk of mapped cell lattices to a persistent workspace.
 
@@ -492,6 +511,13 @@ def accumulate_cells_torch(
             "node arrays must share shape [cell, v+1, v+1] or "
             "[frame, cell, v+1, v+1]"
         )
+    if source_pixels is not None and (node_x.ndim != 3 or cell_frame_index is not None or workspace.frames != 1):
+        raise ValueError("Experimental microimages currently use single-frame rasterization")
+    if source_pixels is not None or source_prefix is not None or cell_flux is not None:
+        from ..microimages import validate_render_tensors
+
+        validate_render_tensors(source_pixels, source_prefix, cell_flux, workspace.shape,
+                                node_x.shape[0], workspace.histogram.device, workspace.histogram.dtype)
     if node_x.shape[-2] != node_x.shape[-1] or node_x.shape[-1] < 2:
         raise ValueError("node lattices must be square with at least two nodes")
     if float(pixel_size_x) <= 0 or float(pixel_size_y) <= 0:
@@ -545,6 +571,7 @@ def accumulate_cells_torch(
     raw_ay, raw_by, raw_cy = corners(node_y.reshape(-1, side, side).to(dtype))
     triangles_per_cell = 2 * (side - 1) * (side - 1)
     frame = cell_frame.repeat_interleave(triangles_per_cell)
+    cell_id = torch.arange(cell_frame.numel(), device=device).repeat_interleave(triangles_per_cell) if cell_flux is not None else None
 
     twice_area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
     ebx, eby = raw_bx - raw_ax, raw_by - raw_ay
@@ -591,6 +618,8 @@ def accumulate_cells_torch(
             frame[thin_index], xmin=xmin, ymin=ymin,
             pixel_size_x=pixel_size_x, pixel_size_y=pixel_size_y, mass=mass,
             budget=min(int(max_boundary_entries), 1 << 15), runtime=runtime,
+            source_pixels=source_pixels, cell_flux=cell_flux,
+            cell_id=None if cell_id is None else cell_id[thin_index],
         )
     keep = keep & ~thin
     kept = torch.nonzero(keep).reshape(-1)
@@ -622,4 +651,6 @@ def accumulate_cells_torch(
             columns=columns,
             max_boundary_entries=int(max_boundary_entries),
             runtime=runtime,
+            source_pixels=source_pixels, source_prefix=source_prefix, cell_flux=cell_flux,
+            cell_id=None if cell_id is None else cell_id[kept],
         )

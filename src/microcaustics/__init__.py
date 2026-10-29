@@ -424,4 +424,8 @@ __all__ = [
     "caustics_pixelated_sources",
 ]
 
-__version__ = "1.0.0"
+from .microimages import MicroimageConfig, MicroimageFrame
+
+__all__ += ["MicroimageConfig", "MicroimageFrame"]
+
+__version__ = "1.0.1"

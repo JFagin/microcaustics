@@ -4,3 +4,4 @@ include CHANGELOG.md
 prune docs
 prune examples
 prune tests
+prune internal_reference

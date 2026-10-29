@@ -97,11 +97,11 @@ class LightCurveRequest:
         ):
             raise TypeError("apply_driving_signal must be True, False, or None")
         if self.source_evolution not in {
-            "exact", "linear_response", "quadratic_response"
+            "exact", "linear_response", "quadratic_response", "cubic_response"
         }:
             raise ValueError(
                 "source_evolution must be 'exact', 'linear_response', "
-                "or 'quadratic_response'"
+                "'quadratic_response', or 'cubic_response'"
             )
         if self.response_delay_bin_days is not None and (
             not math.isfinite(self.response_delay_bin_days)
@@ -996,7 +996,8 @@ def _flexible_streaming_light_curves(
                     local_times,
                     delay_bin_days=request.response_delay_bin_days,
                     response_order=(
-                        2 if request.source_evolution == "quadratic_response" else 1
+                        {"linear_response": 1, "quadratic_response": 2,
+                         "cubic_response": 3}[request.source_evolution]
                     ),
                     runtime=runtime,
                 )

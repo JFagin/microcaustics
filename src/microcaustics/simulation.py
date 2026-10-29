@@ -175,6 +175,7 @@ class MicrolensingSimulation:
         *,
         method: IRSConfig | IPMConfig,
         time_days: float = 0.0,
+        microimages=None,
     ) -> MagnificationMap:
         """Generate a source-independent magnification map.
 
@@ -183,9 +184,17 @@ class MicrolensingSimulation:
         A source model is not required. IRS and IPM both return absolute
         magnification. IPM may use the nested source scout or evaluate the
         complete lens field, as selected by :class:`IPMConfig`.
+
+        Optional ``microimages=MicroimageRequest`` output
+        also integrates a source over the existing lens cells. The returned map's
+        ``microimages`` member holds this optional image. No second ray grid is
+        traced. The ``dynamic_maps`` iterator also accepts this
+        request for shared temporal rendering.
         """
 
         if isinstance(method, IRSConfig):
+            if microimages is not None:
+                raise ValueError("Microimages require IPM")
             from .solvers import inverse_ray_shooting
 
             return inverse_ray_shooting(
@@ -204,6 +213,7 @@ class MicrolensingSimulation:
                 source_grid,
                 method,
                 time_days=time_days,
+                _microimages=microimages,
             )
         raise TypeError("method must be an IRSConfig or IPMConfig")
 
@@ -470,13 +480,34 @@ class MicrolensingSimulation:
         microlensing_only_source: PixelatedSource | None = None,
         source_evolution: str = "exact",
         response_delay_bin_days: float | None = None,
+        microimages=None,
+        microimage_observer=None,
     ) -> LightCurve:
         """Stream dynamic maps directly into an arbitrary source light curve.
 
         Only fluxes are retained unless ``map_observer`` explicitly stores a
         frame. This is the ordinary production interface when a complete map
         sequence is not itself a required output.
+
+        The optional ``microimage_observer(index, frame)`` callback also
+        receives stellar microimages at each epoch. ``MicroimageConfig`` can
+        restrict epochs or bands. This requires exact source evolution on the
+        native map grid with a fixed source center. Source pixels and lens
+        mapping are shared with photometry. Images are not retained by default.
         """
+
+        if microimages is not None or microimage_observer is not None:
+            from .microimages import microimage_light_curve
+
+            if (band_batch_size is not None or microlensing_only_source is not None
+                    or source_evolution != "exact"):
+                raise ValueError("Microimages require exact source evolution without band batching or a second source")
+            return microimage_light_curve(
+                self, lens_region, source_grid, times_days, source, distances,
+                method=method, trajectory=trajectory, schedule=schedule,
+                map_observer=map_observer, microimages=microimages,
+                microimage_observer=microimage_observer,
+            )
 
         if (
             band_batch_size is not None

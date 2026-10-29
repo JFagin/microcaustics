@@ -526,6 +526,26 @@ source epoch, including daily intrinsic variability between 25-day maps.
 
 ### Response-based source evolution
 
+The option `source_evolution="cubic_response"` adds
+one sixth of the third brightness derivative convolved with the cubed driver
+fluctuation. It uses the same signed CDF reconstruction as quadratic response.
+Temperature and Planck terms are shared across all three derivatives, driver
+powers share integration work, and the final flux uses one combined matrix
+multiplication. The ordinary-deposition option also supports cubic evolution.
+For large float32 CUDA response projections, the Triton path
+groups pixels by delay bin and shares their reads between signed response
+terms and neighboring bins. This changes only how the existing deposition
+is computed, not its weights or the CDF reconstruction.
+The source model, stellar mapping, and exact-evolution default are unchanged.
+Higher order is not guaranteed to improve large excursions or errors dominated
+by numerical response reconstruction. The notebook compares driver standard
+deviations of 0.1, 0.3, and 0.5 before recommending a mode for that example.
+
+The notebook `examples/notebooks/source_models/06_source_evolution_comparison.ipynb`
+derives the linear, quadratic, and cubic flux approximations and generates a matched
+comparison with exact evolution, including per-band errors and complete-call
+timings.
+
 The default `source_evolution="exact"` evaluates the nonlinear thermal disk at
 every requested source epoch. For a stationary `ThermalReprocessingSource`,
 `source_evolution="linear_response"` instead multiplies the mean disk and its
@@ -553,7 +573,7 @@ approximate = system.light_curve(
 )
 ```
 
-Both response modes select the coarse CDF spacing once near the observer-frame
+The response modes select the coarse CDF spacing once near the observer-frame
 light-crossing time of a source pixel, bounded by the narrowest unlensed
 response width and the tabulated driver's cadence. Set a positive
 `response_delay_bin_days` to select it explicitly. Output transfer-function

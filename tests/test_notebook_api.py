@@ -16,8 +16,54 @@ import microcaustics as mc
 NOTEBOOKS = Path(__file__).resolve().parents[1] / "examples" / "notebooks"
 
 
+def test_microimage_notebook_generates_its_animation():
+    path = NOTEBOOKS / "microimage_motion.ipynb"
+    assert path.stat().st_size < 25_000_000
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
+    assert not any(cell.get("attachments") for cell in notebook["cells"])
+    assert "microimage_observer=save_frame" in source
+    assert "map_observer=save_map" in source
+    assert "dynamic_labeled_caustics(" in source
+    assert "plots.save_fixed_palette_gif(" in source
+    assert "animation_frames()" in source
+    assert "cropped = frame.crop(" in source
+    assert "image.reshape(-1)[indices] = values" in source
+    assert ".rebin(" not in source
+    assert "avg_pool2d" not in source
+    assert "max_pixels" not in source
+    assert "np.load(" not in source
+    assert "q2237_b_movie" not in source
+    assert "sys.path" not in source
+    assert "q2237_b_map_microimages_centroid.gif" not in source
+    assert "900, 1325" not in source  # No fixed crossing times from an older run.
+
+
 def cells(path):
     return json.loads(path.read_text(encoding="utf-8"))["cells"]
+
+
+def test_source_evolution_notebook_compares_matched_modes():
+    notebook = cells(NOTEBOOKS / "source_models/06_source_evolution_comparison.ipynb")
+    source = "\n".join("".join(cell["source"]) for cell in notebook if cell["cell_type"] == "code")
+    for mode in ("exact", "linear_response", "quadratic_response", "cubic_response"):
+        assert f'"{mode}"' in source
+    assert source.count("system = mc.MicrolensingSystem(") == 1
+    assert "system.light_curve(source_evolution=mode, **options)" in source
+    assert "torch.cuda.synchronize()" in source
+    assert "np.log10(flux / reference)" in source
+    assert "first_seconds" in source and "REPEATS = 5" in source
+    assert "np.load(" not in source
+    assert "response_reconstruction=\"cdf\"" in source
+    assert "sys.path" not in source
+    assert "spectral_system = system.with_source(realization.source)" in source
+    assert "wavelength_samples=32" in source and "return_spectrum=True" in source
+    assert 'bandpasses="lsst"' in source
+    assert "spectral_system.light_curve(source_evolution=mode, **spectral_options)" in source
+    assert "spectrum.total_flux" in source and "spectrum.continuum_flux" in source
+    assert "spectral_seconds" in source
+    assert "amplitudes = (0.1, 0.3, 0.5)" in source
+    assert "replace(realization.source, signal=amplitude_driver)" in source
 
 
 @pytest.mark.parametrize(

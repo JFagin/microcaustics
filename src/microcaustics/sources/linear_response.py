@@ -1,4 +1,4 @@
-"""Linear and quadratic response approximations for a thermal disk.
+"""Thermal response approximations through cubic order.
 
 The exact source remains the default. This plan keeps daily driver sampling but
 contracts the wavelength-dependent mean image and response with each sparse
@@ -55,8 +55,8 @@ class OrdinaryResponsePlan:
         delay_bin_days = 0.1 if delay_bin_days is None else delay_bin_days
         if not math.isfinite(delay_bin_days) or delay_bin_days <= 0:
             raise ValueError("response_delay_bin_days must be finite and positive")
-        if response_order not in (1, 2):
-            raise ValueError("response_order must be 1 or 2")
+        if response_order not in (1, 2, 3):
+            raise ValueError("response_order must be 1, 2, or 3")
 
         device, dtype = times.device, times.dtype
         valid = source.transfer.hit.to(device) & torch.isfinite(
@@ -86,7 +86,7 @@ class OrdinaryResponsePlan:
             torch.zeros_like(valid_delay),
         ).clamp(0.0, 1.0)
         mean_value = torch.as_tensor(
-            source.signal.metadata().get("mean_amplitude", 1.0)
+            source.signal.metadata().get("mean_amplitude", 1.0), dtype=dtype
         )
         if mean_value.numel() != 1:
             raise ValueError("thermal response requires a scalar driver mean amplitude")
@@ -114,8 +114,12 @@ class OrdinaryResponsePlan:
         self.delay_bin_days = float(delay_bin_days)
         self.driver_delta = driving - mean_amplitude
         self.driver_delta_squared = (
-            self.driver_delta.square() if response_order == 2 else None
+            self.driver_delta.square() if response_order >= 2 else None
         )
+        if response_order == 3 and not _prepare_only:
+            self.driver_powers = torch.cat(
+                (self.driver_delta, self.driver_delta_squared, self.driver_delta.pow(3)), 1
+            )
         self.response_order = response_order
         self.runtime = runtime
         self.shape = source.geometry.shape
@@ -163,9 +167,10 @@ class OrdinaryResponsePlan:
         for chunk, valid_bands in source_chunks:
             if isinstance(chunk, TimeShiftedSource):
                 chunk = chunk.source
-            brightness = chunk._brightness_from_state(mean_state)[
-                0, ..., :valid_bands
-            ].reshape(-1, valid_bands)[selected]
+            if response_order < 3:
+                brightness = chunk._brightness_from_state(mean_state)[
+                    0, ..., :valid_bands
+                ].reshape(-1, valid_bands)[selected]
             wavelength = (
                 torch.as_tensor(
                     chunk.geometry.wavelengths_angstrom, device=device, dtype=dtype
@@ -184,36 +189,34 @@ class OrdinaryResponsePlan:
                 color,
                 chunk.geometry.pixel_scale_m[0] * chunk.geometry.pixel_scale_m[1],
                 mean_amplitude,
-                response_order == 2,
+                response_order >= 2,
             )
+            if response_order == 3:
+                arguments += (True,)
             if runtime is None:
-                linear_weights, quadratic_weights = _quadratic_response_weight_kernel(
+                weights = _quadratic_response_weight_kernel(
                     *arguments
                 )
             else:
-                (linear_weights, quadratic_weights), _ = run_tensor_kernel(
+                weights, _ = run_tensor_kernel(
                     runtime,
                     "thermal response weights",
                     _quadratic_response_weight_kernel,
                     *arguments,
                 )
-            response = linear_weights[..., :valid_bands].reshape(-1, valid_bands)[
-                selected
-            ]
-            if response_order == 2:
-                quadratic = quadratic_weights[..., :valid_bands].reshape(
-                    -1, valid_bands
-                )[selected]
-                response = torch.cat((response, quadratic), dim=1)
+            if response_order == 3:
+                brightness = weights[0][..., :valid_bands].reshape(-1, valid_bands)[selected]
+                weights = weights[1:]
+            response = torch.cat(tuple(
+                w[..., :valid_bands].reshape(-1, valid_bands)[selected]
+                for w in weights[:response_order]
+            ), dim=1)
             if fuse_chunks:
                 fused_brightness[:, column : column + valid_bands] = brightness
-                fused_response[:, column : column + valid_bands] = response[
-                    :, :valid_bands
-                ]
-                if response_order == 2:
+                for order in range(response_order):
                     fused_response[
-                        :, total_bands + column : total_bands + column + valid_bands
-                    ] = response[:, valid_bands:]
+                        :, order * total_bands + column : order * total_bands + column + valid_bands
+                    ] = response[:, order * valid_bands : (order + 1) * valid_bands]
             else:
                 self.parts.append((brightness, response, valid_bands))
             column += valid_bands
@@ -233,7 +236,7 @@ class OrdinaryResponsePlan:
         }
 
     def _project_valid(self, sampled):
-        means, linear_kernels, quadratic_kernels = [], [], []
+        means, linear_kernels, quadratic_kernels, cubic_kernels = [], [], [], []
         for brightness, response, bands in self.parts:
             arguments = (
                 sampled,
@@ -258,8 +261,15 @@ class OrdinaryResponsePlan:
                 )
             means.append(mean)
             linear_kernels.append(kernel[:, :bands])
-            if self.response_order == 2:
-                quadratic_kernels.append(kernel[:, bands:])
+            if self.response_order >= 2:
+                quadratic_kernels.append(kernel[:, bands : 2 * bands])
+            if self.response_order == 3:
+                cubic_kernels.append(kernel[:, 2 * bands :])
+        if self.response_order == 3:
+            return torch.cat(means), torch.cat((
+                torch.cat(linear_kernels, 1), torch.cat(quadratic_kernels, 1) / 2,
+                torch.cat(cubic_kernels, 1) / 6,
+            ), 0)
         return (
             torch.cat(means),
             torch.cat(linear_kernels, dim=1),
@@ -277,6 +287,10 @@ class OrdinaryResponsePlan:
     def flux(self, projection, start, stop):
         """Evaluate the projected response over the selected driver epochs."""
 
+        if self.response_order == 3:
+            # Orders and factorials were packed once during map projection.
+            # One GEMM (with the mean as its bias) replaces three separate GEMMs.
+            return torch.addmm(projection[0][None], self.driver_powers[start:stop], projection[1])
         mean, linear, quadratic = projection
         result = mean[None] + self.driver_delta[start:stop] @ linear
         if quadratic is not None:
@@ -285,12 +299,11 @@ class OrdinaryResponsePlan:
 
     def unlensed_flux(self, start, stop):
         """Evaluate the same response with the unlensed source projection."""
-
         return self.flux(self.unlensed_projection, start, stop)
 
 
 class LinearResponsePlan(OrdinaryResponsePlan):
-    """CDF/PCHIP linear or quadratic response, sharing export and convolution.
+    """CDF/PCHIP thermal response, sharing export and convolution.
 
     Tabulated drivers are integrated analytically. Callable drivers use
     three-point Gauss quadrature on each native interval. No second response is
@@ -353,10 +366,11 @@ class LinearResponsePlan(OrdinaryResponsePlan):
         from .variability import TabulatedDrivingSignal
 
         table = getattr(signal, "_samples", signal)
-        quadratic = self.response_order == 2
+        quadratic = self.response_order >= 2
+        cubic = self.response_order == 3
         columns = 3 * self.grid.count
         needed = (
-            times.numel() * columns * times.element_size() * (2 if quadratic else 1)
+            times.numel() * columns * times.element_size() * self.response_order
         )
         budget = 512 * 2**20
         if times.device.type == "cuda":
@@ -394,14 +408,18 @@ class LinearResponsePlan(OrdinaryResponsePlan):
                     )
                 )
                 values = torch.cat((values[:1], values, values[-1:]))
-        first = times.new_empty((len(times), columns))
-        second = torch.empty_like(first) if quadratic else None
+        if cubic:
+            self.driver_powers = times.new_empty((len(times), columns * 3))
+            first, second, third = self.driver_powers.split(columns, dim=1)
+        else:
+            first = times.new_empty((len(times), columns))
+            second = torch.empty_like(first) if quadratic else None
         for start in range(0, len(times), 64):
             batch = times[start : start + 64]
             if analytic:
                 # Fixed shape, including the final partial chunk.
                 padded = torch.cat((batch, batch[-1:].expand(64 - len(batch))))
-                a, b = self.grid.run(
+                integrated = self.grid.run(
                     "CDF driver integration",
                     driver_integrals,
                     padded,
@@ -410,46 +428,64 @@ class LinearResponsePlan(OrdinaryResponsePlan):
                     values[:, 0],
                     baseline,
                     quadratic,
+                    cubic,
                 )
-                a = a[: len(batch)]
-                b = b[: len(batch)] if b is not None else None
             else:
-                a, b = callable_driver_integrals(
-                    signal, batch, self.edges, baseline, quadratic
+                integrated = callable_driver_integrals(
+                    signal, batch, self.edges, baseline, quadratic, cubic
                 )
-            first[start : start + len(batch)] = a
+            first[start : start + len(batch)] = integrated[0][:len(batch)]
             if quadratic:
-                second[start : start + len(batch)] = b
+                second[start : start + len(batch)] = integrated[1][:len(batch)]
+            if cubic:
+                third[start : start + len(batch)] = integrated[2][:len(batch)]
         self.driver_delta, self.driver_delta_squared = first, second
 
     def _project_valid(self, sampled):
         if not self.cdf:
             return super()._project_valid(sampled)
-        means, linear, quadratic = [], [], []
+        means, linear, quadratic, cubic = [], [], [], []
         for (brightness, response, bands), scale in zip(
             self.parts, self.scales, strict=True
         ):
             mean, coeff = self.grid.project(
-                sampled, brightness, response, bands, self.response_order == 2
+                sampled, brightness, response, bands, self.response_order >= 2,
+                self.response_order == 3,
             )
             means.append(mean)
             linear.append(coeff[:, :bands] * scale[:bands])
-            if self.response_order == 2:
+            if self.response_order >= 2:
                 quadratic.append(
-                    (coeff[:, bands : 2 * bands] - coeff[:, 2 * bands :])
-                    * scale[bands:]
+                    (coeff[:, bands : 2 * bands] - coeff[:, 2 * bands : 3 * bands])
+                    * scale[bands : 2 * bands]
                 )
+            if self.response_order == 3:
+                cubic.append(
+                    (coeff[:, 3 * bands : 4 * bands] - coeff[:, 4 * bands :])
+                    * scale[2 * bands :]
+                )
+        if self.response_order == 3:
+            return torch.cat(means), torch.cat((
+                torch.cat(linear, 1), torch.cat(quadratic, 1) / 2,
+                torch.cat(cubic, 1) / 6,
+            ), 0)
         return (
             torch.cat(means),
             torch.cat(linear, 1),
             torch.cat(quadratic, 1) if quadratic else None,
         )
 
-    def response_bin_masses(self, projection, output_edges, *, quadratic=False):
+    def response_bin_masses(self, projection, output_edges, *, quadratic=False, order=None):
         """Integrate the exact same polynomials used by the light curve."""
         if not self.cdf:
             raise ValueError("response_bin_masses requires CDF reconstruction")
-        coeff = projection[2 if quadratic else 1]
+        order = (2 if quadratic else 1) if order is None else order
+        if order not in (1, 2, 3) or order > self.response_order:
+            raise ValueError("requested response order was not computed")
+        if self.response_order == 3:
+            coeff = projection[1].chunk(3, dim=0)[order - 1] * math.factorial(order)
+        else:
+            coeff = projection[order]
         if coeff is None:
             raise ValueError("no quadratic response was computed")
         return self.grid.rebin(coeff, output_edges)
@@ -457,6 +493,7 @@ class LinearResponsePlan(OrdinaryResponsePlan):
     def metadata(self):
         """Describe the selected response reconstruction and its delay grid."""
         return {
+            "response_order": self.response_order,
             "response_reconstruction": "cdf_pchip" if self.cdf else "ordinary",
             "response_delay_bin_days": self.delay_bin_days,
             "response_cdf_phases": self.grid.phase_count if self.cdf else None,

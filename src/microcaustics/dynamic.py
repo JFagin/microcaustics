@@ -28,9 +28,7 @@ def _expand_interval_scout_cells(
 ) -> torch.Tensor:
     """Expand a coarse endpoint-mask union directly to fine IPM cell indices."""
 
-    mask = anchor_masks[
-        [positions[index] for index in dict.fromkeys(pair)]
-    ].any(dim=0)
+    mask = anchor_masks[[positions[index] for index in dict.fromkeys(pair)]].any(dim=0)
     tiles = mask.nonzero(as_tuple=False)
     local_y, local_x = torch.meshgrid(
         torch.arange(ratio, device=anchor_masks.device),
@@ -83,10 +81,14 @@ class DynamicMapScheduler:
         config: DynamicConfig,
         *,
         far_field_batch_observer=None,
+        microimages=None,
     ) -> None:
         """Store an immutable calculation request and validate its time axis."""
 
         self.simulation = simulation
+        self.microimages = microimages
+        if microimages is not None and not isinstance(method, IPMConfig):
+            raise ValueError("Microimages require IPM")
         self.lens_region = lens_region
         self.source_grid = source_grid
         self.times = tuple(float(value) for value in times_days)
@@ -133,7 +135,9 @@ class DynamicMapScheduler:
         # This is a scheduling batch, not a promise that every solver kernel
         # fuses the temporal dimension. Forty is the validated paper default.
         # Smaller sequences are never padded solely for this interface.
-        return min(len(self.times), 40 if self.simulation.runtime.device.type == "cuda" else 1)
+        return min(
+            len(self.times), 40 if self.simulation.runtime.device.type == "cuda" else 1
+        )
 
     def _calculate_with_backoff(
         self,
@@ -157,6 +161,7 @@ class DynamicMapScheduler:
                         self.source_grid,
                         current,
                         time_days=time_days,
+                        _microimages=self.microimages,
                         **internal,
                     )
                 else:
@@ -222,6 +227,7 @@ class DynamicMapScheduler:
                     selection_metadata=selection_metadata,
                     scalar_correction=scalar_correction,
                     real_frame_count=real_frames,
+                    _microimages=self.microimages,
                 )
                 return result, reductions, 0
             except Exception as error:
@@ -240,14 +246,18 @@ class DynamicMapScheduler:
                 # Padded entries are an optimization only. Remove them before
                 # recursively reducing the real temporal batch.
                 real_times = times[:real_frames]
-                real_far_fields = None if far_fields is None else far_fields[:real_frames]
+                real_far_fields = (
+                    None if far_fields is None else far_fields[:real_frames]
+                )
                 midpoint = max(1, real_frames // 2)
                 left, left_reductions, left_splits = (
                     self._calculate_ipm_batch_with_backoff(
                         current,
                         real_times[:midpoint],
                         far_fields=(
-                            None if real_far_fields is None else real_far_fields[:midpoint]
+                            None
+                            if real_far_fields is None
+                            else real_far_fields[:midpoint]
                         ),
                         selected_cell_indices=selected_cell_indices,
                         selected_cell_shape=selected_cell_shape,
@@ -260,7 +270,9 @@ class DynamicMapScheduler:
                         current,
                         real_times[midpoint:],
                         far_fields=(
-                            None if real_far_fields is None else real_far_fields[midpoint:]
+                            None
+                            if real_far_fields is None
+                            else real_far_fields[midpoint:]
                         ),
                         selected_cell_indices=selected_cell_indices,
                         selected_cell_shape=selected_cell_shape,
@@ -323,7 +335,9 @@ class DynamicMapScheduler:
                         real_indices,
                     )
                 padded_times = tuple(real_times)
-                padded_far_fields = None if real_far_fields is None else list(real_far_fields)
+                padded_far_fields = (
+                    None if real_far_fields is None else list(real_far_fields)
+                )
                 if (
                     self.config.pad_temporal_batches
                     and self.simulation.runtime.device.type == "cuda"
@@ -423,14 +437,18 @@ class DynamicMapScheduler:
                 from .solvers.far_field import temporal_taylor_far_field_window
 
                 interval_indices = list(range(anchor_start, anchor_stop))
-                interval_far_fields, temporal_far_field_metadata = temporal_taylor_far_field_window(
-                    self.simulation,
-                    self.lens_region,
-                    self.method.far_field_approx,
-                    self.times,
-                    interval_indices,
+                interval_far_fields, temporal_far_field_metadata = (
+                    temporal_taylor_far_field_window(
+                        self.simulation,
+                        self.lens_region,
+                        self.method.far_field_approx,
+                        self.times,
+                        interval_indices,
+                    )
                 )
-                far_fields.update(zip(interval_indices, interval_far_fields, strict=True))
+                far_fields.update(
+                    zip(interval_indices, interval_far_fields, strict=True)
+                )
 
             def far_field_for(
                 index: int,
@@ -483,7 +501,9 @@ class DynamicMapScheduler:
                     time_days=self.times[last_index],
                 )
                 if (last_ny, last_nx) != (fine_ny, fine_nx):
-                    raise RuntimeError("dynamic scout fine-grid shape changed between frames")
+                    raise RuntimeError(
+                        "dynamic scout fine-grid shape changed between frames"
+                    )
                 endpoint_cells = torch.unique(torch.cat((first_cells, last_cells)))
             selection_metadata: dict[str, object] = {
                 "scout_ratio": int(self.method.scout_ratio),
@@ -520,7 +540,9 @@ class DynamicMapScheduler:
                             "dynamic_frame_index": index,
                             "dynamic_frame_count": len(self.times),
                             "dynamic_static_map_reuse": False,
-                            "dynamic_scout_reuse_approximate": anchor_stop - anchor_start > 1,
+                            "dynamic_scout_reuse_approximate": anchor_stop
+                            - anchor_start
+                            > 1,
                             "dynamic_oom_chunk_reductions": reductions,
                             "dynamic_temporal_batch_size": batch_size,
                             "dynamic_temporal_batch_index": batch_start // batch_size,
@@ -565,9 +587,7 @@ class DynamicMapScheduler:
             )
             if self.config.endpoint_union:
                 scout_anchor_indices = [
-                    endpoint
-                    for pair in interval_pairs
-                    for endpoint in pair
+                    endpoint for pair in interval_pairs for endpoint in pair
                 ]
             else:
                 # Disabling endpoint reuse means every real frame receives an
@@ -579,12 +599,14 @@ class DynamicMapScheduler:
                 set(real_indices) | set(scout_anchor_indices)
             )
             if self.method.far_field_approx.enabled:
-                requested_far_fields, temporal_far_field_metadata = temporal_taylor_far_field_window(
-                    self.simulation,
-                    self.lens_region,
-                    self.method.far_field_approx,
-                    self.times,
-                    requested_far_field_indices,
+                requested_far_fields, temporal_far_field_metadata = (
+                    temporal_taylor_far_field_window(
+                        self.simulation,
+                        self.lens_region,
+                        self.method.far_field_approx,
+                        self.times,
+                        requested_far_field_indices,
+                    )
                 )
                 far_field_by_index = dict(
                     zip(
@@ -593,9 +615,7 @@ class DynamicMapScheduler:
                         strict=True,
                     )
                 )
-                far_fields = tuple(
-                    far_field_by_index[index] for index in real_indices
-                )
+                far_fields = tuple(far_field_by_index[index] for index in real_indices)
             else:
                 far_fields = (None,) * len(real_indices)
                 far_field_by_index = {
@@ -629,9 +649,7 @@ class DynamicMapScheduler:
                     scout_metadata_rows,
                     anchor_cells,
                     anchor_masks,
-                ) = (
-                    batched_scout
-                )
+                ) = batched_scout
             else:
                 all_cells = []
                 fine_shape = None
@@ -739,8 +757,7 @@ class DynamicMapScheduler:
                     and any(first != last for first, last in interval_pairs)
                 ),
                 "dynamic_scout_component_selected_cells": [
-                    int(row["selected_fine_cells"])
-                    for row in scout_metadata_rows
+                    int(row["selected_fine_cells"]) for row in scout_metadata_rows
                 ],
                 **temporal_far_field_metadata,
                 **correction_diagnostics,
@@ -780,7 +797,10 @@ class DynamicMapScheduler:
                         result.timing,
                         steady_seconds=(
                             result.timing.steady_seconds
-                            + (far_field_preparation_seconds + scout_preparation_seconds)
+                            + (
+                                far_field_preparation_seconds
+                                + scout_preparation_seconds
+                            )
                             / len(real_indices)
                         ),
                         component_seconds=component_seconds,
@@ -815,7 +835,11 @@ class DynamicMapScheduler:
 
         if not self.times:
             return
-        if self.config.reuse_static_maps and not self.simulation.point_masses.has_motion:
+        if (
+            self.config.reuse_static_maps
+            and not self.simulation.point_masses.has_motion
+            and self.microimages is None
+        ):
             iterator = self._static()
         elif isinstance(self.method, IPMConfig) and self.method.tiled:
             iterator = self._tiled_ipm()
@@ -842,8 +866,15 @@ def dynamic_maps(
     method: IRSConfig | IPMConfig,
     config: DynamicConfig | None = None,
     _far_field_batch_observer=None,
+    microimages=None,
 ) -> Iterator[MagnificationMap]:
-    """Return a streaming iterator over scheduled dynamic magnification maps."""
+    """Return a streaming iterator over scheduled dynamic magnification maps.
+
+    Optional ``microimages`` output weights the same mapped cells
+    with a source in each epoch. Scout reuse and temporal batching are retained.
+    Static-map reuse is disabled for this optional output because a static lens
+    can still have a changing source. Consume outputs as a stream to bound memory.
+    """
 
     return DynamicMapScheduler(
         simulation,
@@ -853,6 +884,7 @@ def dynamic_maps(
         method,
         DynamicConfig() if config is None else config,
         far_field_batch_observer=_far_field_batch_observer,
+        microimages=microimages,
     ).maps()
 
 
@@ -876,9 +908,7 @@ def _cross_system_tiled_ipm_maps(
     requests = tuple(requests)
     if not requests:
         return (), None
-    caustic_requests = (
-        None if caustic_requests is None else tuple(caustic_requests)
-    )
+    caustic_requests = None if caustic_requests is None else tuple(caustic_requests)
     if caustic_requests is not None and len(caustic_requests) != len(requests):
         raise ValueError("caustic requests must match cross-system map requests")
     first_simulation, first_region, first_grid, times, method, schedule = requests[0]
@@ -892,7 +922,9 @@ def _cross_system_tiled_ipm_maps(
     if not schedule.fused_temporal_ipm:
         raise ValueError("cross-system fusion requires fused_temporal_ipm")
     first_runtime = first_simulation.runtime
-    for simulation, region, grid, other_times, other_method, other_schedule in requests[1:]:
+    for simulation, region, grid, other_times, other_method, other_schedule in requests[
+        1:
+    ]:
         if (
             region != first_region
             or grid != first_grid
@@ -921,11 +953,7 @@ def _cross_system_tiled_ipm_maps(
     )
     refresh = int(schedule.scout_refresh_frames)
     outputs: list[list[MagnificationMap]] = [[] for _ in requests]
-    label_outputs = (
-        None
-        if caustic_requests is None
-        else [[] for _ in requests]
-    )
+    label_outputs = None if caustic_requests is None else [[] for _ in requests]
     label_state = (
         None
         if caustic_requests is None
@@ -1045,7 +1073,10 @@ def _cross_system_tiled_ipm_maps(
                     ]
                     for index in real_indices
                 )
-            if method.dual_scout_scalar_correction and scalar_corrections[system_index] is None:
+            if (
+                method.dual_scout_scalar_correction
+                and scalar_corrections[system_index] is None
+            ):
                 scalar_corrections[system_index], correction_metadata[system_index] = (
                     dual_scout_scalar_correction(
                         simulation,
@@ -1063,7 +1094,9 @@ def _cross_system_tiled_ipm_maps(
         corrections = torch.stack(
             [
                 torch.as_tensor(
-                    0.0 if scalar_corrections[owner] is None else scalar_corrections[owner],
+                    0.0
+                    if scalar_corrections[owner] is None
+                    else scalar_corrections[owner],
                     device=first_runtime.device,
                     dtype=first_runtime.dtype,
                 )
@@ -1108,9 +1141,13 @@ def _cross_system_tiled_ipm_maps(
                 source_region=first_grid.region,
             )
             frame_count = len(real_indices)
-            for owner, (_, config, diagnostic_grid, include_distance_map, _) in enumerate(
-                caustic_requests
-            ):
+            for owner, (
+                _,
+                config,
+                diagnostic_grid,
+                include_distance_map,
+                _,
+            ) in enumerate(caustic_requests):
                 state = label_state[owner]
                 labeled, *next_state = label_caustic_fields(
                     fields[owner * frame_count : (owner + 1) * frame_count],
@@ -1150,7 +1187,5 @@ def _cross_system_tiled_ipm_maps(
                 )
             )
     return tuple(tuple(row) for row in outputs), (
-        None
-        if label_outputs is None
-        else tuple(tuple(row) for row in label_outputs)
+        None if label_outputs is None else tuple(tuple(row) for row in label_outputs)
     )

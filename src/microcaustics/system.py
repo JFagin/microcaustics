@@ -367,6 +367,8 @@ class MicrolensingRealization:
         band_batch_size=None,
         source_evolution="exact",
         response_delay_bin_days=None,
+        microimages=None,
+        microimage_observer=None,
     ):
         """Resolve geometry and observers once for all four photometry schedulers."""
 
@@ -406,6 +408,10 @@ class MicrolensingRealization:
             source_evolution=source_evolution,
             response_delay_bin_days=response_delay_bin_days,
         )
+        if microimages is not None or microimage_observer is not None:
+            if include_labels or flux_times is not None:
+                raise ValueError("Microimages require unlabeled, same-cadence photometry")
+            kwargs.update(microimages=microimages, microimage_observer=microimage_observer)
         if include_labels:
             kwargs.update(
                 map_schedule=schedule,
@@ -455,8 +461,21 @@ class MicrolensingRealization:
         host_lensing: str = "omit",
         source_evolution: str = "exact",
         response_delay_bin_days: float | None = None,
+        microimages=None,
+        microimage_observer=None,
     ) -> LightCurve:
-        """Generate a finite-source light curve for this realization."""
+        """Generate a finite-source light curve for this realization.
+
+        The ``microimage_observer(index, frame)`` callback streams optional
+        stellar microimages. ``microimages=MicroimageConfig(...)`` selects
+        epochs/bands, otherwise the observer receives them all.
+        """
+
+        if (microimages is not None or microimage_observer is not None) and (
+            bandpasses is not None or bands_angstrom is not None
+            or band_batch_size is not None or wavelength_batch_size is not None
+        ):
+            raise ValueError("Microimages use the source's native bands without spectral integration or band batching")
 
         if wavelength_batch_size is not None and band_batch_size is not None:
             raise ValueError(
@@ -533,6 +552,8 @@ class MicrolensingRealization:
         return self._photometry(
             times_days,
             None,
+            microimages=microimages,
+            microimage_observer=microimage_observer,
             include_labels=False,
             source=source,
             method=method,
@@ -2116,6 +2137,8 @@ class MicrolensingSystem:
         source_evolution: str = "exact",
         response_delay_bin_days: float | None = None,
         start_day: float = 0.0,
+        microimages=None,
+        microimage_observer=None,
         **kwargs,
     ) -> LightCurve:
         """Generate photometry with optional source-center labels.
@@ -2130,6 +2153,11 @@ class MicrolensingSystem:
         Returns a LightCurve with apparent AB ``magnitude``, physical ``flux``
         in Jy, and optional ``labels`` and integer-indexed retained ``maps``.
         Labels are calculated only when ``include_labels=True``.
+
+        The ``microimage_observer(index, frame)`` callback streams microimages
+        without changing the returned light curve. ``MicroimageConfig`` can
+        select epochs and native source bands. Microimage output
+        requires unlabeled, exact-source, same-cadence photometry.
 
         ``apply_driving_signal=None`` uses the source's driver when
         present. ``False`` keeps its mean heating while disabling fluctuations,
@@ -2150,11 +2178,11 @@ class MicrolensingSystem:
                 "include_microlensing_only=True requires the driven light curve"
             )
         if source_evolution not in {
-            "exact", "linear_response", "quadratic_response"
+            "exact", "linear_response", "quadratic_response", "cubic_response"
         }:
             raise ValueError(
                 "source_evolution must be 'exact', 'linear_response', "
-                "or 'quadratic_response'"
+                "'quadratic_response', or 'cubic_response'"
             )
         if response_delay_bin_days is not None and (not math.isfinite(response_delay_bin_days) or response_delay_bin_days <= 0):
             raise ValueError("response_delay_bin_days must be finite and positive")
@@ -2167,6 +2195,14 @@ class MicrolensingSystem:
             flux_times_days=flux_times_days,
             start_day=start_day,
         )
+        if microimages is not None or microimage_observer is not None:
+            if (include_labels or flux_times is not None or bandpasses is not None
+                    or bands_angstrom is not None or band_batch_size is not None
+                    or wavelength_batch_size is not None or include_microlensing_only
+                    or source_evolution != "exact"):
+                raise ValueError("Microimages require exact, unlabeled, same-cadence photometry in the source's native bands")
+            if not callable(microimage_observer):
+                raise ValueError("microimages requires a callable microimage_observer")
         if wavelength_batch_size is not None and band_batch_size is not None:
             raise ValueError(
                 "supply wavelength_batch_size or band_batch_size, not both"
@@ -2306,6 +2342,8 @@ class MicrolensingSystem:
         system = self if source_override is None else self.with_source(source_override)
         _validate_source_driver(system.source, apply_driving_signal)
         resolved = system._realize_for_times(map_times)
+        if microimages is not None or microimage_observer is not None:
+            call_kwargs.update(microimages=microimages, microimage_observer=microimage_observer)
         if apply_driving_signal is False:
             call_kwargs["source"] = resolved._mean_source
         result = _evaluate_light_curve(

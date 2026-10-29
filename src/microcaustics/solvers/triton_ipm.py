@@ -246,6 +246,14 @@ if triton is not None:
         VIRTUAL_REFINEMENT: tl.constexpr,
         COMPACT_ACTIVE: tl.constexpr,
         INDEXED_FRAMES: tl.constexpr,
+        source_pixels_ptr,
+        source_prefix_ptr,
+        cell_flux_ptr,
+        RENDER: tl.constexpr,
+        BANDS: tl.constexpr,
+        BAND_BLOCK: tl.constexpr,
+        SOURCE_FRAME_STRIDE: tl.constexpr,
+        PREFIX_FRAME_STRIDE: tl.constexpr,
     ):
         active_index = tl.program_id(0)
         if COMPACT_ACTIVE:
@@ -371,6 +379,12 @@ if triton is not None:
         )
         row_count = tl.where(keep, last_row - first_row + 1, 0)
         maximum_rows = tl.max(row_count, axis=0)
+
+        if RENDER:
+            band = tl.arange(0, BAND_BLOCK)
+            flux = tl.full((TRIANGLE_BLOCK, BAND_BLOCK), 0.0, tl.float32)
+            source_pixels_ptr += frame * SOURCE_FRAME_STRIDE
+            source_prefix_ptr += frame * PREFIX_FRAME_STRIDE
 
         for local_row in tl.range(0, maximum_rows, num_stages=1):
             row = first_row + local_row
@@ -534,6 +548,18 @@ if triton is not None:
                 -density,
                 mask=full,
             )
+            if RENDER:
+                lo = ((row + origin_y) * (COLUMNS + 1) + full0 + origin_x)[
+                    :, None
+                ] * BANDS + band[None, :]
+                hi = ((row + origin_y) * (COLUMNS + 1) + full1 + origin_x + 1)[
+                    :, None
+                ] * BANDS + band[None, :]
+                valid_band = full[:, None] & (band[None, :] < BANDS)
+                span = tl.load(
+                    source_prefix_ptr + hi, mask=valid_band, other=0.0
+                ) - tl.load(source_prefix_ptr + lo, mask=valid_band, other=0.0)
+                flux += tl.where(full[:, None], density[:, None] * span, 0.0)
             left_count = tl.where(full, full0 - bbox0, bbox1 - bbox0 + 1)
             maximum_boundary = tl.max(boundary_count, axis=0)
             for boundary_lane in tl.range(0, maximum_boundary, num_stages=1):
@@ -570,6 +596,29 @@ if triton is not None:
                     density * tl.maximum(area, 0.0),
                     mask=valid_row & (boundary_lane < boundary_count),
                 )
+                if RENDER:
+                    valid_pixel = valid_row & (boundary_lane < boundary_count)
+                    brightness = tl.load(
+                        source_pixels_ptr
+                        + (
+                            ((row + origin_y) * COLUMNS + column + origin_x)[:, None]
+                            * BANDS
+                            + band[None, :]
+                        ),
+                        mask=valid_pixel[:, None] & (band[None, :] < BANDS),
+                        other=0.0,
+                    )
+                    flux += tl.where(
+                        valid_pixel[:, None],
+                        (density * tl.maximum(area, 0.0))[:, None] * brightness,
+                        0.0,
+                    )
+        if RENDER:
+            tl.store(
+                cell_flux_ptr + cell * BANDS + band,
+                tl.sum(flux, axis=0),
+                mask=active_cell & (band < BANDS),
+            )
 
 
 def triton_ipm_available() -> bool:
@@ -682,6 +731,9 @@ def accumulate_cells_triton(
     pixel_size_y: float,
     lens_area_per_triangle_uas2: float,
     cell_frame_index: torch.Tensor | None = None,
+    source_pixels: torch.Tensor | None = None,
+    source_prefix: torch.Tensor | None = None,
+    cell_flux: torch.Tensor | None = None,
 ) -> None:
     """Add one chunk of mapped cell lattices to a persistent workspace."""
 
@@ -698,6 +750,49 @@ def accumulate_cells_triton(
     if workspace.histogram.device != node_x.device:
         raise ValueError("workspace and mapped nodes must share a CUDA device")
     temporal_frames = 1 if node_x.ndim == 3 else int(node_x.shape[0])
+    render = source_pixels is not None
+    source_frame_stride = prefix_frame_stride = 0
+    if render or source_prefix is not None or cell_flux is not None:
+        from ..microimages import validate_render_tensors
+
+        if render and source_pixels.ndim == 4:
+            if node_x.ndim != 4 or cell_frame_index is not None:
+                raise ValueError("Microimage batches require a shared cell selection")
+            if (
+                source_pixels.shape[0] != temporal_frames
+                or source_prefix.shape[0] != temporal_frames
+            ):
+                raise ValueError("Microimage sources must match the temporal batch")
+            source_frame_stride = source_pixels.stride(0)
+            prefix_frame_stride = source_prefix.stride(0)
+            for frame in range(temporal_frames):
+                validate_render_tensors(
+                    source_pixels[frame],
+                    source_prefix[frame],
+                    cell_flux[frame * node_x.shape[1] : (frame + 1) * node_x.shape[1]],
+                    workspace.shape,
+                    node_x.shape[1],
+                    node_x.device,
+                    node_x.dtype,
+                )
+        else:
+            if render and (
+                node_x.ndim != 3
+                or cell_frame_index is not None
+                or workspace.frames != 1
+            ):
+                raise ValueError(
+                    "Microimage temporal rasterization requires batched sources"
+                )
+            validate_render_tensors(
+                source_pixels,
+                source_prefix,
+                cell_flux,
+                workspace.shape,
+                node_x.shape[0],
+                node_x.device,
+                node_x.dtype,
+            )
     cells_per_frame = int(node_x.shape[-3])
     indexed_frames = cell_frame_index is not None
     if indexed_frames:
@@ -776,6 +871,14 @@ def accumulate_cells_triton(
         VIRTUAL_REFINEMENT=virtual_refinement,
         COMPACT_ACTIVE=True,
         INDEXED_FRAMES=indexed_frames,
+        source_pixels_ptr=source_pixels if render else workspace.histogram,
+        source_prefix_ptr=source_prefix if render else workspace.histogram,
+        cell_flux_ptr=cell_flux if render else workspace.histogram,
+        RENDER=render,
+        BANDS=source_pixels.shape[-1] if render else 1,
+        BAND_BLOCK=triton.next_power_of_2(source_pixels.shape[-1]) if render else 1,
+        SOURCE_FRAME_STRIDE=source_frame_stride,
+        PREFIX_FRAME_STRIDE=prefix_frame_stride,
         num_warps=max(1, min(8, triangle_block // 32)),
         num_stages=1,
     )

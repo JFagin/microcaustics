@@ -38,6 +38,7 @@ from .methods import (
     plot_ipm_scout_method,
     plot_lens_field_strategies,
 )
+from .microimages import plot_microimages
 from .paper_methods import (
     render_live_paper_anchor_gauge,
     render_live_paper_ipm_schematic,
@@ -63,6 +64,7 @@ from .transfer import (
 )
 
 __all__ = [
+    "plot_microimages",
     "plot_anchor_gauge",
     "plot_caustics",
     "plot_caustic_diagnostics",

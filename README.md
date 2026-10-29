@@ -1,8 +1,13 @@
 # microcaustics
 
 `microcaustics` is a Python package for static and dynamic gravitational
-microlensing simulations. Version 1.0.0 implements the numerical methods
+microlensing simulations. Version 1.0.1 implements the numerical methods
 validated in the accompanying methods paper.
+
+Our [companion study](https://arxiv.org/abs/2610.37475) finds that neglecting
+independent microlens motions can underestimate population disk sizes by 6–28%
+in three simulated quasar-lens configurations, motivating the use of evolving
+magnification maps.
 
 ![Ten-year Q2237 image-B-like dynamic magnification map with source-plane caustics](docs/assets/q2237_image_b_dynamic_magnification.gif)
 
@@ -10,6 +15,15 @@ The animation above shows how stellar motions reshape the microlensing
 magnification map and caustic network. See the
 [Q2237 light-curve tutorial](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb)
 for the source code.
+
+### Microimages and astrometry
+
+You can request optional
+[microimage output](docs/microimages.md) during a light curve.
+The callback can save images or their flux-weighted centers. An example follows
+the light-curve setup below. All curve epochs and bands are used unless selected
+with `MicroimageConfig`.
+See the [Q2237 B notebook](examples/notebooks/microimage_motion.ipynb).
 
 ### Fast CUDA production path
 
@@ -104,7 +118,7 @@ python -c "import torch; print('torch', torch.__version__); print('CUDA', torch.
 Install the tagged release directly from GitHub after PyTorch is available.
 
 ```bash
-python -m pip install "microcaustics @ git+https://github.com/JFagin/microcaustics.git@v1.0.0"
+python -m pip install "microcaustics @ git+https://github.com/JFagin/microcaustics.git@v1.0.1"
 ```
 
 Clone the repository when you want to run the notebooks, edit the source, or
@@ -569,6 +583,19 @@ figure, ax = mcp.plot_light_curve(
 )
 ```
 
+For optional microimage output, use the same `system` with a callback. This
+output requires exact source evolution, a stationary source on its
+native map grid, and no integrated caustic labels.
+
+```python
+centroids = []
+
+def save_frame(index, frame):
+    centroids.append(frame.centroid_uas.detach().cpu())
+
+curve = system.light_curve(times_days=[0, 25, 50], microimage_observer=save_frame)
+```
+
 `temporal_batch_size` controls how many map epochs are processed together.
 It affects throughput and memory rather than the requested sampling accuracy.
 A short sequence can use a smaller batch to avoid unnecessary padding.
@@ -603,14 +630,24 @@ print(combined.labels.crossing_labels.shape)   # [147], labels stay at the map c
 print(combined.labels.times_days.shape)        # [147], separate label epochs
 ```
 
-The driver is generated once on a fixed grid. Defaults cover day -1000 through
-day 7300, with fivefold FFT padding followed by cropping to reduce boundary
-effects. Shorter light-curve requests reuse the same driver samples. Set
-`max_duration_days`, `history_days`, or `padding_factor` on the driver to change
-these choices. The 1000-day history is not sufficient for every source or arrival
-delay. Out-of-range queries raise an error rather than hold an endpoint.
-Changing the generation grid can change the entire realization even with the
-same seed. A driver-specific `seed` overrides the inherited system seed.
+`source_evolution="exact"` is the default. For faster thermal-reprocessing
+calculations, choose `"linear_response"`, `"quadratic_response"`, or
+`"cubic_response"`. These retain the disk response delays and daily photometry.
+We recommend cubic for the highest accuracy among these approximations, with
+little additional compute in our benchmarks. Accuracy depends on the source
+and driving amplitude. The [source-evolution notebook](examples/notebooks/source_models/06_source_evolution_comparison.ipynb)
+compares all four modes, including full-spectrum accuracy and runtime.
+
+```python
+approximate = system.light_curve(
+    duration_days=3650, map_cadence_days=25, source_cadence_days=1,
+    apply_driving_signal=True, source_evolution="cubic_response",
+)
+```
+
+The driver is generated once and reused across light-curve requests. Its time
+range must cover the requested epochs and source and image delays. See the
+[driving-signal guide](docs/sources.md#optional-source-driving) for settings and seeding.
 
 For bandpass-integrated Rubin/LSST magnitudes, combine the physical disk
 continuum with an empirical quasar spectrum and the bundled filter responses.
@@ -952,13 +989,13 @@ GitHub issue.
 ## Authors and contributions
 
 `microcaustics` was created and is maintained by
-[Joshua Fagin](https://orcid.org/0000-0001-8723-6136). He can be reached at
+[Joshua Fagin](https://jfagin.github.io/). He can be reached at
 [faginjoshua@gmail.com](mailto:faginjoshua@gmail.com).
 
 Contributors include the following authors.
 
 - [Connor Stone](https://orcid.org/0000-0002-9086-6398) played a key role in developing the microlensing simulator.
-- [James Hung-Hsu Chan](https://orcid.org/0000-0001-8797-725X) played a key role in developing the stellar dynamics model.
+- [James Hung-Hsu Chan](https://orcid.org/0000-0001-8797-725X) played a key role in developing the stellar dynamics model and mentored the development of the simulation framework.
 - [Sophia Miskiewicz](https://orcid.org/0000-0003-0631-9701) contributed to bug fixing.
 - [Henry Best](https://orcid.org/0009-0009-6932-6379) contributed to the relativistic quasar source model.
 - [Paras Sharma](https://orcid.org/0000-0002-6909-205X) contributed to bug fixing.
@@ -987,6 +1024,8 @@ motivate.
 
 ### Microlensing and numerical methods
 
+- Fagin et al. (2026),
+  [*Neglecting Dynamical Microlensing Can Bias Accretion Disk Size Measurements at the Population Level*](https://arxiv.org/abs/2610.37475).
 - Wambsganss, Paczyński, and Katz (1990),
   [*A Microlensing Model for QSO 2237+0305*](https://doi.org/10.1086/168546).
 - Mediavilla et al. (2006),

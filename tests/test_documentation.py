@@ -7,6 +7,7 @@ import builtins
 import importlib
 import json
 import re
+import symtable
 import unittest
 from pathlib import Path
 
@@ -19,6 +20,29 @@ SOURCE_ROOT = PACKAGE_ROOT / "src" / "microcaustics"
 def _python_blocks(text: str):
     pattern = re.compile(r"```(?:python|py)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
     yield from pattern.findall(text)
+
+
+def _global_references(table):
+    """Find global reads without mistaking callback locals for global names."""
+    names = {
+        symbol.get_name()
+        for symbol in table.get_symbols()
+        if symbol.is_referenced() and symbol.is_global()
+    }
+    for child in table.get_children():
+        names.update(_global_references(child))
+    return names
+
+
+def _block_names(block, defined):
+    """Return unresolved global reads and top-level definitions in one snippet."""
+    table = symtable.symtable(block, "README snippet", "exec")
+    assigned = {
+        symbol.get_name()
+        for symbol in table.get_symbols()
+        if symbol.is_assigned() or symbol.is_imported() or symbol.is_namespace()
+    }
+    return _global_references(table) - defined - assigned, assigned
 
 
 class DocumentationIntegrityTests(unittest.TestCase):
@@ -121,29 +145,24 @@ class DocumentationIntegrityTests(unittest.TestCase):
         unresolved: list[str] = []
         readme = (PACKAGE_ROOT / "README.md").read_text(encoding="utf-8")
         for index, block in enumerate(_python_blocks(readme)):
-            tree = ast.parse(block, filename=f"README.md::python-block-{index}")
-            assigned = {
-                node.id
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
-            }
-            imported: set[str] = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    imported.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
-                elif isinstance(node, ast.ImportFrom):
-                    imported.update(alias.asname or alias.name for alias in node.names)
-            available = defined | assigned | imported
-            unresolved.extend(
-                f"block {index}: {node.id}"
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Name)
-                and isinstance(node.ctx, ast.Load)
-                and node.id not in available
-            )
+            missing, assigned = _block_names(block, defined)
+            unresolved.extend(f"block {index}: {name}" for name in missing)
             defined.update(assigned)
-            defined.update(imported)
         self.assertEqual(sorted(set(unresolved)), [])
+
+    def test_readme_name_check_understands_callback_scope(self) -> None:
+        """Accept callback arguments but still detect missing globals and typos."""
+        block = (
+            "def save_frame(index, frame):\n"
+            "    centroids.append(frame.centroid_uas)\n"
+            "curve = system.light_curve(microimage_observer=save_frame)\n"
+        )
+        missing, _ = _block_names(block, {"centroids", "system"})
+        self.assertEqual(missing, set())
+        missing, _ = _block_names(block, set())
+        self.assertEqual(missing, {"centroids", "system"})
+        missing, _ = _block_names(block.replace("frame.centroid", "typo.centroid"), {"centroids", "system"})
+        self.assertEqual(missing, {"typo"})
 
     def test_examples_use_public_package_imports(self) -> None:
         violations: list[str] = []
@@ -267,7 +286,7 @@ class DocumentationIntegrityTests(unittest.TestCase):
                     ),
                     f"{path.name} has no embedded visual output",
                 )
-                self.assertLess(path.stat().st_size, 100_000_000)
+                self.assertLess(path.stat().st_size, 25_000_000)
 
     def test_release_notebook_sequence_is_complete(self) -> None:
         root = PACKAGE_ROOT / "examples" / "notebooks"

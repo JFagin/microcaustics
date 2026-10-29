@@ -42,6 +42,7 @@ nav:
   - Microlensing:
       - IPM: ipm.md
       - Dynamic calculations: dynamic.md
+      - Microimages and astrometry: microimages.md
       - Caustics and labels: caustics.md
       - Lens populations: lens_populations.md
       - Automatic tuning: tuning.md

@@ -218,8 +218,8 @@ source was about 0.03 s per 147-map, 10-year light curve. A new valid-pixel
 count, delay-bin count, or wavelength batch can trigger another compilation,
 so set `static_response_projection=False` for heterogeneous source
 populations. A fixed observing cadence alone does not fix these shapes.
-This option affects only
-`linear_response` and `quadratic_response`, not the exact disk path.
+This option affects `linear_response`, `quadratic_response`, and
+`cubic_response`, not the exact disk path.
 
 Static disks use a per-call brightness cache when it fits within one thirty-second
 of the configured device memory budget, capped at 512 MiB across all requests.

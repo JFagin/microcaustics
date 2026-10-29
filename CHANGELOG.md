@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1
+
+updated user guides, notebooks, added astrometry, and added cubic transfer function
+
 ## 1.0.0
 
 Initial release of `microcaustics`:

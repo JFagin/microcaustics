@@ -57,7 +57,7 @@ calculation. Every epoch receives its own complete far-field coefficient table.
 Temporal batching changes throughput but not the numerical approximation.
 
 For moving tiled-IPM fields, `scout_refresh_frames=1` recomputes the scout at
-every frame. Larger values reuse an endpoint-union cell selection and are an
+every frame. Larger values reuse cells selected at either end of each interval and are an
 explicit approximation. Returned metadata records the selected scout anchors
 and whether endpoint-union reuse was active.
 

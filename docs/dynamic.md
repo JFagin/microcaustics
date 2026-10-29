@@ -194,8 +194,8 @@ at every map epoch. Several epochs can be processed together on the GPU, but
 the coefficients are not interpolated in time.
 
 Every map result records its scout refresh endpoints, selected-cell count,
-whether endpoint union was used, and whether the selection was approximate. This provenance is
-kept even when map values are consumed immediately by a light-curve routine.
+whether endpoint union was used, and whether the selection was approximate. These settings are
+recorded even when maps are used immediately to calculate a light curve.
 
 The scheduler halves `cell_chunk_size` after a CUDA out-of-memory allocation
 until the configured lossless minimum is reached. This changes throughput and

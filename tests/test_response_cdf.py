@@ -187,7 +187,7 @@ def test_signed_projection_splits_before_binning():
     torch.testing.assert_close(mass, torch.tensor([[7.0, 3.0, 2.0], [6.0, 0.0, 2.0]]))
 
 
-@pytest.mark.parametrize("order", [1, 2])
+@pytest.mark.parametrize("order", [1, 2, 3])
 def test_default_transfer_and_light_curve_use_same_cdf_without_reference_work(order):
     from unittest.mock import patch
 

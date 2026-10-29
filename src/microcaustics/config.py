@@ -178,7 +178,7 @@ class RuntimeConfig:
         recompile; set false for heterogeneous source populations.
     response_reconstruction:
         "cdf" (default) shares conservative CDF/PCHIP kernels between thermal
-        transfer products and linear/quadratic response light curves.
+        transfer products and linear, quadratic, and cubic response light curves.
         "ordinary" retains direct transfer histograms and two-node response
         deposition. Neither setting changes exact nonlinear source evolution.
     profiling:
@@ -296,7 +296,7 @@ class IPMConfig:
     # support ring below.
     scout_halo_pixels: float = 0.0
     scout_dilation_cells: int = 1
-    scout_trace_centers: bool = True
+    scout_trace_centers: bool = False
     dual_scout_scalar_correction: bool = False
     cell_chunk_size: int = 65_536
     compact_sparse_nodes: bool = False
@@ -462,7 +462,7 @@ def _production_static_ipm_config(
     config = production_ipm_config(
         rays=rays,
         scout_ratio=1,
-        scout_trace_centers=True,
+        scout_trace_centers=False,
         dual_scout_scalar_correction=False,
     )
     return replace(config, **overrides) if overrides else config
