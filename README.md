@@ -982,6 +982,34 @@ If you use `microcaustics` in published work, please cite Fagin et al. (2026),
 
 </details>
 
+Also consider citing our companion paper, which examines how dynamical
+microlensing and the microlens mass distribution affect accretion disk-size
+inference and other observables,
+[*Neglecting Dynamical Microlensing Can Bias Accretion Disk Size Measurements at the Population Level*](https://arxiv.org/abs/2610.37475).
+
+<details>
+<summary>BibTeX</summary>
+
+```bibtex
+@article{Fagin2026DiskBias,
+  author = {Fagin, Joshua and Chan, James Hung-Hsu and Stone, Connor
+            and Best, Henry and Sharma, Paras and Miskiewicz, Sophia
+            and O'Dowd, Matthew and Perreault-Levasseur, Laurence
+            and Hezaveh, Yashar and Birrer, Simon},
+  title = {{Neglecting Dynamical Microlensing Can Bias Accretion Disk
+            Size Measurements at the Population Level}},
+  journal = {arXiv e-prints},
+  year = {2026},
+  pages = {arXiv:2610.37475},
+  archivePrefix = {arXiv},
+  eprint = {2610.37475},
+  url = {https://arxiv.org/abs/2610.37475}
+}
+```
+
+</details>
+
+
 Questions, bug reports, and collaboration inquiries may be sent to Joshua
 Fagin at [faginjoshua@gmail.com](mailto:faginjoshua@gmail.com) or opened as a
 GitHub issue.
