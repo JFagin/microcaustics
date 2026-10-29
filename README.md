@@ -2,7 +2,7 @@
 
 `microcaustics` is a Python package for static and dynamic gravitational
 microlensing simulations. Version 1.0.1 implements the numerical methods
-validated in the accompanying methods paper.
+validated in the accompanying [methods paper](https://arxiv.org/abs/2610.19703).
 
 Our [companion study](https://arxiv.org/abs/2610.37475) finds that neglecting
 independent microlens motions can underestimate population disk sizes by 6–28%
