@@ -93,7 +93,7 @@ image = renderer.render(42.0, sources=band_sources)
 ```
 
 This supports thin disks, transferred GR disks, expanding photospheres, and
-arbitrary user sources without teaching the macro renderer their physics.
+arbitrary user sources without adding source-specific code to the renderer.
 Conversion from physical source-plane surface brightness to flux per rendered
 pixel is enabled by default and follows surface-brightness conservation.
 

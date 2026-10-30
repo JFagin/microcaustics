@@ -69,7 +69,7 @@ the complete map cube after values have been consumed by the caller.
 
 ## Different map and source cadences
 
-Intrinsic source evolution need not use the dynamic-map cadence. For example,
+The source and magnification maps can use different cadences. For example,
 generate the slowly changing microlensing field every 25 days while evaluating
 a variable source every day:
 
@@ -99,7 +99,7 @@ source-center labels at the sparse map epochs.
 ## Streaming finite-source light curves
 
 `MicrolensingSystem.light_curve` evaluates a source in temporal batches and
-consumes each map immediately. Only the final flux array is retained. To derive
+uses each map immediately. Only the final flux array is retained. To derive
 several source or trajectory realizations from the same map sequence, use
 `light_curves`:
 
@@ -121,15 +121,13 @@ curves = system.light_curves(
 
 Compatible source-array shapes are passed through one batched map-sampling
 operation. Different shapes, band counts, physical scales, and coverage rules
-remain valid and are grouped automatically. The expensive maps are still made
-only once. This is independent-source photometry behind a shared macroimage.
-The package does not describe it as fused map generation across unrelated lens
-systems.
+remain valid and are grouped automatically. Each map is generated once and
+reused for all requested sources behind the same macroimage. Independent lens
+systems require separate maps.
 
 Shared-map requests inherit the system distances unless explicitly overridden.
 Source models are pixelated once before sampling. Fine-cadence evolution uses
-the same two-map interpolation as individual light curves. Each dynamic map
-is generated once for the whole request list.
+the same two-map interpolation as individual light curves.
 
 Requests may also select wavelengths and cadences without constructing new
 sources manually. This makes an evolving spectrum an ordinary multiband light
@@ -212,8 +210,7 @@ benchmark alternative temporal and spatial work sizes. See
 disabled, unless lossless OOM backoff must split it.
 `light_curve_batch_size` limits the number of compatible source requests in a
 single map-sampling call. Compile, warmup, and steady-state timing remain
-separate. The current package only reports a fused operation when the
-underlying solver actually executes one.
+separate.
 
 This shared-map source batching is distinct from independent-system
 concurrency. `batched_system_light_curves` accepts arbitrary mixtures of

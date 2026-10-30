@@ -1,8 +1,9 @@
 # Extending microcaustics
 
 The package separates lens physics, map solvers, sources, variability,
-trajectories, macro models, observation sampling, and output consumers. Prefer
-implementing the smallest relevant protocol over subclassing a simulation.
+trajectories, macro models, observation sampling, and functions that use the
+results. Prefer implementing the smallest relevant protocol over subclassing
+a simulation.
 
 ## Custom finite sources
 

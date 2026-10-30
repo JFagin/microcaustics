@@ -16,7 +16,16 @@ from .sources import PixelatedSource
 
 @dataclass(frozen=True)
 class MicroimageConfig:
-    """Optional output selections. Omitted fields use all curve epochs/bands."""
+    """Select microimage outputs sent to ``microimage_observer``.
+
+    Parameters
+    ----------
+    times_days : sequence of float, optional
+        Observer-frame times in days, chosen from the evaluated light-curve
+        epochs. Omit to use every epoch.
+    bands : sequence of str, optional
+        Native source band names. Omit to use every source band.
+    """
 
     times_days: Sequence[float] | None = None
     bands: Sequence[str] | None = None
@@ -83,7 +92,29 @@ class MicroimageRequest:
 
 @dataclass(frozen=True)
 class MicroimageFrame:
-    """Sparse Jy per IPM lens cell, not a galaxy-scale quad or point brightness."""
+    """Microimage fluxes in selected lens-plane cells at one epoch.
+
+    These are the stellar-lensing images around one macroimage, not the full
+    galaxy-scale quad. Tensors remain on the calculation device.
+
+    Attributes
+    ----------
+    cell_indices : torch.Tensor
+        Flattened indices of the selected cells in the grid's [y, x] layout.
+    flux_jy : torch.Tensor
+        Integrated flux density in Jy, with shape [cell, wavelength].
+    grid : PlaneGrid
+        Lens-plane grid with angular coordinates in microarcseconds.
+    time_days, source_time_days : float
+        Observer-frame lens and source epochs in days. The source epoch includes
+        the macroimage delay. The source's own response delays are retained.
+    wavelengths_angstrom : tuple of float
+        Observed wavelengths in angstroms, in the order used by ``flux_jy``.
+    normalization_correction_flux_jy : torch.Tensor
+        Additional flux density per wavelength from the scout normalization
+        correction. Add to ``total_flux_jy`` to recover the light-curve flux.
+        It has no assigned position and is excluded from the centroid.
+    """
 
     cell_indices: torch.Tensor
     flux_jy: torch.Tensor
@@ -95,7 +126,7 @@ class MicroimageFrame:
 
     @property
     def total_flux_jy(self):
-        """Flux actually assigned to lens-plane cells, without scalar correction."""
+        """Total flux density in Jy per wavelength, excluding the correction."""
         return self.flux_jy.sum(dim=0)
 
     @property

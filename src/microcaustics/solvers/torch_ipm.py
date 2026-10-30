@@ -512,7 +512,7 @@ def accumulate_cells_torch(
             "[frame, cell, v+1, v+1]"
         )
     if source_pixels is not None and (node_x.ndim != 3 or cell_frame_index is not None or workspace.frames != 1):
-        raise ValueError("Experimental microimages currently use single-frame rasterization")
+        raise ValueError("Microimages currently use single-frame rasterization")
     if source_pixels is not None or source_prefix is not None or cell_flux is not None:
         from ..microimages import validate_render_tensors
 

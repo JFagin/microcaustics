@@ -112,9 +112,10 @@ Separate source/map cadences, moving source trajectories, linear/quadratic/cubic
 response approximations, bandpass integration, band batching, a simultaneous
 mean-driver comparison and integrated caustic labeling are not yet supported
 by this interface. They raise an error rather than silently changing the source
-or omitting images. Caustic labels can be calculated separately. Independent
-system batching with ragged cell selections remains unsupported.
+or omitting images. Caustic labels can be calculated separately. Batching
+independent systems with different cell selections for each system remains unsupported.
 
 The notebook `examples/notebooks/workflows/05_microimages_and_astrometry.ipynb` generates six-band Q2237 B photometry, i-band images, centroid motion,
-caustic-crossing labels and its GIF from scratch. It also checks flux closure.
+caustic-crossing labels and its GIF from scratch. It also checks that the image
+flux, including the normalization correction, matches the light-curve flux.
 No pre-existing animation or simulation output is loaded.

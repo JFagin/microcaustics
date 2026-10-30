@@ -1,8 +1,8 @@
 # Streaming and saving data products
 
 Dynamic map iterators yield one `MagnificationMap` at a time. Light-curve and
-transfer-function methods consume each map immediately and retain compact
-response arrays. This is preferred when a complete map cube is not a product.
+transfer-function methods use each map immediately and retain compact
+response arrays. Use this approach when you do not need to save every map.
 
 ## Retaining selected epochs
 
@@ -15,8 +15,9 @@ This is the simplest choice for a small gallery or checkpoint set.
 ## Map observers
 
 Light-curve, labeled-light-curve, transfer-function, and multi-image workflows
-accept map-observer callbacks. A callback receives the real frame index and
-registered `MagnificationMap`. Padded temporal slots are never exposed. Use it
+accept map-observer callbacks. A callback receives the frame index and
+corresponding `MagnificationMap`. Extra frames used to pad a batch are not
+returned. Use it
 to save selected epochs, update online statistics, or pass maps elsewhere.
 
 Keep observers fast. Copy retained arrays to CPU promptly and avoid blocking
@@ -49,7 +50,7 @@ to a temporary file and atomically moved into place only after finalization.
 Light-curve archives preserve physical Jy fluxes and, when requested, the
 source-center labels, crossing flags, distances, censoring flags, and separate
 label epochs. After loading, use `result.labels.times_days` for that time axis.
-It need not match the finer photometry cadence in `result.times_days`.
+It can differ from the finer photometry cadence in `result.times_days`.
 
 Full caustic geometry and retained magnification maps are not included in the
 compact light-curve archive. Loaded labels have `caustics=None`. Save retained

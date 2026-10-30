@@ -1,9 +1,10 @@
 # Timing conventions
 
-Report these three costs separately when timing accelerated calculations:
+When benchmarking, distinguish compilation, warmup, and steady-state runtime.
 
 - **Compile time.** One-time graph or kernel compilation for a new shape.
-- **Warmup time.** Untimed calls used to populate caches and stabilize memory.
+- **Warmup.** Run the calculation a few times before measuring its runtime so
+  compilation and other setup work do not affect the timing.
 - **Steady-state time.** Delivered runtime after compilation and warmup.
 
 GPU work can finish after the Python call returns, so timing it requires
@@ -45,9 +46,8 @@ print(measurement.first_call_seconds)
 print(measurement.median_steady_seconds)
 ```
 
-The first-call value is deliberately named **first-call time**, not compile
-time. A portable measurement cannot disentangle kernel/graph compilation from
-allocator initialization, cache population, and the first numerical execution.
+First-call time includes any compilation, memory initialization, cache setup,
+and the calculation itself. It does not measure compilation alone.
 `estimated_first_call_overhead_seconds` subtracts the median steady time but is
 still labeled as an estimate rather than pure compilation cost.
 

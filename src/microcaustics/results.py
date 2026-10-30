@@ -42,7 +42,13 @@ class TimingBreakdown:
 
 @dataclass(frozen=True)
 class MagnificationMap:
-    """A magnification field and complete numerical provenance."""
+    """A source-plane magnification map at one observer-frame epoch.
+
+    ``values`` has shape [y, x] matching ``grid`` and contains linear
+    magnifications, not magnitudes. Grid coordinates are in microarcseconds
+    and ``time_days`` is in days. ``method`` and ``metadata`` describe the
+    calculation, while ``timing`` holds any collected runtime measurements.
+    """
 
     values: torch.Tensor
     grid: PlaneGrid
@@ -343,7 +349,13 @@ class TransferFunction:
 
 @dataclass(frozen=True)
 class TransferFunctionSeries:
-    """Time-dependent response functions from a dynamic microlens field."""
+    """Time-dependent response functions from a dynamic microlens field.
+
+    ``values`` stores response mass with shape [time, delay_bin, band], not
+    response density per day. ``times_days`` and ``delay_edges_days`` give the
+    observer-frame epochs and delay-bin edges in days. ``mean_delays_days``
+    has shape [time, band] and uses the same convention as ``TransferFunction``.
+    """
 
     times_days: torch.Tensor
     delay_edges_days: torch.Tensor

@@ -24,6 +24,23 @@ if TYPE_CHECKING:
     from ..results import MagnificationMap
 
 
+def _validate_spectral_options(
+    *,
+    wavelength_batch_size: int | None,
+    band_batch_size: int | None,
+    spectral_model,
+    bandpasses,
+    return_spectrum: bool,
+) -> None:
+    """Check shared spectral options before preparing a light curve."""
+    if wavelength_batch_size is not None and band_batch_size is not None:
+        raise ValueError("supply wavelength_batch_size or band_batch_size, not both")
+    if spectral_model is not None and bandpasses is None:
+        raise ValueError("spectral_model requires bandpasses")
+    if return_spectrum and bandpasses is None:
+        raise ValueError("return_spectrum requires bandpasses")
+
+
 def _retaining_map_observer(
     times_days: Sequence[float],
     keep_maps_at_days: Sequence[float] | None,

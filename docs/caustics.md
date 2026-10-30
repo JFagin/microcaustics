@@ -146,8 +146,10 @@ reduction. CPU, Apple, float64, and non-Triton execution retain the portable
 chunked Torch calculation. These implementations differ only in execution
 strategy.
 
-Winding maps still require a complete, consistently oriented caustic field.
-Extracting that complete field can dominate runtime because the determinant
+Winding numbers require complete, closed caustic curves. Our binary-label
+method uses only the caustic segments needed within the requested source field,
+without requiring complete closed curves.
+Extracting a complete field for winding numbers can dominate runtime because the determinant
 must cover the requested lens plane. Once those segments exist, the winding
 map itself uses the scanline path above.
 
@@ -160,11 +162,6 @@ Other dtypes and backends evaluate the same grid in bounded coordinate chunks.
 Consistent shared endpoints, rules that count each intersection once, and
 rejection of votes involving clipped curves keep labels stable at the selected
 precision. Production labels do not require a second float64 calculation.
-
-Signed winding numbers require consistently oriented closed segments. Binary
-caustic labels do not require orientation. The direct infinite-ray calculation
-requires a complete field, while the anchor/gauge method rejects votes
-involving clipped curves.
 
 Imported segment collections that have lost their traversal order can be
 registered before a signed winding query:
@@ -181,8 +178,6 @@ winding = field.winding_map(source_grid, orientation="positive")
 
 Connectivity is recovered in the lens plane, paired mapped endpoints remain
 attached, and each closed component receives one positive global orientation.
-This scientific operation is part of the core package rather than notebook
-plotting code.
 
 The optional Weisenbach CCF validation constructs winding maps from both its
 independently generated caustic curves and the microcaustics complete field.

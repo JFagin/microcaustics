@@ -1,17 +1,15 @@
 # Test and validation suites
 
 The ordinary suite is self-contained and does not require paper outputs or
-external research codes:
-
-```powershell
-python -m unittest discover -s tests -p "test_*.py" -v
-```
-
-With the package's test extras installed, the same suite can be run with
-coverage:
+external research codes. With the package's test extras installed, run:
 
 ```powershell
 python -m pytest
+```
+
+To include coverage:
+
+```powershell
 python -m pytest --cov=microcaustics --cov-report=term-missing
 ```
 
@@ -81,7 +79,7 @@ $env:MICROCAUSTICS_RUN_LONG_CUDA = "1"
 python -m unittest tests.test_release_workflows.LongCudaStabilityTests -v
 ```
 
-## Independent numerical oracles
+## Independent numerical comparisons
 
 Macroimage tests exercise the native caustics finder against analytic lens
 solutions and optional independent codes. `tests/_legacy_macro_solver.py`
@@ -119,8 +117,7 @@ python -m pytest -q tests/test_external_oracles.py tests/test_native_macroimages
 ```
 
 Lenstronomy and speclite are used for validation. Caustics, SciPy, and Astropy
-also support optional package features. None becomes a required dependency
-because it is used in CI. SIM5 and Weisenbach comparisons still require the
+also support optional package features. SIM5 and Weisenbach comparisons still require the
 separate local reference products described below and do not run in these jobs.
 
 ## Weisenbach IPM comparison
@@ -133,7 +130,7 @@ $env:MICROCAUSTICS_WEISENBACH_AGGREGATE = "C:\path\to\luke_lightcurve_all_frames
 python -m unittest tests.test_external_weisluke -v
 ```
 
-The test verifies the fixed-aperture coordinate contract and hashes, recomputes
+The test verifies the fixed-aperture coordinate conventions and hashes, recomputes
 the light-curve residuals with the package's public validation API, and checks
 the stored map metric. The default light-curve threshold is 20 mmag and can be
 overridden with `MICROCAUSTICS_WEISENBACH_MAX_LC_RMSE_MMAG`.

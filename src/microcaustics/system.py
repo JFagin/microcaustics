@@ -32,6 +32,7 @@ from ._system.scheduling import (
     _light_curve_times,
     _production_dynamic_settings,
     _retaining_map_observer,
+    _validate_spectral_options,
     _with_method_options,
 )
 from .config import (
@@ -466,6 +467,9 @@ class MicrolensingRealization:
     ) -> LightCurve:
         """Generate a finite-source light curve for this realization.
 
+        ``times_days`` gives observer-frame epochs in days. Returned ``flux``
+        and ``magnitude`` arrays have shape [time, band], in Jy and AB magnitudes.
+
         The ``microimage_observer(index, frame)`` callback streams optional
         stellar microimages. ``microimages=MicroimageConfig(...)`` selects
         epochs/bands, otherwise the observer receives them all.
@@ -477,14 +481,13 @@ class MicrolensingRealization:
         ):
             raise ValueError("Microimages use the source's native bands without spectral integration or band batching")
 
-        if wavelength_batch_size is not None and band_batch_size is not None:
-            raise ValueError(
-                "supply wavelength_batch_size or band_batch_size, not both"
-            )
-        if spectral_model is not None and bandpasses is None:
-            raise ValueError("spectral_model requires bandpasses")
-        if return_spectrum and bandpasses is None:
-            raise ValueError("return_spectrum requires bandpasses")
+        _validate_spectral_options(
+            wavelength_batch_size=wavelength_batch_size,
+            band_batch_size=band_batch_size,
+            spectral_model=spectral_model,
+            bandpasses=bandpasses,
+            return_spectrum=return_spectrum,
+        )
         if bandpasses is not None:
             return _spectral_light_curve(
                 self,
@@ -594,14 +597,13 @@ class MicrolensingRealization:
 
         from .photometry import source_light_curve
 
-        if wavelength_batch_size is not None and band_batch_size is not None:
-            raise ValueError(
-                "supply wavelength_batch_size or band_batch_size, not both"
-            )
-        if spectral_model is not None and bandpasses is None:
-            raise ValueError("spectral_model requires bandpasses")
-        if return_spectrum and bandpasses is None:
-            raise ValueError("return_spectrum requires bandpasses")
+        _validate_spectral_options(
+            wavelength_batch_size=wavelength_batch_size,
+            band_batch_size=band_batch_size,
+            spectral_model=spectral_model,
+            bandpasses=bandpasses,
+            return_spectrum=return_spectrum,
+        )
         source = self.source
         if source is None:
             raise ValueError("source_light_curve requires a system source")
@@ -790,16 +792,21 @@ class MicrolensingRealization:
         source_evolution: str = "exact",
         response_delay_bin_days: float | None = None,
     ) -> LightCurve:
-        """Use sparse dynamic maps with independently sampled source evolution."""
+        """Use dynamic maps with independently sampled source evolution.
 
-        if wavelength_batch_size is not None and band_batch_size is not None:
-            raise ValueError(
-                "supply wavelength_batch_size or band_batch_size, not both"
-            )
-        if spectral_model is not None and bandpasses is None:
-            raise ValueError("spectral_model requires bandpasses")
-        if return_spectrum and bandpasses is None:
-            raise ValueError("return_spectrum requires bandpasses")
+        ``map_times_days`` sets the magnification-map epochs and
+        ``flux_times_days`` sets the photometry epochs, both in observer-frame
+        days. Returned fluxes and AB magnitudes have shape [photometry epoch,
+        band], with flux density in Jy.
+        """
+
+        _validate_spectral_options(
+            wavelength_batch_size=wavelength_batch_size,
+            band_batch_size=band_batch_size,
+            spectral_model=spectral_model,
+            bandpasses=bandpasses,
+            return_spectrum=return_spectrum,
+        )
         if bandpasses is not None:
             return _spectral_light_curve(
                 self,
@@ -2203,14 +2210,13 @@ class MicrolensingSystem:
                 raise ValueError("Microimages require exact, unlabeled, same-cadence photometry in the source's native bands")
             if not callable(microimage_observer):
                 raise ValueError("microimages requires a callable microimage_observer")
-        if wavelength_batch_size is not None and band_batch_size is not None:
-            raise ValueError(
-                "supply wavelength_batch_size or band_batch_size, not both"
-            )
-        if spectral_model is not None and bandpasses is None:
-            raise ValueError("spectral_model requires bandpasses")
-        if return_spectrum and bandpasses is None:
-            raise ValueError("return_spectrum requires bandpasses")
+        _validate_spectral_options(
+            wavelength_batch_size=wavelength_batch_size,
+            band_batch_size=band_batch_size,
+            spectral_model=spectral_model,
+            bandpasses=bandpasses,
+            return_spectrum=return_spectrum,
+        )
         if bandpasses is not None:
             call_kwargs = _light_curve_options(
                 kwargs,

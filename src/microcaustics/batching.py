@@ -20,6 +20,7 @@ from ._system.scheduling import (
     _light_curve_options,
     _light_curve_times,
     _retaining_map_observer,
+    _validate_spectral_options,
     _with_method_options,
 )
 from .config import IPMConfig
@@ -1217,12 +1218,13 @@ def batched_system_light_curves(
 
     from ._batch_storage import BatchOutputWriter
 
-    if wavelength_batch_size is not None and band_batch_size is not None:
-        raise ValueError("supply wavelength_batch_size or band_batch_size, not both")
-    if spectral_model is not None and bandpasses is None:
-        raise ValueError("spectral_model requires bandpasses")
-    if return_spectrum and bandpasses is None:
-        raise ValueError("return_spectrum requires bandpasses")
+    _validate_spectral_options(
+        wavelength_batch_size=wavelength_batch_size,
+        band_batch_size=band_batch_size,
+        spectral_model=spectral_model,
+        bandpasses=bandpasses,
+        return_spectrum=return_spectrum,
+    )
     if include_microlensing_only and apply_driving_signal is False:
         raise ValueError(
             "include_microlensing_only=True requires the driven light curves"

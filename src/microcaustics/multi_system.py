@@ -15,6 +15,7 @@ from ._system.scheduling import (
     _light_curve_times,
     _production_dynamic_settings,
     _retaining_map_observer,
+    _validate_spectral_options,
 )
 from .config import (
     CausticConfig,
@@ -666,14 +667,13 @@ class MultiImageSystem:
             raise ValueError(
                 "include_microlensing_only=True requires the driven light curves"
             )
-        if wavelength_batch_size is not None and band_batch_size is not None:
-            raise ValueError(
-                "supply wavelength_batch_size or band_batch_size, not both"
-            )
-        if spectral_model is not None and bandpasses is None:
-            raise ValueError("spectral_model requires bandpasses")
-        if return_spectrum and bandpasses is None:
-            raise ValueError("return_spectrum requires bandpasses")
+        _validate_spectral_options(
+            wavelength_batch_size=wavelength_batch_size,
+            band_batch_size=band_batch_size,
+            spectral_model=spectral_model,
+            bandpasses=bandpasses,
+            return_spectrum=return_spectrum,
+        )
         for value, label in (
             (times_days, "times_days"),
             (flux_times_days, "flux_times_days"),

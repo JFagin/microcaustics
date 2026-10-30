@@ -21,6 +21,35 @@ from .sources import PixelatedSource
 from .trajectories import SourceTrajectory
 
 
+def _light_curve_requests(
+    source,
+    distances,
+    trajectory,
+    strict_coverage,
+    *,
+    microlensing_only_source,
+    source_evolution,
+    response_delay_bin_days,
+):
+    """Prepare the main source and optional microlensing-only comparison."""
+    from .photometry import LightCurveRequest
+
+    requests = [
+        LightCurveRequest(
+            source, distances, trajectory, strict_coverage,
+            source_evolution=source_evolution,
+            response_delay_bin_days=response_delay_bin_days,
+        )
+    ]
+    if microlensing_only_source is not None:
+        requests.append(
+            LightCurveRequest(
+                microlensing_only_source, distances, trajectory, strict_coverage
+            )
+        )
+    return requests
+
+
 @dataclass(frozen=True)
 class MicrolensingSimulation:
     """A macro lens, point-mass field, and resolved numerical runtime.
@@ -363,21 +392,13 @@ class MicrolensingSimulation:
         """Stream a finite-source LC with aligned center-crossing labels."""
 
         from .caustics import streaming_labeled_light_curves
-        from .photometry import LightCurveRequest
 
-        requests = [
-            LightCurveRequest(
-                source, distances, trajectory, strict_coverage,
-                source_evolution=source_evolution,
-                response_delay_bin_days=response_delay_bin_days,
-            )
-        ]
-        if microlensing_only_source is not None:
-            requests.append(
-                LightCurveRequest(
-                    microlensing_only_source, distances, trajectory, strict_coverage
-                )
-            )
+        requests = _light_curve_requests(
+            source, distances, trajectory, strict_coverage,
+            microlensing_only_source=microlensing_only_source,
+            source_evolution=source_evolution,
+            response_delay_bin_days=response_delay_bin_days,
+        )
         results = streaming_labeled_light_curves(
             self,
             lens_region,
@@ -514,24 +535,14 @@ class MicrolensingSimulation:
             or microlensing_only_source is not None
             or source_evolution != "exact"
         ):
-            from .photometry import LightCurveRequest, streaming_light_curves
+            from .photometry import streaming_light_curves
 
-            requests = [
-                LightCurveRequest(
-                    source, distances, trajectory, strict_coverage,
-                    source_evolution=source_evolution,
-                    response_delay_bin_days=response_delay_bin_days,
-                )
-            ]
-            if microlensing_only_source is not None:
-                requests.append(
-                    LightCurveRequest(
-                        microlensing_only_source,
-                        distances,
-                        trajectory,
-                        strict_coverage,
-                    )
-                )
+            requests = _light_curve_requests(
+                source, distances, trajectory, strict_coverage,
+                microlensing_only_source=microlensing_only_source,
+                source_evolution=source_evolution,
+                response_delay_bin_days=response_delay_bin_days,
+            )
             curves = streaming_light_curves(
                 self,
                 lens_region,
@@ -635,24 +646,14 @@ class MicrolensingSimulation:
             or microlensing_only_source is not None
             or source_evolution != "exact"
         ):
-            from .photometry import LightCurveRequest, streaming_light_curves
+            from .photometry import streaming_light_curves
 
-            requests = [
-                LightCurveRequest(
-                    source, distances, trajectory, strict_coverage,
-                    source_evolution=source_evolution,
-                    response_delay_bin_days=response_delay_bin_days,
-                )
-            ]
-            if microlensing_only_source is not None:
-                requests.append(
-                    LightCurveRequest(
-                        microlensing_only_source,
-                        distances,
-                        trajectory,
-                        strict_coverage,
-                    )
-                )
+            requests = _light_curve_requests(
+                source, distances, trajectory, strict_coverage,
+                microlensing_only_source=microlensing_only_source,
+                source_evolution=source_evolution,
+                response_delay_bin_days=response_delay_bin_days,
+            )
             curves = streaming_light_curves(
                 self,
                 lens_region,
@@ -717,21 +718,13 @@ class MicrolensingSimulation:
         """
 
         from .caustics import streaming_labeled_light_curves
-        from .photometry import LightCurveRequest
 
-        requests = [
-            LightCurveRequest(
-                source, distances, trajectory, strict_coverage,
-                source_evolution=source_evolution,
-                response_delay_bin_days=response_delay_bin_days,
-            )
-        ]
-        if microlensing_only_source is not None:
-            requests.append(
-                LightCurveRequest(
-                    microlensing_only_source, distances, trajectory, strict_coverage
-                )
-            )
+        requests = _light_curve_requests(
+            source, distances, trajectory, strict_coverage,
+            microlensing_only_source=microlensing_only_source,
+            source_evolution=source_evolution,
+            response_delay_bin_days=response_delay_bin_days,
+        )
         results = streaming_labeled_light_curves(
             self,
             lens_region,

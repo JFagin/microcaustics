@@ -250,8 +250,8 @@ source = mc.TransferredThinDiskSource(
 )
 ```
 
-Consequently the same disk-emission implementation can consume the analytic
-Kerr backend, a SIM5 validation product, or a user ray tracer. Delay and
+The same disk-emission implementation can use transfer data from the analytic
+Kerr solver, SIM5, or a custom ray tracer. Delay and
 azimuth remain available for reverberation and non-axisymmetric extensions,
 but axisymmetric static brightness does not pay to recompute them.
 
@@ -373,7 +373,7 @@ CPU and Apple execution cap the effective quadrature chunk at 65,536 rays to
 avoid allocating unnecessarily large arrays of integration nodes. The
 requested and effective sizes are both recorded in transfer metadata.
 
-An axisymmetric disk does not consume emission azimuth, so `KerrDiskModel`
+An axisymmetric disk does not use emission azimuth, so `KerrDiskModel`
 omits that calculation by default. Set `compute_emission_azimuth=True` when a
 non-axisymmetric model or a diagnostic needs it. Returned delays are converted
 from `GM/c^3` to observer-frame days using the supplied black-hole mass. The

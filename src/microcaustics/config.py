@@ -41,9 +41,8 @@ _DTYPES = {
 def normalize_dtype(value: str | torch.dtype) -> torch.dtype:
     """Return a supported floating-point dtype.
 
-    Float16 and bfloat16 are deliberately excluded from the initial public
-    contract because lens singularities and caustic predicates require more
-    dynamic range and precision.
+    Float16 and bfloat16 are not supported because lens singularities and
+    caustic calculations require more dynamic range and precision.
     """
 
     if isinstance(value, torch.dtype):

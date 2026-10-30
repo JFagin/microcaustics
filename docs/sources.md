@@ -57,8 +57,8 @@ samples. The 0.1-day driver grid and daily source sampling do not require daily
 or sub-daily microlensing maps.
 
 Set `history_days`, `max_duration_days`, and `padding_factor` on the driver for
-other workloads. Queries outside the declared horizon raise an actionable
-error. History must cover reverberation and macroimage delays. Changing the
+other workloads. Queries outside the configured time range raise an error.
+History must cover reverberation and macroimage delays. Changing the
 generation grid changes the realization even with the same seed.
 
 A per-call `source=` override or a `with_source(...)` replacement uses its own
@@ -395,7 +395,7 @@ reuse the source's invariant linear-response weights, and the batch operation
 uses bounded spatial chunks for long dynamic-map sequences. Request a full
 transfer function only when its delay-dependent shape is required.
 
-Transfer functions are also first-class standalone data products. They do not
+Transfer functions can also be calculated on their own. They do not
 require a low-level `microcaustics.multi_image.MultiImageSimulation`:
 
 ```python
@@ -526,6 +526,23 @@ source epoch, including daily intrinsic variability between 25-day maps.
 
 ### Response-based source evolution
 
+By default, `source_evolution="exact"` evaluates the nonlinear thermal disk at
+every source epoch. The `linear_response`, `quadratic_response`, and
+`cubic_response` modes approximate its response to the driving signal, reducing
+the cost of variable-source calculations, particularly for spectra.
+
+For a stationary `ThermalReprocessingSource`, `source_evolution="linear_response"`
+multiplies the mean disk and its unnormalized delay response by each
+magnification map and sums over pixels. It interpolates these results between
+map epochs and combines the response with the driving signal. Only the spatial
+disk calculation is approximated. The driving signal and output light curve
+keep their original time sampling. The unnormalized kernel is essential because microlensing changes
+both its shape and response amplitude. The default CDF/PCHIP reconstruction
+conserves total response mass. Fine fractional deposition and averaging four
+shifted CDF grids reduce artifacts from individual pixel delays. The same
+polynomials generate transfer-function products and convolve with the driver,
+without plot-only smoothing.
+
 The option `source_evolution="cubic_response"` adds
 one sixth of the third brightness derivative convolved with the cubed driver
 fluctuation. It uses the same signed CDF reconstruction as quadratic response.
@@ -545,19 +562,6 @@ The notebook `examples/notebooks/source_models/06_source_evolution_comparison.ip
 derives the linear, quadratic, and cubic flux approximations and generates a matched
 comparison with exact evolution, including per-band errors and complete-call
 timings.
-
-The default `source_evolution="exact"` evaluates the nonlinear thermal disk at
-every requested source epoch. For a stationary `ThermalReprocessingSource`,
-`source_evolution="linear_response"` instead multiplies the mean disk and its
-unnormalized delay response by each magnification map and sums over pixels.
-It interpolates these results between map epochs and combines the response
-with the driving signal. The driver and output remain sampled daily. Only
-the expensive spatial disk evaluation is approximated.
-The unnormalized kernel is essential because microlensing changes both its
-shape and response amplitude. The default CDF/PCHIP reconstruction conserves
-total response mass. Fine fractional deposition and averaging four shifted
-CDF grids reduce artifacts from individual pixel delays. The same polynomials generate transfer-function
-products and convolve with the driver, without plot-only smoothing.
 
 ```python
 approximate = system.light_curve(

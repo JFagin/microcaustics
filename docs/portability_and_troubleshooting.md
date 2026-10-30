@@ -50,7 +50,7 @@ plotting or astronomy packages:
 - `microcaustics[science]` provides Astropy and SciPy.
 - `microcaustics[macro]` provides caustics-based macro models and rendering.
 - `microcaustics[notebooks]` provides Jupyter and plotting.
-- `microcaustics[validation]` provides independent scientific oracles.
+- `microcaustics[validation]` provides libraries for independent numerical comparisons.
 
 After installation, run:
 

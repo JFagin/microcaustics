@@ -1256,18 +1256,18 @@ def temporal_batch_ipm(
     real_frame_count: int | None = None,
     _microimages=None,
 ) -> tuple[MagnificationMap, ...]:
-    """Generate a temporal IPM batch with shared or ragged cell queues.
+    """Generate an IPM batch with shared or per-frame cell selections.
 
     The CUDA production path stacks every frame's mapped node lattices and
     rasterizes them in one direct-cell Triton launch per cell chunk. Lens
     coordinates, selected-cell indices, interpolation work, and raster
-    allocation are shared. Portable backends preserve the numerical contract
+    allocation are shared. Portable backends perform the same calculation
     with the exact eager rasterizer.
 
     A tiled calculation normally supplies one conservative cell selection valid
     for the complete temporal batch. Independent compatible systems may instead
-    supply ``selected_cell_indices_by_frame``; those queues are concatenated
-    with explicit output-frame tags, so no system traces another system's scout
+    supply ``selected_cell_indices_by_frame``. These cell selections are combined
+    with their frame indices, so no system traces another system's scout
     cells. ``real_frame_count`` permits a padded final batch while dropping the
     synthetic frames from the returned sequence.
     """
@@ -1278,7 +1278,7 @@ def temporal_batch_ipm(
         return ()
     if _microimages is not None and selected_cell_indices_by_frame is not None:
         raise ValueError(
-            "Experimental microimage batches require a shared cell selection"
+            "Microimage batches require a shared cell selection"
         )
     total_frames = len(times)
     real_frames = total_frames if real_frame_count is None else int(real_frame_count)

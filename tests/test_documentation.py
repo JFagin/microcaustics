@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import base64
+import binascii
 import builtins
 import importlib
 import json
@@ -45,7 +47,54 @@ def _block_names(block, defined):
     return _global_references(table) - defined - assigned, assigned
 
 
+def _has_embedded_visual_output(output):
+    """Recognize image outputs and the embedded HTML GIF previews."""
+    data = output.get("data", {})
+    if data.get("image/png") or data.get("image/gif"):
+        return True
+    html = data.get("text/html", "")
+    if isinstance(html, list):
+        html = "".join(html)
+    pattern = r'''<img\b[^>]*\bsrc\s*=\s*["']data:image/gif;base64,([^"']+)["']'''
+    for encoded in re.findall(pattern, html, flags=re.IGNORECASE):
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            continue
+        if (
+            len(payload) >= 14
+            and payload[:6] in (b"GIF87a", b"GIF89a")
+            and payload.endswith(b";")
+        ):
+            return True
+    return False
+
+
 class DocumentationIntegrityTests(unittest.TestCase):
+    def test_visual_output_check_accepts_embedded_html_gifs(self) -> None:
+        # A complete one-pixel GIF, not an external image or an HTML placeholder.
+        encoded = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+        html = f'<img src="data:image/gif;base64,{encoded}" alt="Animation">'
+        self.assertTrue(_has_embedded_visual_output({"data": {"text/html": html}}))
+        self.assertTrue(
+            _has_embedded_visual_output({"data": {"text/html": [html[:20], html[20:]]}})
+        )
+        for mime in ("image/png", "image/gif"):
+            self.assertTrue(_has_embedded_visual_output({"data": {mime: encoded}}))
+        for invalid in (
+            "<p>Animation</p>",
+            '<img src="https://example.com/animation.gif">',
+            '<img src="animation.gif">',
+            '<img src="data:image/gif;base64,not-valid-base64">',
+            '<img src="data:image/gif;base64,aGVsbG8=">',
+            f'<img src="data:image/gif;base64,{encoded[:-4]}">',
+        ):
+            with self.subTest(html=invalid):
+                self.assertFalse(
+                    _has_embedded_visual_output({"data": {"text/html": invalid}})
+                )
+        self.assertFalse(_has_embedded_visual_output({"data": {"image/png": ""}}))
+
     def test_retired_far_field_terminology_is_absent(self) -> None:
         """Prevent the removed historical name from returning to public surfaces."""
 
@@ -280,8 +329,7 @@ class DocumentationIntegrityTests(unittest.TestCase):
                 )
                 self.assertTrue(
                     any(
-                        "image/png" in output.get("data", {})
-                        or "image/gif" in output.get("data", {})
+                        _has_embedded_visual_output(output)
                         for output in outputs
                     ),
                     f"{path.name} has no embedded visual output",

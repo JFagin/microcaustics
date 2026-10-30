@@ -111,6 +111,27 @@ def _resolve_sampling(
     )
 
 
+def _initialize_source_sampling(model) -> None:
+    """Normalize a physical source model's bands and grid settings."""
+    wavelengths, names = _resolve_bands(
+        model.wavelengths_angstrom,
+        model.band_names,
+        model.bands_angstrom,
+    )
+    object.__setattr__(model, "wavelengths_angstrom", wavelengths)
+    object.__setattr__(model, "band_names", names)
+    object.__setattr__(
+        model,
+        "grid",
+        _resolve_sampling(
+            model.grid,
+            source_grid_shape=model.source_grid_shape,
+            enclosed_flux_fraction=model.enclosed_flux_fraction,
+            source_margin=model.source_margin,
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class SourceGridConfig:
     """Numerical sampling policy for an automatically sized physical source.
@@ -273,23 +294,7 @@ class ThinDiskModel:
             self.viscous_flux_profile,
             self.radiative_efficiency,
         )
-        wavelengths, names = _resolve_bands(
-            self.wavelengths_angstrom,
-            self.band_names,
-            self.bands_angstrom,
-        )
-        object.__setattr__(self, "wavelengths_angstrom", wavelengths)
-        object.__setattr__(self, "band_names", names)
-        object.__setattr__(
-            self,
-            "grid",
-            _resolve_sampling(
-                self.grid,
-                source_grid_shape=self.source_grid_shape,
-                enclosed_flux_fraction=self.enclosed_flux_fraction,
-                source_margin=self.source_margin,
-            ),
-        )
+        _initialize_source_sampling(self)
         if self.black_hole_mass_solar <= 0.0:
             raise ValueError("black_hole_mass_solar must be positive")
         if self.eddington_ratio <= 0.0:
@@ -638,23 +643,7 @@ class KerrDiskModel:
         from .variability import _validate_source_driver
 
         _validate_source_driver(self)
-        wavelengths, names = _resolve_bands(
-            self.wavelengths_angstrom,
-            self.band_names,
-            self.bands_angstrom,
-        )
-        object.__setattr__(self, "wavelengths_angstrom", wavelengths)
-        object.__setattr__(self, "band_names", names)
-        object.__setattr__(
-            self,
-            "grid",
-            _resolve_sampling(
-                self.grid,
-                source_grid_shape=self.source_grid_shape,
-                enclosed_flux_fraction=self.enclosed_flux_fraction,
-                source_margin=self.source_margin,
-            ),
-        )
+        _initialize_source_sampling(self)
         support = ThinDiskModel(
             black_hole_mass_solar=self.black_hole_mass_solar,
             eddington_ratio=self.eddington_ratio,
@@ -1149,23 +1138,7 @@ class GaussianModel:
     hole_radius_uas: float | None = None
 
     def __post_init__(self) -> None:
-        wavelengths, names = _resolve_bands(
-            self.wavelengths_angstrom,
-            self.band_names,
-            self.bands_angstrom,
-        )
-        object.__setattr__(self, "wavelengths_angstrom", wavelengths)
-        object.__setattr__(self, "band_names", names)
-        object.__setattr__(
-            self,
-            "grid",
-            _resolve_sampling(
-                self.grid,
-                source_grid_shape=self.source_grid_shape,
-                enclosed_flux_fraction=self.enclosed_flux_fraction,
-                source_margin=self.source_margin,
-            ),
-        )
+        _initialize_source_sampling(self)
         if (self.sigma_m is None) == (self.sigma_uas is None):
             raise ValueError("supply exactly one of sigma_uas or sigma_m")
         width = self.sigma_m if self.sigma_uas is None else self.sigma_uas
