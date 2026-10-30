@@ -17,7 +17,8 @@ NOTEBOOKS = Path(__file__).resolve().parents[1] / "examples" / "notebooks"
 
 
 def test_microimage_notebook_generates_its_animation():
-    path = NOTEBOOKS / "microimage_motion.ipynb"
+    path = NOTEBOOKS / "workflows/05_microimages_and_astrometry.ipynb"
+    assert not (NOTEBOOKS / "microimage_motion.ipynb").exists()
     assert path.stat().st_size < 25_000_000
     notebook = json.loads(path.read_text(encoding="utf-8"))
     source = "\n".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
@@ -27,6 +28,15 @@ def test_microimage_notebook_generates_its_animation():
     assert "dynamic_labeled_caustics(" in source
     assert "plots.save_fixed_palette_gif(" in source
     assert "animation_frames()" in source
+    assert 'GIF_DIRECTORY = Path("../assets/animations")' in source
+    assert 'GIF_DIRECTORY / "q2237_b_microimages.gif"' in source
+    assert (path.parent / "../assets/animations/q2237_b_microimages.gif").is_file()
+    markdown = "\n".join(
+        "".join(cell["source"])
+        for cell in notebook["cells"]
+        if cell["cell_type"] == "markdown"
+    )
+    assert "[View the full GIF](../assets/animations/q2237_b_microimages.gif)" in markdown
     assert "cropped = frame.crop(" in source
     assert "image.reshape(-1)[indices] = values" in source
     assert ".rebin(" not in source

@@ -71,6 +71,13 @@ coordinates. For a single-colormap animation, pass
 This preserves the gradient and thin caustic lines that automatic palette
 sampling might miss. GIFs remain limited to 256 colors.
 
+For a self-contained notebook preview, use `display(mcp.gif_preview(gif_path))`.
+This embeds a continuous excerpt below GitHub's observed display-size cutoff.
+Only the end of the excerpt is shortened when necessary. Resolution, colors,
+frame cadence, and playback timing are unchanged. Set `start_frame` and
+`stop_frame` to choose an interval. The full GIF is left intact and can be
+linked separately. This helper also requires IPython.
+
 For a variable source, `animate_standardized_source_bands` uses the temporal
 statistics returned by `standardize_source_over_time`. Pass `bands="i"` for a
 single-band animation, or omit `bands` to show them all. Band selection does

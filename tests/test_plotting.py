@@ -391,6 +391,8 @@ class PlottingTests(unittest.TestCase):
         )
         self.assertEqual(len(diagnostic_axes), 4)
         self.assertEqual(len(diagnostic_figure.axes), 8)
+        self.assertEqual(diagnostic_axes[1].get_title(), "Binary caustic class")
+        self.assertEqual(diagnostic_figure.axes[5].get_ylabel(), "Class")
         labels = mc.AnchorGaugeLabels(
             raw_center_label=0,
             center_label=0,

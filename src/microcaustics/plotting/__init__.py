@@ -39,6 +39,7 @@ from .methods import (
     plot_lens_field_strategies,
 )
 from .microimages import plot_microimages
+from .notebooks import gif_preview
 from .paper_methods import (
     render_live_paper_anchor_gauge,
     render_live_paper_ipm_schematic,
@@ -64,6 +65,7 @@ from .transfer import (
 )
 
 __all__ = [
+    "gif_preview",
     "plot_microimages",
     "plot_anchor_gauge",
     "plot_caustics",

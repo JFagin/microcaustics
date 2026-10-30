@@ -23,7 +23,7 @@ You can request optional
 The callback can save images or their flux-weighted centers. An example follows
 the light-curve setup below. All curve epochs and bands are used unless selected
 with `MicroimageConfig`.
-See the [Q2237 B notebook](examples/notebooks/microimage_motion.ipynb).
+See the [Q2237 B notebook](examples/notebooks/workflows/05_microimages_and_astrometry.ipynb).
 
 ### Fast CUDA production path
 
@@ -212,8 +212,8 @@ Start with
 [Getting started with maps and light curves](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb).
 It generates a ten-year dynamic magnification sequence, finite-source light
 curves with and without intrinsic variability, source-center caustic labels,
-and the animation shown above. The calculation uses the documented production
-IPM and far-field settings used for production calculations.
+and an animation of the evolving magnification map. The calculation uses the
+documented production IPM and far-field settings used for production calculations.
 
 The complete notebook guide is organized into five tracks.
 
@@ -221,8 +221,8 @@ The complete notebook guide is organized into five tracks.
 |---|---|
 | Getting started | [Static maps and numerical methods](examples/notebooks/getting_started/00_static_maps_and_numerical_methods.ipynb), [Q2237 production light curves](examples/notebooks/getting_started/01_q2237_production_light_curve_and_gif.ipynb), and [dynamic maps and light curves](examples/notebooks/getting_started/02_dynamic_maps_and_light_curves.ipynb) |
 | Methods | [Stellar populations and mass functions](examples/notebooks/methods/00_stellar_populations_and_mass_functions.ipynb), [far-field approximation](examples/notebooks/methods/01_far_field_approximation.ipynb), and [caustics and labels](examples/notebooks/methods/02_caustics_and_labels.ipynb) |
-| Source models | [Relativistic disks and reverberation](examples/notebooks/source_models/00_relativistic_disks_and_reverberation.ipynb), [expanding supernovae](examples/notebooks/source_models/01_expanding_supernovae.ipynb), [custom sources and variability](examples/notebooks/source_models/02_custom_sources_and_variability.ipynb), [spectral microlensing](examples/notebooks/source_models/03_spectral_microlensing.ipynb), and [quasar spectra and bandpass photometry](examples/notebooks/source_models/05_quasar_spectra_and_bandpass_photometry.ipynb) |
-| Workflows | [Multi-image light curves and observations](examples/notebooks/workflows/00_multi_image_light_curves_and_observations.ipynb), [realistic strong-lens images](examples/notebooks/workflows/01_realistic_strong_lens_image.ipynb), [end-to-end lensed quasars](examples/notebooks/workflows/02_end_to_end_lensed_quasar.ipynb), [streaming and export](examples/notebooks/workflows/03_streaming_and_exporting_results.ipynb), and [simulation datasets](examples/notebooks/workflows/04_simulation_datasets.ipynb) |
+| Source models | [Relativistic disks and reverberation](examples/notebooks/source_models/00_relativistic_disks_and_reverberation.ipynb), [expanding supernovae](examples/notebooks/source_models/01_expanding_supernovae.ipynb), [custom sources and variability](examples/notebooks/source_models/02_custom_sources_and_variability.ipynb), [spectral microlensing](examples/notebooks/source_models/03_spectral_microlensing.ipynb), [disk flux profiles](examples/notebooks/source_models/04_disk_flux_profiles.ipynb), [quasar spectra and bandpass photometry](examples/notebooks/source_models/05_quasar_spectra_and_bandpass_photometry.ipynb), and [source-evolution comparisons](examples/notebooks/source_models/06_source_evolution_comparison.ipynb) |
+| Workflows | [Multi-image light curves and observations](examples/notebooks/workflows/00_multi_image_light_curves_and_observations.ipynb), [realistic strong-lens images](examples/notebooks/workflows/01_realistic_strong_lens_image.ipynb), [end-to-end lensed quasars](examples/notebooks/workflows/02_end_to_end_lensed_quasar.ipynb), [streaming and export](examples/notebooks/workflows/03_streaming_and_exporting_results.ipynb), [simulation datasets](examples/notebooks/workflows/04_simulation_datasets.ipynb), and [microimages and astrometry](examples/notebooks/workflows/05_microimages_and_astrometry.ipynb) |
 | Validation | [Weisenbach IPM](examples/notebooks/validation/00_weisenbach_ipm_visual_validation.ipynb), [SIM5 GR](examples/notebooks/validation/01_sim5_gr_visual_validation.ipynb), [accuracy and performance](examples/notebooks/validation/02_accuracy_and_performance.ipynb), and [analytic single-point lens](examples/notebooks/validation/03_single_point_lens_validation.ipynb) |
 
 The validation notebooks can use independently generated Weisenbach and SIM5

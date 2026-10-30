@@ -364,7 +364,7 @@ def plot_caustic_diagnostics(
             )
     for axis, title in zip(
         axes,
-        ("Magnification", "Binary parity", "Distance", "Winding number"),
+        ("Magnification", "Binary caustic class", "Distance", "Winding number"),
         strict=True,
     ):
         axis.set_xlim(bounds[:2])
@@ -380,7 +380,7 @@ def plot_caustic_diagnostics(
         hide_image_axes(axis)
     panel_colorbar(figure, axes[0], mag_artist, label=r"$\log_{10}\mu$")
     panel_colorbar(
-        figure, axes[1], parity_artist, label="Parity", ticks=parity_ticks
+        figure, axes[1], parity_artist, label="Class", ticks=parity_ticks
     )
     panel_colorbar(
         figure, axes[2], distance_artist, label=r"Distance [$\mu$as]"

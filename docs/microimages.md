@@ -115,6 +115,6 @@ by this interface. They raise an error rather than silently changing the source
 or omitting images. Caustic labels can be calculated separately. Independent
 system batching with ragged cell selections remains unsupported.
 
-The notebook `examples/notebooks/microimage_motion.ipynb` generates six-band Q2237 B photometry, i-band images, centroid motion,
+The notebook `examples/notebooks/workflows/05_microimages_and_astrometry.ipynb` generates six-band Q2237 B photometry, i-band images, centroid motion,
 caustic-crossing labels and its GIF from scratch. It also checks flux closure.
 No pre-existing animation or simulation output is loaded.
