@@ -498,6 +498,8 @@ class ThinDiskSource:
     relativity: str = "none"
     name: str = "thin_disk"
     is_time_static: bool = True
+    # Enclosed-flux radius from the physical model, not a brightness cutoff.
+    aperture_support_radius_m: float | None = field(default=None, kw_only=True)
     _brightness_cache: dict = field(
         default_factory=dict,
         init=False,
@@ -538,6 +540,14 @@ class ThinDiskSource:
                 raise ValueError(f"{name} lies outside its physical range")
         if self.outer_radius_m is not None and float(self.outer_radius_m) <= 0:
             raise ValueError("outer_radius_m must be positive")
+        if self.aperture_support_radius_m is not None and not (
+            math.isfinite(self.aperture_support_radius_m) and self.aperture_support_radius_m > 0
+        ):
+            raise ValueError("aperture_support_radius_m must be finite and positive")
+
+    def support_radius_m(self, distances=None) -> float | None:
+        """Retain the physical model's aperture radius after pixelization, if known."""
+        return self.aperture_support_radius_m
 
     @classmethod
     def from_lensing_distances(
@@ -747,7 +757,12 @@ class ThinDiskSource:
     def with_bands(self, bands_angstrom: Mapping[str, float]) -> ThinDiskSource:
         """Reuse the physical disk grid at different observed wavelengths."""
 
-        return replace(self, geometry=self.geometry.with_bands(bands_angstrom))
+        geometry = self.geometry.with_bands(bands_angstrom)
+        support = self.aperture_support_radius_m
+        if max(geometry.wavelengths_angstrom) > max(self.geometry.wavelengths_angstrom):
+            # The old enclosed-flux estimate need not cover a redder band.
+            support = None
+        return replace(self, geometry=geometry, aperture_support_radius_m=support)
 
     def metadata(self) -> Mapping[str, object]:
         """Return physical disk parameters and approximation provenance."""

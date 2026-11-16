@@ -448,6 +448,7 @@ class ThinDiskModel:
             radiative_efficiency=self.radiative_efficiency,
             relativity=self.relativity,
             name=self.name,
+            aperture_support_radius_m=self.support_radius_m(distances, policy),
         )
 
 

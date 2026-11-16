@@ -1367,9 +1367,13 @@ class MicrolensingSystem:
         # the complete numerical problem together so the physical sky geometry
         # and resulting light curve remain unchanged.
         physical_source = isinstance(self.source, PhysicalSourceModel)
-        source_has_orientation = physical_source and (
-            hasattr(self.source, "position_angle_deg")
-            or hasattr(self.source, "position_angle_rad")
+        # A scalar brightness modulation does not rotate the underlying model.
+        orientation_model = (
+            self.source.source if isinstance(self.source, ModulatedSource) else self.source
+        )
+        source_has_orientation = isinstance(orientation_model, PhysicalSourceModel) and (
+            hasattr(orientation_model, "position_angle_deg")
+            or hasattr(orientation_model, "position_angle_rad")
         )
         explicit_grid_is_rotation_safe = self.source_grid is None or (
             math.isclose(
@@ -1400,11 +1404,14 @@ class MicrolensingSystem:
         numerical_macro = (
             replace(self.macro, shear_angle_deg=0.0) if align_rectangle else self.macro
         )
-        numerical_source_model = (
-            _source_in_rotated_frame(self.source, frame_rotation_deg)
-            if align_rectangle and physical_source
-            else self.source
-        )
+        numerical_source_model = self.source
+        if align_rectangle and physical_source:
+            rotated = _source_in_rotated_frame(orientation_model, frame_rotation_deg)
+            numerical_source_model = (
+                replace(self.source, source=rotated)
+                if isinstance(self.source, ModulatedSource)
+                else rotated
+            )
         model_accepts_signal = hasattr(numerical_source_model, "with_driving_signal")
         if self._bound_driving_signal is not None and model_accepts_signal:
             numerical_source_model = _source_with_signal(
@@ -1433,10 +1440,7 @@ class MicrolensingSystem:
                 runtime=resolved_runtime,
             )
             support_radius_method = getattr(
-                # Match explicit pixelization when a physical model is wrapped.
-                source
-                if isinstance(numerical_source_model, ModulatedSource)
-                else numerical_source_model,
+                numerical_source_model,
                 "support_radius_m",
                 None,
             )
@@ -1809,12 +1813,11 @@ class MicrolensingSystem:
             )
         support_radius = self.source_support_radius_uas
         if support_radius is None and support_method is not None:
-            support_radius = float(
-                self.distances.source_length_to_uas(
-                    support_method(self.distances),
-                    dtype=torch.float64,
+            radius_m = support_method(self.distances)
+            if radius_m is not None:
+                support_radius = float(
+                    self.distances.source_length_to_uas(radius_m, dtype=torch.float64)
                 )
-            )
 
         aperture = None
         expected_stars = None

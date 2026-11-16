@@ -210,6 +210,43 @@ def test_modulated_physical_disk_matches_explicit_pixelization():
     )
     torch.testing.assert_close(first.stars.x_uas, second.stars.x_uas)
     torch.testing.assert_close(first.stars.y_uas, second.stars.y_uas)
+    # A materialized disk cannot promise the same flux coverage in a redder
+    # band. With no known radius both setup and its preview should use the grid.
+    redder = direct.with_bands({"y": 9712.})
+    assert redder.support_radius_m(distances) is None
+    red_system = mc.MicrolensingSystem(source=redder, **common)
+    assert red_system.summary(display=False)["stellar_aperture_radius_uas"] == (
+        red_system.realize().stellar_aperture.radius_uas
+    )
+
+
+@pytest.mark.parametrize("domain", ["scout", "rectangle"])
+def test_modulating_disk_preserves_seeded_stellar_field(domain):
+    disk = mc.ThinDiskModel(
+        black_hole_mass_solar=10**9.08, eddington_ratio=0.34, spin=0.74,
+        source_redshift=1.695, bands_angstrom={"i": 7546.}, source_grid_shape=16,
+    )
+    driver = mc.TabulatedDrivingSignal([0., 1.], [1., 1.5])
+    common = dict(
+        lens_redshift=0.0395, source_redshift=1.695,
+        macro=mc.MacroLens(0.391, 0.391, shear_angle_deg=141.73),
+        stellar_population=mc.StellarPopulation.salpeter(
+            kinematics=mc.IsotropicKinematics(170., bulk_velocity_km_s=(50., -25.)),
+        ),
+        seed=0, duration_days=3650., integration_domain=domain,
+        runtime=mc.RuntimeConfig(device="cpu", backend="torch-eager"),
+    )
+    bare, modulated = [
+        mc.MicrolensingSystem(source=source, **common).realize()
+        for source in (disk, mc.ModulatedSource(disk, driver))
+    ]
+    assert bare.source_support_radius_uas is not None
+    assert modulated.source_support_radius_uas == bare.source_support_radius_uas
+    assert modulated.stellar_aperture == bare.stellar_aperture
+    assert modulated.sky_to_local_rotation_deg == bare.sky_to_local_rotation_deg
+    assert len(modulated.stars) == len(bare.stars) > 0
+    for key in ("x_uas", "y_uas", "mass_solar", "velocity_x_uas_per_day", "velocity_y_uas_per_day"):
+        assert torch.equal(getattr(modulated.stars, key), getattr(bare.stars, key))
 
 
 def test_custom_source_works_in_independent_and_multi_image_light_curves(tmp_path):
